@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def test_control_plane_env_includes_livekit_credentials() -> None:
@@ -75,10 +76,10 @@ def test_start_settle_proxy_lifecycle(monkeypatch, tmp_path) -> None:
     """拉起/幂等/开关三态：upstream=:1237、port=1238、pid/log 命名齐。"""
     spawned: list[tuple] = []
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
-    monkeypatch.setattr(bok, "repo_python", lambda: "/usr/bin/python3")
-    monkeypatch.setattr(bok, "healthy", lambda p: False)
-    monkeypatch.setattr(
-        bok, "_start_proc",
+    patch_bok(monkeypatch, "repo_python", lambda: "/usr/bin/python3")
+    patch_bok(monkeypatch, "healthy", lambda p: False)
+    patch_bok(
+        monkeypatch, "_start_proc",
         lambda argv, pid, log, env=None: spawned.append((argv, pid, log, env)),
     )
     assert bok._start_settle_proxy(tmp_path, tmp_path) is True
@@ -91,12 +92,12 @@ def test_start_settle_proxy_lifecycle(monkeypatch, tmp_path) -> None:
     assert env["BOK_LLM_QUEUE_UPSTREAM"] == "http://127.0.0.1:1237"
     # 已健康=幂等跳过（healthy 早退路径同款）
     spawned.clear()
-    monkeypatch.setattr(bok, "healthy", lambda p: True)
+    patch_bok(monkeypatch, "healthy", lambda p: True)
     assert bok._start_settle_proxy(tmp_path, tmp_path) is True
     assert spawned == []
     # queue 关=不起
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
-    monkeypatch.setattr(bok, "healthy", lambda p: False)
+    patch_bok(monkeypatch, "healthy", lambda p: False)
     assert bok._start_settle_proxy(tmp_path, tmp_path) is False
     assert spawned == []
 
@@ -105,7 +106,7 @@ def test_worker_env_bakes_ssl_cert_file(tmp_path, monkeypatch) -> None:
     """worker env builder（agent 生产档 + CP + serve 同源）自动注入 SSL_CERT_FILE，
     仅当 env 未设且 cacert.pem 在盘——干净 shell 起 worker 唔再炸 MiniMax TLS。"""
     py = _fake_venv_with_certifi(tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: py)
+    patch_bok(monkeypatch, "repo_python", lambda: py)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     expected = str(tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "certifi" / "cacert.pem")
     assert bok._agent_prod_env()["SSL_CERT_FILE"] == expected
@@ -115,13 +116,13 @@ def test_worker_env_bakes_ssl_cert_file(tmp_path, monkeypatch) -> None:
 def test_worker_env_ssl_cert_file_user_override_respected(monkeypatch, tmp_path) -> None:
     """显式设置的 SSL_CERT_FILE 永远优先，bake 唔覆盖。"""
     monkeypatch.setenv("SSL_CERT_FILE", "/custom/cacert.pem")
-    monkeypatch.setattr(bok, "repo_python", lambda: _fake_venv_with_certifi(tmp_path))
+    patch_bok(monkeypatch, "repo_python", lambda: _fake_venv_with_certifi(tmp_path))
     assert bok._agent_prod_env()["SSL_CERT_FILE"] == "/custom/cacert.pem"
 
 
 def test_worker_env_no_certifi_left_unset(tmp_path, monkeypatch) -> None:
     """certifi 找唔到（假 venv 空 + 当前解释器无 certifi）→ 唔注入，env 保持原样。"""
-    monkeypatch.setattr(bok, "repo_python", lambda: tmp_path / "venv" / "bin" / "python")
+    patch_bok(monkeypatch, "repo_python", lambda: tmp_path / "venv" / "bin" / "python")
     (tmp_path / "venv" / "bin").mkdir(parents=True)
     monkeypatch.setitem(sys.modules, "certifi", None)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)

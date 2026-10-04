@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def test_settle_model_env_override(monkeypatch):
@@ -90,11 +91,11 @@ def test_prompt_cache_bytes_tiers(monkeypatch):
     monkeypatch.setenv("BOK_LLM_PROMPT_CACHE_BYTES", "8GB")
     assert bok._default_prompt_cache_bytes() == "8GB"
     monkeypatch.delenv("BOK_LLM_PROMPT_CACHE_BYTES", raising=False)
-    monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 48.0)
+    patch_bok(monkeypatch, "_physical_mem_gib", lambda: 48.0)
     assert bok._default_prompt_cache_bytes() == "4GB"
-    monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 16.0)
+    patch_bok(monkeypatch, "_physical_mem_gib", lambda: 16.0)
     assert bok._default_prompt_cache_bytes() == "4GB"
-    monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 0.0)
+    patch_bok(monkeypatch, "_physical_mem_gib", lambda: 0.0)
     assert bok._default_prompt_cache_bytes() == "4GB"
 
 

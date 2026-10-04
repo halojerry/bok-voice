@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.agent import (  # noqa: E402
     _response_watchdog_synth_ext_s,
     _watchdog_synth_extend_reason,
@@ -117,9 +118,8 @@ def test_watchdog_fire_extends_before_force_interrupt():
     assert probe < fired < interrupt, (
         "顺延判定必须先于真触发计数与 force-interrupt——否则临界真回复照旧被掐"
     )
-    assert 'BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S' in (
-        ROOT / "tools" / "bok.py"
-    ).read_text(encoding="utf-8"), "新 env 必须进 _FORWARD_ENV(prod 封闭面可达)"
+    assert 'BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S' in bok_source(), (
+        "新 env 必须进 _FORWARD_ENV(prod 封闭面可达)")
 
 
 # ---- 二判据:LLM 生成中(agent_state==thinking)同旗同窗顺延(2026-09-25)----

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 # ---- 1. app_data_dir 平台分档 ----
@@ -55,7 +56,7 @@ def test_platform_key_linux_uses_gpu_table(monkeypatch):
 
 def test_bundled_llama_linux_candidates(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
-    monkeypatch.setattr(bok, "runtime_root", lambda: tmp_path)
+    patch_bok(monkeypatch, "runtime_root", lambda: tmp_path)
     monkeypatch.setattr(bok.os, "name", "posix")
     assert bok.bundled_llama() is None
     nested = tmp_path / "llama" / "linux"
@@ -66,7 +67,7 @@ def test_bundled_llama_linux_candidates(monkeypatch, tmp_path: Path):
 
 def test_bundled_llama_mac_none(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(bok._platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(bok, "runtime_root", lambda: tmp_path)
+    patch_bok(monkeypatch, "runtime_root", lambda: tmp_path)
     (tmp_path / "llama").mkdir()
     (tmp_path / "llama" / "llama-server").write_text("x")
     assert bok.bundled_llama() is None  # mac 走 mlx，不吃 llama
@@ -99,8 +100,8 @@ def livekit_env(monkeypatch, tmp_path: Path):
     base_dir = tmp_path / "repo" / "services" / "livekit-server"
     base_dir.mkdir(parents=True)
     base = _write_base_livekit(base_dir)
-    monkeypatch.setattr(bok, "ROOT", tmp_path / "repo")
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path / "appdata")
+    patch_bok(monkeypatch, "ROOT", tmp_path / "repo")
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path / "appdata")
     for k in ("BOK_LIVEKIT_BIND", "BOK_LIVEKIT_WEBHOOK_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
         monkeypatch.delenv(k, raising=False)
     return base, tmp_path
@@ -143,16 +144,16 @@ def test_livekit_config_only_bind_keeps_other_sections(livekit_env, monkeypatch)
 
 def test_cmd_up_runs_services_then_call_plane(monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(bok, "_cmd_up_services", lambda: (calls.append("services"), 0)[1])
-    monkeypatch.setattr(bok, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
+    patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 0)[1])
+    patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
     assert bok.cmd_up() == 0
     assert calls == ["services", "call_plane"]
 
 
 def test_cmd_up_skips_call_plane_when_services_fail(monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(bok, "_cmd_up_services", lambda: (calls.append("services"), 1)[1])
-    monkeypatch.setattr(bok, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
+    patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 1)[1])
+    patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
     assert bok.cmd_up() == 1
     assert calls == ["services"]  # 服务面失败即短路，通话面不拉
 
@@ -160,33 +161,33 @@ def test_cmd_up_skips_call_plane_when_services_fail(monkeypatch):
 def test_start_call_plane_waits_livekit_then_starts_workers(monkeypatch, tmp_path: Path):
     """通话面单点：LiveKit 就绪 → 三个 worker 全量 spawn → monitor（与 serve 同源）。"""
     started: list[str] = []
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "_livekit_config_path", lambda: tmp_path / "livekit.yaml")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "shutil_which", lambda name: None)
-    monkeypatch.setattr(bok, "_start_proc", lambda argv, pidf, logf, **kw: started.append(str(argv[0])))
-    monkeypatch.setattr(bok, "healthy", lambda port: port == 7880)
-    monkeypatch.setattr(
-        bok, "_worker_specs",
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "_livekit_config_path", lambda: tmp_path / "livekit.yaml")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "shutil_which", lambda name: None)
+    patch_bok(monkeypatch, "_start_proc", lambda argv, pidf, logf, **kw: started.append(str(argv[0])))
+    patch_bok(monkeypatch, "healthy", lambda port: port == 7880)
+    patch_bok(
+        monkeypatch, "_worker_specs",
         lambda py: [
             {"name": "agent", "port": 8081, "argv": [str(py), "-m", "agent_runtime.main"],
              "pidfile": tmp_path / "a.pid", "logfile": tmp_path / "a.log", "env": {}},
         ],
     )
-    monkeypatch.setattr(bok, "_ensure_monitor", lambda py: started.append("monitor"))
+    patch_bok(monkeypatch, "_ensure_monitor", lambda py: started.append("monitor"))
     assert bok._start_call_plane("/py") is True
     assert started == ["/py", "monitor"]
 
 
 def test_start_call_plane_returns_false_without_livekit(monkeypatch, tmp_path: Path):
     started: list[str] = []
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "_livekit_config_path", lambda: tmp_path / "livekit.yaml")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "shutil_which", lambda name: None)
-    monkeypatch.setattr(bok, "healthy", lambda port: False)
-    monkeypatch.setattr(bok, "_start_proc", lambda *a, **kw: started.append("proc"))
-    monkeypatch.setattr(bok, "_worker_specs", lambda py: (_ for _ in ()).throw(AssertionError("worker 不应被拉起")))
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "_livekit_config_path", lambda: tmp_path / "livekit.yaml")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "shutil_which", lambda name: None)
+    patch_bok(monkeypatch, "healthy", lambda port: False)
+    patch_bok(monkeypatch, "_start_proc", lambda *a, **kw: started.append("proc"))
+    patch_bok(monkeypatch, "_worker_specs", lambda py: (_ for _ in ()).throw(AssertionError("worker 不应被拉起")))
     monkeypatch.setattr(bok.time, "sleep", lambda s: None)
     monkeypatch.setattr(bok.time, "monotonic", _deadline_clock())
     assert bok._start_call_plane("/py") is False
@@ -250,7 +251,7 @@ def test_worker_env_default_still_local(monkeypatch):
 def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Path):
     """cmd_download 落盘的 *Q4_K_M.gguf 应解析为文件路径（llama-server 只认文件）。"""
     monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     gguf = tmp_path / "models" / "Qwen--Qwen3-4B-Q4_K_M" / "Qwen3-4B.Q4_K_M.gguf"
     gguf.parent.mkdir(parents=True)
     gguf.write_text("x")
@@ -260,5 +261,5 @@ def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Pat
 def test_model_path_linux_dev_no_gguf_keeps_repo_id(monkeypatch, tmp_path: Path):
     """布局里没有 gguf 时保持 repo id 兜底（win-dev hf cache 语义，行为不变）。"""
     monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     assert bok.model_path({"llm": "Qwen/Qwen3-4B"}, "llm") == "Qwen/Qwen3-4B"

@@ -13,6 +13,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from _bok_src import bok_source
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
@@ -225,7 +227,7 @@ def test_wiring_source_pins():
     assert "def _finish_sv(" in SIDECAR_SRC
     assert "def _norm_engine(" in SIDECAR_SRC
     # bok:模型收编 + 目录下发 + 依赖
-    bok = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok = bok_source()
     assert '"sensevoice": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"' in bok
     assert 'asr_env["QWEN3_ASR_SV_MODEL_DIR"]' in bok
     reqs = (ROOT / "services" / "qwen3-asr-sidecar" / "requirements.txt").read_text(

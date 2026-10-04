@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX killpg/载体语义")
 
@@ -224,8 +225,8 @@ def test_cmd_down_skips_foreign_pidfile(monkeypatch, tmp_path, capsys):
     """cmd_down pidfile 循环：他树 skip，未知照杀。清扫两路径打桩——绝不碰真栈。"""
     home = _tmp_home(monkeypatch, tmp_path)
     pool = _FakeWorkers()
-    monkeypatch.setattr(bok, "_sweep_orphan_workers", lambda: [])
-    monkeypatch.setattr(bok, "_sweep_orphan_listeners", lambda healthy_ok=True: [])
+    patch_bok(monkeypatch, "_sweep_orphan_workers", lambda: [])
+    patch_bok(monkeypatch, "_sweep_orphan_listeners", lambda healthy_ok=True: [])
     try:
         foreign = pool.spawn(OTHER_ROOT)
         unknown = pool.spawn(None)
@@ -278,10 +279,12 @@ def test_sweep_orphan_workers_skips_foreign(monkeypatch, tmp_path, capsys):
 def test_respawn_skips_healthy_port(monkeypatch, tmp_path):
     """monitor _respawn 起拉循环：端口已有健康监听跳过（杀被守卫挡下后不硬起刷
     bind 失败噪声）。_respawn 是 cmd_monitor 闭包——按同源逻辑最小复刻验证。"""
+    import bokctl.core as core  # 权威命名空间（W① 补丁契约：读与补丁同源）
+
     _tmp_home(monkeypatch, tmp_path)
     started: list[int] = []
-    monkeypatch.setattr(bok, "healthy", lambda port: port == 8081)
-    monkeypatch.setattr(bok, "_start_proc",
+    patch_bok(monkeypatch, "healthy", lambda port: port == 8081)
+    patch_bok(monkeypatch, "_start_proc",
                         lambda *a, **k: started.append(1) or 0)
     specs = [
         {"name": "agent", "port": 8081, "pidfile": Path("/tmp/x-agent.pid"),
@@ -289,11 +292,12 @@ def test_respawn_skips_healthy_port(monkeypatch, tmp_path):
         {"name": "interp-fwd", "port": 8082, "pidfile": Path("/tmp/x-fwd.pid"),
          "logfile": Path("/tmp/x.log"), "argv": [], "env": {}},
     ]
-    # 与 cmd_monitor._respawn 的起拉循环同构（健康跳过段逐字同款）
+    # 与 cmd_monitor._respawn 的起拉循环同构（健康跳过段逐字同款）——
+    # 循环体读 core 全局（生产闭包同源），不吃门面镜像（补丁打在 core）。
     for spec in specs:
-        if bok.healthy(spec["port"]):
+        if core.healthy(spec["port"]):
             continue
-        bok._start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+        core._start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
     assert started == [1], "只有不健康端口该被拉起"
 
 
@@ -351,7 +355,7 @@ def test_ensure_monitor_reuse_respawns_foreign_logs(monkeypatch, tmp_path, capsy
     home = _tmp_home(monkeypatch, tmp_path)
     run = _run_dir(home)
     started: list[str] = []
-    monkeypatch.setattr(bok, "_start_proc", lambda *a, **k: started.append("x") or 12345)
+    patch_bok(monkeypatch, "_start_proc", lambda *a, **k: started.append("x") or 12345)
     pool = _FakeWorkers()
     try:
         recycled = pool.spawn(None)

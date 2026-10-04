@@ -28,9 +28,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bok_src import bok_source  # noqa: E402
 
 _AGENT_DIR = Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime"
-_BOK_SRC = Path(__file__).resolve().parents[1] / "tools" / "bok.py"
 
 # 豁免清单（键 → 理由）。动这里必须带理由；无理由的豁免 = 立法倒退。
 _EXEMPT: dict[str, str] = {
@@ -92,7 +92,7 @@ def _bok_provides() -> set[str]:
     `_FORWARD_ENV` 元组、`for _k in (...)` 白名单元组、`for base in (...)` 的
     `*_REV` 动态展开。
     """
-    src = _BOK_SRC.read_text(encoding="utf-8")
+    src = bok_source()
     provided = set(bok._FORWARD_ENV)
     provided |= set(re.findall(r'env\[?"([A-Z][A-Z0-9_]+)"?\]?\s*=', src))
     provided |= set(re.findall(r'setdefault\(\s*"([A-Z][A-Z0-9_]+)"', src))

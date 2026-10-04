@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
 from livekit import rtc  # noqa: E402
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.interpret import (  # noqa: E402
     _src_track_state,
     _src_track_watch_loop,
@@ -31,7 +32,7 @@ from agent_runtime.interpret import (  # noqa: E402
 INTERP_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(
     encoding="utf-8"
 )
-BOK_SRC = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+BOK_SRC = bok_source()
 
 AUDIO = rtc.TrackKind.KIND_AUDIO
 VIDEO = rtc.TrackKind.KIND_VIDEO

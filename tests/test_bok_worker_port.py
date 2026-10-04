@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -65,9 +66,9 @@ def test_worker_ports_dynamic_agent_entry(monkeypatch) -> None:
 
 
 def test_worker_specs_port_follows_env(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "_agent_worker_env", lambda py: {})
-    monkeypatch.setattr(bok, "_realtime_demo_enabled", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "_agent_worker_env", lambda py: {})
+    patch_bok(monkeypatch, "_realtime_demo_enabled", lambda: False)
     monkeypatch.delenv("BOK_WORKER_PORT", raising=False)
     specs = bok._worker_specs("/py")
     assert specs[0]["port"] == 8081
@@ -127,6 +128,6 @@ def test_relaxed_healthy_worker_http_surface_follows_env(monkeypatch) -> None:
         seen.append(url)
         raise OSError("boom")
 
-    monkeypatch.setattr(bok, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     assert bok._relaxed_healthy(9081) is False
     assert seen and seen[0].endswith(":9081/worker"), seen

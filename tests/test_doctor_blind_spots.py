@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _LEASE_LINE = (
     "[llm-queue] lease-timeout forced-reclaim hold_s>60 "
@@ -63,24 +64,24 @@ def test_doctor_a_reply_probe_line(monkeypatch, tmp_path: Path, capsys) -> None:
     log_dir.mkdir()
     (log_dir / "llm-proxy.log").write_text(_LEASE_LINE * 2, encoding="utf-8")
 
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "platform_key", lambda: "mac")
-    monkeypatch.setattr(bok, "is_packaged", lambda: False)
-    monkeypatch.setattr(bok, "_warn_memory_posture", lambda fails, packaged: None)
-    monkeypatch.setattr(bok, "sidecar_python", lambda name: tmp_path / "py")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "bundled_node", lambda: None)
-    monkeypatch.setattr(bok, "bundled_llama", lambda: None)
-    monkeypatch.setattr(bok, "_virtual_audio_present", lambda: False)
-    monkeypatch.setattr(bok, "_doctor_gpu_gate", lambda packaged, fails: None)
-    monkeypatch.setattr(bok, "_doctor_draft_warning", lambda cur: None)
-    monkeypatch.setattr(bok, "_model_present", lambda repo: True)
-    monkeypatch.setattr(bok, "_settle_llm_model", lambda cur: str(model_dir))
-    monkeypatch.setattr(bok, "_probe_worker", lambda port, timeout=3.0: (True, "ok"))
-    monkeypatch.setattr(bok, "_provider_health_summary", lambda: None)
-    monkeypatch.setattr(bok, "_doctor_minimax_tts", lambda data, fails: None)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "platform_key", lambda: "mac")
+    patch_bok(monkeypatch, "is_packaged", lambda: False)
+    patch_bok(monkeypatch, "_warn_memory_posture", lambda fails, packaged: None)
+    patch_bok(monkeypatch, "sidecar_python", lambda name: tmp_path / "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "bundled_node", lambda: None)
+    patch_bok(monkeypatch, "bundled_llama", lambda: None)
+    patch_bok(monkeypatch, "_virtual_audio_present", lambda: False)
+    patch_bok(monkeypatch, "_doctor_gpu_gate", lambda packaged, fails: None)
+    patch_bok(monkeypatch, "_doctor_draft_warning", lambda cur: None)
+    patch_bok(monkeypatch, "_model_present", lambda repo: True)
+    patch_bok(monkeypatch, "_settle_llm_model", lambda cur: str(model_dir))
+    patch_bok(monkeypatch, "_probe_worker", lambda port, timeout=3.0: (True, "ok"))
+    patch_bok(monkeypatch, "_provider_health_summary", lambda: None)
+    patch_bok(monkeypatch, "_doctor_minimax_tts", lambda data, fails: None)
     # :1237 只在听（1235/1236 等不在），CORE_PORTS 判定全走此桩。
-    monkeypatch.setattr(bok, "healthy", lambda port: port == 1237)
+    patch_bok(monkeypatch, "healthy", lambda port: port == 1237)
 
     def fake_urlopen(arg, timeout=None):
         url = arg if isinstance(arg, str) else arg.full_url

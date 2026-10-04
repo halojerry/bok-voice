@@ -34,6 +34,7 @@ PW = "Passw0rd!x"  # 测试夹具口令(与 test_token_dispatch 同源),非真�
 
 # ---- CP 侧 harness（与 test_token_dispatch 同款） ----
 
+from _bokpatch import patch_bok  # noqa: E402
 from bok_voice_business_db.repository import InMemoryBusinessRepository
 from control_plane.auth import hash_password
 
@@ -372,8 +373,8 @@ def test_bok_realtime_worker_spec_opt_in(monkeypatch, tmp_path):
     """BOK_QWEN_REALTIME=1 才出 realtime-demo spec（:8084）；缺省三 worker 不变。"""
     import bok as bok_mod
 
-    monkeypatch.setattr(bok_mod, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok_mod, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
     monkeypatch.delenv("BOK_QWEN_REALTIME", raising=False)
     names = [s["name"] for s in bok_mod._worker_specs("py")]
     assert "realtime-demo" not in names
@@ -389,12 +390,12 @@ def test_bok_realtime_prod_unit_opt_in(monkeypatch, tmp_path):
     不收 :8084——默认栈不跑演示档，prod status 不得对未启用部署恒 DEGRADED）。"""
     import bok as bok_mod
 
-    monkeypatch.setattr(bok_mod, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok_mod, "repo_python", lambda: "py")
-    monkeypatch.setattr(bok_mod, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok_mod, "_agent_prod_env", lambda: {})
-    monkeypatch.setattr(bok_mod, "_interp_env", lambda env: {})
-    monkeypatch.setattr(bok_mod, "_control_plane_env", lambda db: {})
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
+    patch_bok(monkeypatch, "_interp_env", lambda env: {})
+    patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
     monkeypatch.delenv("BOK_QWEN_REALTIME", raising=False)
     assert "bok-realtime" not in {u[0] for u in bok_mod._prod_units()}
     monkeypatch.setenv("BOK_QWEN_REALTIME", "1")

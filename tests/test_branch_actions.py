@@ -19,6 +19,7 @@ for p in ("apps/agent", "packages/core"):
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.agent import branch_hit_plan  # noqa: E402
 from agent_runtime.flow import (  # noqa: E402
     BRANCH_ACTION_HANDOFF,
@@ -280,5 +281,5 @@ def test_funnel_early_block_wiring():
     # 规则推进让位:分支命中轮引擎不再自动推进
     assert "and not _branch_hold" in src
     # env 立法:BOK_BRANCH_ACTION 进 _FORWARD_ENV 白名单(漏登记 CI 红)
-    bok_src = (ROOT / "tools/bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert '"BOK_BRANCH_ACTION"' in bok_src

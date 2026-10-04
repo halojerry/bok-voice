@@ -28,6 +28,8 @@ for p in ("apps/agent", "packages/core"):
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
+from _bok_src import bok_source  # noqa: E402
+
 from agent_runtime.agent import (  # noqa: E402
     _strip_number_echo,
     _wa_confirm_or_reask,
@@ -143,7 +145,7 @@ def test_strip_normal_digit_text_untouched():
 def test_wiring_and_forward_env():
     src = (ROOT / "apps/agent/agent_runtime/agent.py").read_text(encoding="utf-8")
     assert 'os.environ.get("BOK_WA_ECHO_STRIP", "1") == "1"' in src  # 默认开
-    bok_src = (ROOT / "tools/bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert '"BOK_WA_ECHO_STRIP"' in bok_src  # env 立法:进 _FORWARD_ENV
     # 剥离点在 WA 累积块之前(累积与侦测都吃干净文本)——打真调用点
     # (`_echo_free = …` 唯一赋值位);裸 `_strip_number_echo(` index 会命中

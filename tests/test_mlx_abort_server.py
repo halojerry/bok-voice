@@ -618,7 +618,9 @@ def test_attach_mlx_abort_on_raw_stream(monkeypatch):
 def test_bok_launch_points_use_wrapper():
     import tools.bok as bok
 
-    src = (ROOT / "tools" / "bok.py").read_text()
+    from _bok_src import bok_source
+
+    src = bok_source()
     assert bok.MLX_SERVER_WRAPPER == ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
     assert bok.MLX_SERVER_WRAPPER.is_file()
     argv = bok._mac_llm_server_argv(Path("py"), "/m", "1239", {"llm_draft": ""})

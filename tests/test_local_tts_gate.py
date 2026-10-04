@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def _make_db(tmp_path: Path, *, provider: str | None, personas: list[str]) -> Path:
@@ -39,7 +40,7 @@ def _make_db(tmp_path: Path, *, provider: str | None, personas: list[str]) -> Pa
 
 
 def _gate(monkeypatch, tmp_path: Path, env: str | None = None) -> tuple[bool, str]:
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     if env is None:
         monkeypatch.delenv("BOK_LOCAL_TTS", raising=False)
     else:
@@ -137,10 +138,10 @@ def test_usable_model_dir_extra_required(monkeypatch, tmp_path):
 
 def test_tts_model_path_skips_broken_lmstudio_copy(monkeypatch, tmp_path):
     # lmstudio=残缺(config.json 无 tokenizer) / app-data=完整 → 必须选 app-data
-    monkeypatch.setattr(bok, "is_packaged", lambda: False)
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
-    monkeypatch.setattr(bok, "model_dir", lambda repo: tmp_path / "appdata" / repo.replace("/", "--"))
+    patch_bok(monkeypatch, "is_packaged", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
+    patch_bok(monkeypatch, "model_dir", lambda repo: tmp_path / "appdata" / repo.replace("/", "--"))
     _mk_model_dir(tmp_path / "lmstudio", "mlx-community/TTS-Base", with_config=True, with_tokenizer=False)
     _mk_model_dir(tmp_path / "appdata", "mlx-community--TTS-Base", with_config=True, with_tokenizer=True)
     got = bok.model_path({"tts_clone": "mlx-community/TTS-Base"}, "tts_clone")

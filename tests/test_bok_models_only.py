@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -27,13 +28,13 @@ import bok  # noqa: E402
 
 def test_models_only_skips_call_plane(monkeypatch) -> None:
     calls: list[tuple] = []
-    monkeypatch.setattr(
-        bok, "_cmd_up_services",
+    patch_bok(
+        monkeypatch, "_cmd_up_services",
         lambda models_only=False: (calls.append(("services", models_only)), 0)[1])
-    monkeypatch.setattr(
-        bok, "_start_call_plane",
+    patch_bok(
+        monkeypatch, "_start_call_plane",
         lambda py: (calls.append(("call_plane",)), True)[1])
-    monkeypatch.setattr(bok, "repo_python", lambda: "/py")
+    patch_bok(monkeypatch, "repo_python", lambda: "/py")
     assert bok.cmd_up(models_only=True) == 0
     assert calls == [("services", True)], "models-only 不得拉通话面"
     calls.clear()
@@ -52,21 +53,21 @@ def test_models_only_service_set(monkeypatch, tmp_path) -> None:
                 started.append(port)
         return 1
 
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "cmd_download", lambda only=None: 0)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "cmd_download", lambda only=None: 0)
     sidecar = tmp_path / "sidecar-py"
     sidecar.write_text("")
-    monkeypatch.setattr(bok, "sidecar_python", lambda name: sidecar)
-    monkeypatch.setattr(bok, "model_path", lambda cur, key: str(tmp_path / key))
-    monkeypatch.setattr(bok, "healthy", lambda port: False)
+    patch_bok(monkeypatch, "sidecar_python", lambda name: sidecar)
+    patch_bok(monkeypatch, "model_path", lambda cur, key: str(tmp_path / key))
+    patch_bok(monkeypatch, "healthy", lambda port: False)
     monkeypatch.setattr(bok.time, "sleep", lambda s: None)
-    monkeypatch.setattr(bok, "_start_proc", fake_start)
-    monkeypatch.setattr(bok, "_local_tts_needed", lambda: (True, "local"))
-    monkeypatch.setattr(bok, "_start_llm", lambda *a, **k: started.append("llm-lane"))
-    monkeypatch.setattr(bok, "_start_mt_llm", lambda *a, **k: (started.append("mt-lane"), True)[1])
-    monkeypatch.setattr(bok, "_start_settle_llm", lambda *a, **k: (started.append("settle-lane"), True)[1])
-    monkeypatch.setattr(bok, "_start_laya", lambda *a, **k: (started.append("laya-lane"), False)[1])
-    monkeypatch.setattr(bok, "_ports_down_after_grace", lambda targets, probe=None: [])
+    patch_bok(monkeypatch, "_start_proc", fake_start)
+    patch_bok(monkeypatch, "_local_tts_needed", lambda: (True, "local"))
+    patch_bok(monkeypatch, "_start_llm", lambda *a, **k: started.append("llm-lane"))
+    patch_bok(monkeypatch, "_start_mt_llm", lambda *a, **k: (started.append("mt-lane"), True)[1])
+    patch_bok(monkeypatch, "_start_settle_llm", lambda *a, **k: (started.append("settle-lane"), True)[1])
+    patch_bok(monkeypatch, "_start_laya", lambda *a, **k: (started.append("laya-lane"), False)[1])
+    patch_bok(monkeypatch, "_ports_down_after_grace", lambda targets, probe=None: [])
     assert bok._cmd_up_services(models_only=True) == 0
     assert "8787" in started and "8788" in started
     assert "llm-lane" in started and "mt-lane" in started and "settle-lane" in started
@@ -79,7 +80,7 @@ def test_models_only_argparse_and_main_wiring(monkeypatch) -> None:
     assert args.cmd == "up" and args.models_only is True
     assert bok.parse_args(["up"]).models_only is False
     seen: dict = {}
-    monkeypatch.setattr(bok, "cmd_up", lambda models_only=False: (seen.update(models_only=models_only), 0)[1])
+    patch_bok(monkeypatch, "cmd_up", lambda models_only=False: (seen.update(models_only=models_only), 0)[1])
     assert bok.main(["up", "--models-only"]) == 0
     assert seen["models_only"] is True
 
@@ -90,12 +91,12 @@ def test_models_only_argparse_and_main_wiring(monkeypatch) -> None:
 
 
 def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: "py")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "_agent_prod_env", lambda: {})
-    monkeypatch.setattr(bok, "_interp_env", lambda env: {})
-    monkeypatch.setattr(bok, "_control_plane_env", lambda db: {})
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
+    patch_bok(monkeypatch, "_interp_env", lambda env: {})
+    patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
 
 
 def test_prod_units_model_plane_default_off(monkeypatch, tmp_path) -> None:
@@ -111,8 +112,8 @@ def test_prod_units_model_plane_default_off(monkeypatch, tmp_path) -> None:
 
 def test_prod_install_mac_plist_gated_by_flag(monkeypatch, tmp_path) -> None:
     _patch_prod_unit_deps(monkeypatch, tmp_path)
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
     assert bok.cmd_prod_install() == 0
     unit_dir = tmp_path / "units"
     assert not (unit_dir / "com.bokvoice.bok-model-plane.plist").exists()
@@ -130,8 +131,8 @@ def test_prod_uninstall_mac_removes_opt_in_model_plane(monkeypatch, tmp_path, ca
     import subprocess as _sp
 
     _patch_prod_unit_deps(monkeypatch, tmp_path)
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: _sp.CompletedProcess(argv, 0, stdout="", stderr=""))
@@ -148,6 +149,6 @@ def test_prod_argparse_and_main_wiring(monkeypatch) -> None:
     assert args.with_model_plane is True
     assert bok.parse_args(["prod", "install"]).with_model_plane is False
     seen: dict = {}
-    monkeypatch.setattr(bok, "cmd_prod", lambda action, **kw: (seen.update(action=action, **kw), 0)[1])
+    patch_bok(monkeypatch, "cmd_prod", lambda action, **kw: (seen.update(action=action, **kw), 0)[1])
     assert bok.main(["prod", "install", "--with-model-plane"]) == 0
     assert seen["with_model_plane"] is True

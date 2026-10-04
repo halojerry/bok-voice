@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
 import systemd_units as sd  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _PY = "/opt/bok/.venv312/bin/python"
 _ROOT = "/opt/bok"
@@ -214,10 +215,10 @@ def test_env_file_sample_lists_pythonpath_and_never_write_hint():
 def _linux(monkeypatch, tmp_path: Path) -> None:
     """模拟 Linux 档（桩法对齐 test_prod_windows：is_mac/is_linux 双桩），
     app-data 钉到 tmp、解释器钉到固定路径保证 ExecStart 可断言。"""
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: True)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: Path(_PY))
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: True)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: Path(_PY))
 
 
 def test_staging_dir_default(monkeypatch, tmp_path):

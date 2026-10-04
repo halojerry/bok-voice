@@ -29,6 +29,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from _bok_src import bok_source
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
     "bok_llm_queue_proxy", _ROOT / "services" / "llm-mlx" / "queue_proxy.py")
@@ -320,7 +322,7 @@ def test_gate_line_printed_for_every_generation_request(capsys):
 # ---- 源扫描（拓扑接线 + 车道头注入） ----------------------------------------
 def test_bok_wiring_and_agent_lane_header_pinned():
     """bok.py 队列拓扑接线 + agent X-Bok-Lane 注入 + cache 档 6GB 缺省在源码钉住。"""
-    bok_src = (_ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert "BOK_LLM_QUEUE_PROXY" in bok_src, "kill-switch 在场"
     assert '"1239"' in bok_src, "mlx 内部端口接线在场"
     assert "queue_proxy.py" in bok_src, "代理启动接线在场"

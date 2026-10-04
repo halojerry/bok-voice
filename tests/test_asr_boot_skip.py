@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from _bok_src import bok_source
+
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("QWEN3_ASR_BACKEND", "mlx")
 
@@ -224,7 +226,7 @@ def test_partial_mlx_triggers_lazy_load(monkeypatch, capsys):
 
 def test_wiring_source_pins():
     sidecar = (ROOT / "services" / "qwen3-asr-sidecar" / "app.py").read_text(encoding="utf-8")
-    bok = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok = bok_source()
     # sidecar:启动闸 + 懒加载单飞 + 观测行
     assert "def _boot_engine(" in sidecar
     assert 'if _boot_engine() == "sensevoice":' in sidecar

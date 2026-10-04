@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX killpg/载体语义")
 
@@ -80,8 +81,8 @@ def _run_dir(home: Path) -> Path:
 
 
 def _patch_down_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bok, "_sweep_orphan_workers", lambda: [])
-    monkeypatch.setattr(bok, "_sweep_orphan_listeners", lambda healthy_ok=True: [])
+    patch_bok(monkeypatch, "_sweep_orphan_workers", lambda: [])
+    patch_bok(monkeypatch, "_sweep_orphan_listeners", lambda healthy_ok=True: [])
 
 
 def _assert_alive(proc) -> None:
@@ -107,17 +108,17 @@ def test_pid_reused_stale_helper(monkeypatch, tmp_path) -> None:
     assert bok._pid_reused_stale(pidfile, 12345) is False  # 无戳 fail-open
 
     (run / "proc-12345.root").write_text(f"{bok.ROOT}\tOLD LSTART\n", encoding="utf-8")
-    monkeypatch.setattr(bok, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
+    patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
     assert bok._pid_reused_stale(pidfile, 12345) is True
 
-    monkeypatch.setattr(bok, "_ps_field", lambda pid, field: "OLD LSTART" if field == "lstart=" else "")
+    patch_bok(monkeypatch, "_ps_field", lambda pid, field: "OLD LSTART" if field == "lstart=" else "")
     assert bok._pid_reused_stale(pidfile, 12345) is False  # 戳对得上=不是复用
 
-    monkeypatch.setattr(bok, "_ps_field", lambda pid, field: "")  # ps 读不出
+    patch_bok(monkeypatch, "_ps_field", lambda pid, field: "")  # ps 读不出
     assert bok._pid_reused_stale(pidfile, 12345) is False
 
     (run / "proc-12345.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")  # 坏戳
-    monkeypatch.setattr(bok, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
+    patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
     assert bok._pid_reused_stale(pidfile, 12345) is False
 
 
@@ -137,8 +138,8 @@ def test_cmd_down_skips_reused_pid_stamp(monkeypatch, tmp_path, capsys) -> None:
         (run / "agent.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
             f"{bok.ROOT}\tSTALE LSTART\n", encoding="utf-8")
-        monkeypatch.setattr(
-            bok, "_ps_field",
+        patch_bok(
+            monkeypatch, "_ps_field",
             lambda pid, field: "LIVE LSTART" if field == "lstart=" else "")
         rc = bok.cmd_down()
         assert rc == 0
@@ -160,8 +161,8 @@ def test_cmd_down_kills_when_stamp_matches(monkeypatch, tmp_path, capsys) -> Non
         (run / "tts.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
             f"{bok.ROOT}\tMATCH LSTART\n", encoding="utf-8")
-        monkeypatch.setattr(
-            bok, "_ps_field",
+        patch_bok(
+            monkeypatch, "_ps_field",
             lambda pid, field: "MATCH LSTART" if field == "lstart=" else "")
         rc = bok.cmd_down()
         assert rc == 0
@@ -177,7 +178,7 @@ def test_cmd_down_legacy_sidecar_pid_reuse_guard(monkeypatch, tmp_path, capsys) 
     home = _tmp_home(monkeypatch, tmp_path)
     repo = tmp_path / "repo"
     (repo / "data").mkdir(parents=True)
-    monkeypatch.setattr(bok, "ROOT", repo)
+    patch_bok(monkeypatch, "ROOT", repo)
     _patch_down_sweeps(monkeypatch)
     pool = _FakeWorkers()
     try:
@@ -185,8 +186,8 @@ def test_cmd_down_legacy_sidecar_pid_reuse_guard(monkeypatch, tmp_path, capsys) 
         (repo / "data" / "sidecar-asr.pid").write_text(str(proc.pid))
         (_run_dir(home) / f"proc-{proc.pid}.root").write_text(
             f"{repo}\tSTALE LSTART\n", encoding="utf-8")
-        monkeypatch.setattr(
-            bok, "_ps_field",
+        patch_bok(
+            monkeypatch, "_ps_field",
             lambda pid, field: "LIVE LSTART" if field == "lstart=" else "")
         rc = bok.cmd_down()
         assert rc == 0

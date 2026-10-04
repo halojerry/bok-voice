@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.agent import (  # noqa: E402
     _band_round_is_garbled,
     _garbled_reask_line,
@@ -162,7 +163,7 @@ def test_empty_turn_short_circuit_source_pinned():
 
 
 def test_env_keys_registered_in_forward_env():
-    bok = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok = bok_source()
     for key in (
         "BOK_GARBLED_REASK",
         "BOK_REASK_CONF_MEAN",

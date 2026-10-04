@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "apps" / "agent"))
 import pytest  # noqa: E402
 from livekit.agents import llm  # noqa: E402
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.providers.livekit_plugins import _RepeatSelfGuardStream  # noqa: E402
 
 AGENT_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
@@ -35,7 +36,7 @@ AGENT_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
 PLUGINS_SRC = (
     ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py"
 ).read_text(encoding="utf-8")
-BOK_SRC = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+BOK_SRC = bok_source()
 
 
 class _HangingInnerStream(llm.LLMStream):
