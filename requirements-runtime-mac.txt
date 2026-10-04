@@ -24,3 +24,5 @@ pypinyin>=0.53,<1
 # kaldi fbank（FireRedVAD 试点可选 VAD，providers/firered_vad.py）：跨平台 wheel
 # （mac arm64/linux x86_64/win amd64），仅 BOK_VAD_PROVIDER=firered 时才 import。
 kaldi-native-fbank>=1.22,<2
+# Sentry（R3 2026-10-04）：CP/worker 关键路径上报，SENTRY_DSN 缺席=no-op。
+sentry-sdk>=2,<3

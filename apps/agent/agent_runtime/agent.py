@@ -58,6 +58,14 @@ from .control_plane import ControlPlaneClient
 # DR 容灾+可观测(契约 §1,2026-10-01):worker 四 kind 指标批量上报 CP——
 # 通道/节流/吞错纪律全在模块内,agent 侧只做采样与生命周期挂线。
 from .metrics_report import MetricsReporter, VadInferTracker
+# R3(2026-10-04) Sentry 关键路径上报:DSN(SENTRY_DSN,经 bok.py _FORWARD_ENV
+# 类同款 env 注入)缺席=no-op;worker 面真火点=看门狗触发+背景 judge 失败。
+from bok_voice_obs.sentry_hook import capture as _sentry_capture
+from bok_voice_obs.sentry_hook import init_sentry as _init_sentry
+
+
+class WatchdogTimeoutError(RuntimeError):
+    """看门狗真火(非顺延)哨兵类型——Sentry 按类型聚合哑轮事件,见 R3。"""
 # Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md):薄客户端+纯装配,日志由本模块统一
 # 打点;enabled 闸在最外层(意图=BOK_LAYA_JUDGE、QA 复核=BOK_LAYA_QA,两把 env 闸
 # 独立立法;2026-09-27 意图闸默认翻启 "1"、QA 复核仍默认 "0")。缺 sidecar=
@@ -3572,6 +3580,10 @@ async def entrypoint(ctx):
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
+    # R3 Sentry:worker 进程内初始化(SDK 集成挂 ASGI 无关的纯 capture 面;
+    # DSN 缺席/SDK 缺席=完整 no-op,绝不阻 job)。
+    _init_sentry("agent-worker")
+
     # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
     # run_agent()/worker 主进程的安装对 serving 进程无效。
     from .preemptive_debug import install_preemptive_debug
@@ -4128,6 +4140,12 @@ async def entrypoint(ctx):
             f"-> force-interrupt + ack (call {room_name}) "
             f"[P0.4 tail_chars={_tail_chars} llm_turns={_llm_turns}]",
             flush=True,
+        )
+        # R3(2026-10-04) 关键路径上报:看门狗真火=生产哑轮的头条信号(25 天
+        # 24 例级),DSN 未设=no-op。
+        _sentry_capture(
+            WatchdogTimeoutError(f"no assistant audio {_response_watchdog_s():.0f}s"),
+            lane="watchdog-fire", tail_chars=str(_tail_chars), llm_turns=str(_llm_turns),
         )
         try:
             await session.interrupt(force=True)  # 清僵死 speech(若有),释放队列
@@ -6245,6 +6263,7 @@ async def entrypoint(ctx):
                     print(f"[followup] idempotent hit, no re-ack (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
             print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
+            _sentry_capture(exc, lane="judge-bg", step=str(step_at))  # R3:背景判定失败可聚合
         finally:
             _judge_inflight["step"] = -1
 

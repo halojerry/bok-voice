@@ -25,3 +25,6 @@ sentencepiece>=0.2
 pypinyin>=0.53,<1
 # kaldi fbank（FireRedVAD 试点可选 VAD，providers/firered_vad.py）：跨平台 wheel。
 kaldi-native-fbank>=1.22,<2
+# Sentry（R3 2026-10-04）：CP/worker 关键路径上报，SENTRY_DSN 缺席=no-op
+# （sentry_hook import 容错——离线节点未装也不炸启动）。
+sentry-sdk>=2,<3

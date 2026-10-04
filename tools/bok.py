@@ -1593,11 +1593,14 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     #    白名单 main.py:229）、BOK_ROOT_USERNAME/BOK_ROOT_PASSWORD（root 幂等种子
     #    main.py:400-401，operator/机器赋权后的自助入口；密码原值下发不 strip）、
     #    BOK_SIP_MODE（dial.mode env 覆盖 campaign.py:61）、BOK_CP_PUBLIC_URL
-    #    （云托管管理台/托管节点写 runtime-config main.py:444 + qa_digest.py:394）。
+    #    （云托管管理台/托管节点写 runtime-config main.py:444 + qa_digest.py:394）、
+    #    SENTRY_DSN（R3 2026-10-04：CP init_sentry + worker 关键路径上报;
+    #    worker 面同键另走 _FORWARD_ENV,双面同源 env）。
     if os.environ.get("BOK_ROOT_PASSWORD", "").strip():
         env["BOK_ROOT_PASSWORD"] = os.environ["BOK_ROOT_PASSWORD"]
     for _k in ("BOK_LOG_LEVEL", "BOK_CORS_ORIGINS", "BOK_ROOT_USERNAME",
-               "BOK_SIP_MODE", "BOK_CP_PUBLIC_URL"):
+               "BOK_SIP_MODE", "BOK_CP_PUBLIC_URL", "SENTRY_DSN",
+               "SENTRY_ENVIRONMENT"):
         _v = os.environ.get(_k, "").strip()
         if _v:
             env[_k] = _v
@@ -2438,6 +2441,11 @@ _FORWARD_ENV = (
     # （campaign.py:61 消费），本行补 agent worker 面——不登记则 prod 封闭 env 面
     # agent 侧恒读空串，env 覆盖结构性死门（2026-10-03 C2）。
     "BOK_SIP_MODE",
+    # Sentry 接线（R3 2026-10-04）：worker 面 init_sentry("agent-worker") +
+    # 看门狗真火/背景 judge 失败关键路径上报；DSN 缺席=完整 no-op。
+    # CP 面同键另走 _control_plane_env（main.py init_sentry）。
+    "SENTRY_DSN",
+    "SENTRY_ENVIRONMENT",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

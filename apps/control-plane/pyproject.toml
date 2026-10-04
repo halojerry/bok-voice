@@ -20,6 +20,9 @@ dependencies = [
   "httpx>=0.27,<1",
   "psycopg[binary]>=3.1",
   "sqlalchemy>=2.0,<3",
+  # R3(2026-10-04) Sentry:init_sentry("control-plane"),DSN 走 env 缺席=no-op;
+  # 观测件可选装但默认带上(镜像/裸机一致)。
+  "sentry-sdk>=2,<3",
 ]
 
 [tool.hatch.build.targets.wheel]
