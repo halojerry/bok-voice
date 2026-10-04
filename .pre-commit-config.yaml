@@ -1,0 +1,24 @@
+# 规范十条 R1(2026-10-04):能被工具强制的才是规范。
+# 安装(一次性,本机):pip install pre-commit && pre-commit install
+# 不装也能干活——同一两层门在 CI 里恒跑,本地 hook 只是提前反馈。
+# 层次与 pyproject [tool.ruff] 注释一致:
+#  ① 真 bug 类规则 → 全部 staged 文件(全树恒绿层,见 CI 同款 select);
+#  ② commit-msg → Conventional Commits「type(scope): 主题」校验。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff-check
+        name: ruff (real-bug rules, staged)
+        # 全量 select 在 pyproject;staged 存量文件的风格债不拦提交(风格层
+        # 只对新增文件强制,归 CI new-files 步)——这里只跑真 bug 类。
+        args: ["--select", "F821,F811,F601,F702,E722,E713,E714", "--no-cache"]
+
+  - repo: local
+    hooks:
+      - id: conventional-commit-msg
+        name: commit-msg 「type(scope): 主题」
+        entry: python3 .github/hooks/check_commit_msg.py
+        language: system
+        stages: [commit-msg]
+        always_run: true

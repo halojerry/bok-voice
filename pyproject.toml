@@ -1,0 +1,18 @@
+# 只承载工具配置,不声明 [project](包语义各归 apps/*/packages/* 自己的 pyproject,
+# pytest 配置在 pytest.ini 不动)。
+[tool.ruff]
+line-length = 120
+# vendored 粤拼库(上游 MIT,tab 缩进/长行是上游原样;我们的补丁也不在此树)
+extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor"]
+
+[tool.ruff.lint]
+# 规范十条 R1(2026-10-04,Ethan「能被工具强制的才是规范」):Ruff 单工具链,
+# select=E/F/W/I。存量风格债不整体清(治理计划定案「存量不整体 reformat」),
+# 分两层执行:
+#  ① 真 bug 类规则 = **全树** CI 门禁,现在就绿:
+#     F821(undefined-name)/F811(重复定义覆盖)/F601(字典键重复)/F702/E722/
+#     E713/E714 —— CI 与 pre-commit 都跑这一层;
+#  ② 风格类(E501/W191/F401/I001…) = 只对**新增文件**强制(CI diff-filter=A 步);
+#     存量文件的存量行不追——G2 拆包新模块天然生在全量规则之下。
+# 改本 select 须同步 .github/workflows/ci.yml 两步与 .pre-commit-config.yaml。
+select = ["E", "F", "W", "I"]
