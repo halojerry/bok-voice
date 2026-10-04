@@ -30,13 +30,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
-# G2 W②:prod/doctor/proc 域已搬 tools/bokctl/{prod,doctor,proc}.py——core 侧一律穿模块
-# 对象调用(prod.cmd_prod(...)/doctor.cmd_doctor(...)/proc._kill_proc_tree(...),
-# call-time 属性取用=patch 缝与后续域搬运保持可见)。
-from bokctl import doctor, proc, prod  # noqa: E402
+# G2 W②:prod/doctor/proc/health 域已搬 tools/bokctl/{prod,doctor,proc,health}.py——
+# core 侧一律穿模块对象调用(prod.cmd_prod(...)/doctor.cmd_doctor(...)/
+# proc._kill_proc_tree(...)/health._wait_desktop_ready(...),call-time 属性取用=
+# patch 缝与后续域搬运保持可见)。
+from bokctl import doctor, health, proc, prod  # noqa: E402
 
 _BOK_ROOT_ENV = os.environ.get("BOK_ROOT", "")
 # G2 W①:core.py 比 bok.py 深一层,repo 根=parents[2]
@@ -737,27 +738,6 @@ def healthy(port: int) -> bool:
         return False
 
 
-# ── 就绪真话（2026-10-02 编排审计第二波 · PR-A）──────────────────────────────
-# 端口绑定先于权重可用：mlx_lm 先 listen 再装权重、sidecar 的 uvicorn socket
-# 先于模型装载就绪，两者都让 1s TCP 探活变成谎（「绿着坏」）——等待环等到的是
-# 半死进程、健康面全绿而通话全灭。下列两个探针只认 HTTP 200，永不抛。
-def _http_ok(port: int, path: str, timeout_s: float = 1.5) -> bool:
-    """HTTP 真话探针：**仅 HTTP 200 为 True**（404/426/5xx/超时/拒连全 False，
-    与 _relaxed_healthy「任何应答=活」语义刻意相反——那个答的是「进程在」，
-    这个答的是「能干活」）。永不抛。"""
-    try:
-        status, _ = _http_call(f"http://127.0.0.1:{port}{path}", timeout_s=timeout_s)
-        return status == 200
-    except Exception:  # noqa: BLE001 - 探针只判定，不抛
-        return False
-
-
-def _llm_http_ready(port: int, timeout_s: float = 1.5) -> bool:
-    """LLM 端口就绪真话：/v1/models 必须 HTTP 200。queue proxy 拓扑下 :1235 是
-    代理（/v1/models 直通上游 mlx），代理活而上游 mlx 死亡/装载中同样 False。"""
-    return _http_ok(port, "/v1/models", timeout_s)
-
-
 # 健康面服务单点表（cmd_status / cmd_doctor / prod.cmd_prod_status 共用，防三张表
 # 各自漂移）：settle-llm(1237) 曾缺席 doctor 与 prod status——9B 静默缺失时
 # judge/纪要悄悄退回 4B 健康面全绿；worker 三件曾缺席 doctor。改端口先改这里。
@@ -975,26 +955,6 @@ def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
         return False
 
 
-def _ports_down_after_grace(
-    targets: Sequence[int], probe: Callable[[int], bool] | None = None
-) -> list[int]:
-    """等待环超时前的宽松终检（纯函数便于单测）：对每个 target 用放宽超时逐口
-    复检一次，返回仍探不活的端口列表（空=其实全部健康，别急着宣判超时）。"""
-    if probe is None:
-        probe = _relaxed_healthy
-    return [p for p in targets if not probe(p)]
-
-
-# mt/settle/settle-proxy/llm-raw/embed/laya:模型缺失即跳过,缺它们不拖垮整栈
-# (1238=9B 前门闸,queue 关的栈结构性没有,同享可选豁免)
-_OPTIONAL_LLM_PORTS = (1236, 1237, 1238, 1239, 8789, 8791)
-
-
-def _only_optional_ports(down: list[int]) -> bool:
-    """宽松终检缺口全落在可选线(MT :1236/settle :1237/llm-raw :1239)→ True(整栈照常放行)。"""
-    return bool(down) and all(p in _OPTIONAL_LLM_PORTS for p in down)
-
-
 def _llm_raw_expected() -> bool:
     """:1239（llm-raw，queue proxy 背后的内部 mlx）拓扑是否在役：mac +
     BOK_LLM_QUEUE_PROXY=1。代理关（或非 mac——Windows/Linux 走 llama.cpp，
@@ -1008,46 +968,6 @@ def _llm_raw_status_check_expected() -> bool:
     整栈未起（:1235 也不在）时 1239 不进表——那份判决留给 :1235 自己的必需
     检查，不重复报（镜像 :1237「起了才查」的可选线语义）。"""
     return _llm_raw_expected() and healthy(1235)
-
-
-# serve 就绪等待环的逐口判据（2026-10-02 readiness 真话）：这三个口有真实
-# HTTP 就绪面，必须 200 才算就绪（端口绑定先于权重可用，TCP=谎）；其余
-# （8000/7880/worker）维持 TCP——worker 的 /worker 真端点由 prod status /
-# monitor 面负责，serve 等待环不改语义。
-_SERVE_HTTP_READY_PORTS: dict[int, str] = {8787: "/health", 8788: "/health"}
-
-
-def _serve_ready_probe(port: int) -> bool:
-    """serve 等待环 1s 快档判据：LLM :1235 走 /v1/models HTTP-200；ASR/TTS
-    sidecar :8787/:8788 走 /health HTTP-200（模型装载中=503，等它）；其余 TCP。"""
-    if port == 1235:
-        return _llm_http_ready(port)
-    path = _SERVE_HTTP_READY_PORTS.get(port)
-    if path:
-        return _http_ok(port, path)
-    return healthy(port)
-
-
-def _serve_ready_probe_relaxed(port: int) -> bool:
-    """serve 宽松终检档判据：严格口维持 HTTP-200 真话（5s 窗吸收宿主 CPU
-    风暴的调度延迟），其余端口退回 _relaxed_healthy 旧语义——互杀事故收编
-    （2026-09-19）不得因本轮收窄。"""
-    if port == 1235:
-        return _llm_http_ready(port, timeout_s=5.0)
-    path = _SERVE_HTTP_READY_PORTS.get(port)
-    if path:
-        return _http_ok(port, path, timeout_s=5.0)
-    return _relaxed_healthy(port)
-
-
-def _wait_desktop_ready(targets: Sequence[int], tries: int = 120) -> bool:
-    """serve 就绪等待环（120×1s 形状保留）：全部 target 按 _serve_ready_probe
-    逐口判就绪才 True；超时 False（由调用方做宽松终检/宣判）。"""
-    for _ in range(tries):
-        if all(_serve_ready_probe(p) for p in targets):
-            return True
-        time.sleep(1)
-    return False
 
 
 def _repo_pythonpath() -> str:
@@ -1730,7 +1650,7 @@ def _warn_llm_not_http_ready(ports: Sequence[int]) -> None:
     mlx 端口先绑后装权重（或代理活着而上游 mlx 半死）时 TCP 探活全绿，serve
     会把「绿着坏」的栈当已起跳过 → 下一通首轮全量冷 prefill 甚至哑火。只打
     警告、**不改跳过语义**（双起风险远大于告警价值；真修复走 down+serve）。"""
-    not_ready = [p for p in ports if not _llm_http_ready(p)]
+    not_ready = [p for p in ports if not health._llm_http_ready(p)]
     if not_ready:
         for p in not_ready:
             print(f"[bok] llm :{p} tcp-up but /v1/models not ready "
@@ -2256,11 +2176,11 @@ def _cmd_up_services(models_only: bool = False) -> int:
     # 假死，180s 走完≠服务真死——宣判超时前逐口 5s 复检，全绿即 ready；仍有
     # 真死端口才退出并列出缺口（便于排障）。退出会留下加载中的子代给下一轮
     # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
-    still_down = _ports_down_after_grace(targets)
+    still_down = health._ports_down_after_grace(targets)
     if not still_down:
         print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235{mt_ready_suffix}")
         return 0
-    if _only_optional_ports(still_down):
+    if health._only_optional_ports(still_down):
         # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行
         # (B 线回退主 LLM/settle 回退 :1235),唔令 serve 在 agent worker 拉起前
         # 退出——评审:宽松路径原先漏掉这层豁免,会假超时退出留下加载中子代。
@@ -3077,7 +2997,7 @@ def cmd_serve() -> int:
     # 就绪判据（2026-10-02 readiness 真话）：1235（/v1/models）/8787/8788
     # （/health）必须 HTTP 200——mlx 先绑端口后装权重、sidecar 模型装载中
     # 503，TCP 通≠能干活；这些口的宽松终检同款（见 _serve_ready_probe*）。
-    if _wait_desktop_ready(targets):
+    if health._wait_desktop_ready(targets):
         _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
         ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
         if 1236 in targets:
@@ -3095,7 +3015,7 @@ def cmd_serve() -> int:
     # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
     # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
     # 严格口（1235/8787/8788）的复检维持 HTTP-200 真话（still_down 点名如实）。
-    still_down = _ports_down_after_grace(targets, probe=_serve_ready_probe_relaxed)
+    still_down = health._ports_down_after_grace(targets, probe=health._serve_ready_probe_relaxed)
     if not still_down:
         _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
         print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")

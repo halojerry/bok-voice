@@ -48,9 +48,9 @@ def test_core_ports_cover_embed_and_optional_exemption():
     """W1b embedding sidecar(:8789) 进单点表 + 享可选豁免(缺模型不算超时/降级)。"""
     assert ("embed", 8789) in bok.CORE_PORTS
     assert "embedding" in bok.OPTIONAL_MODELS
-    assert 8789 in bok._OPTIONAL_LLM_PORTS
+    assert 8789 in bok.health._OPTIONAL_LLM_PORTS
     # 宽松终检:缺口仅 embed → 放行(镜像 mt/settle 语义)。
-    assert bok._only_optional_ports([8789]) is True
+    assert bok.health._only_optional_ports([8789]) is True
     # 孤儿清扫身份映射:殭尸 embed 进程按端口+命令行双条件收割。
     assert any(port == 8789 and "bge-embed" in markers for port, markers in bok.proc._ORPHAN_PORT_OWNERS)
     # 放宽探活面:暖机窗 /health 应答(哪怕 ready=false)算进程在。

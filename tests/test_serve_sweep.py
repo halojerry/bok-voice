@@ -211,9 +211,9 @@ def test_ports_down_after_grace():
     """等待环宽松终检（纯函数）：只报仍探不活的口，全绿返回空列表。"""
     health = {8000: True, 8787: False, 8788: True, 1235: False}
     probe = lambda p: health[p]  # noqa: E731
-    assert bok._ports_down_after_grace([8000, 8787, 8788, 1235], probe=probe) == [8787, 1235]
-    assert bok._ports_down_after_grace([8000, 8788], probe=probe) == []
-    assert bok._ports_down_after_grace([], probe=probe) == []
+    assert bok.health._ports_down_after_grace([8000, 8787, 8788, 1235], probe=probe) == [8787, 1235]
+    assert bok.health._ports_down_after_grace([8000, 8788], probe=probe) == []
+    assert bok.health._ports_down_after_grace([], probe=probe) == []
 
 
 def test_ports_down_after_grace_default_probe(monkeypatch):
@@ -225,7 +225,7 @@ def test_ports_down_after_grace_default_probe(monkeypatch):
         return port != 8787
 
     patch_bok(monkeypatch, "_relaxed_healthy", fake_relaxed)
-    assert bok._ports_down_after_grace([8000, 8787]) == [8787]
+    assert bok.health._ports_down_after_grace([8000, 8787]) == [8787]
     assert monkey_hits == [8000, 8787]
 
 
@@ -410,8 +410,8 @@ def test_live_root_markers_kept(monkeypatch, tmp_path):
 def test_only_optional_ports_gate():
     """宽松终检可选线豁免（纯函数）：缺口全落 1236/1237 → 放行；掺任何核心
     端口/空列表 → 唔放行（空=全绿走 ready 分支,轮不到本闸）。"""
-    assert bok._only_optional_ports([1236])
-    assert bok._only_optional_ports([1236, 1237])
-    assert not bok._only_optional_ports([8787])
-    assert not bok._only_optional_ports([8787, 1236])
-    assert not bok._only_optional_ports([])
+    assert bok.health._only_optional_ports([1236])
+    assert bok.health._only_optional_ports([1236, 1237])
+    assert not bok.health._only_optional_ports([8787])
+    assert not bok.health._only_optional_ports([8787, 1236])
+    assert not bok.health._only_optional_ports([])
