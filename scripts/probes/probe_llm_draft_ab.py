@@ -71,7 +71,7 @@ def print_argv(mode: str) -> int:
     llm_py = bok.sidecar_python("llm-mlx")
     llm_model = bok.model_path({**current, "llm": current["llm"]}, "llm")
     draft_flags = bok._llm_draft_flags(current) if mode == "draft" else []
-    argv = bok._mac_llm_server_argv(
+    argv = bok.servers._mac_llm_server_argv(
         llm_py, llm_model, PORT, current, log_level="WARNING", draft_flags=draft_flags
     )
     print(" ".join(shlex.quote(str(a)) for a in argv))

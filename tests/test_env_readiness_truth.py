@@ -318,7 +318,7 @@ def test_serve_wait_wiring_source_pins():
     assert "def _serve_ready_probe(" in src
     assert "def _serve_ready_probe_relaxed(" in src
     assert "_SERVE_HTTP_READY_PORTS" in src
-    serve_src = inspect.getsource(bok.cmd_serve)
+    serve_src = inspect.getsource(bok.servers.cmd_serve)
     assert "if health._wait_desktop_ready(targets):" in serve_src
     assert "_ports_down_after_grace(targets, probe=health._serve_ready_probe_relaxed)" in serve_src
     # 旧形状（对全部 target 用 1s TCP）绝不得回潮到 serve 等待环
@@ -334,7 +334,7 @@ def test_start_llm_tcp_skip_warns_when_http_not_ready(monkeypatch, tmp_path, cap
     started: list = []
     patch_bok(monkeypatch, "_start_proc", lambda *a, **k: started.append(a))
     patch_bok(monkeypatch, "_llm_http_ready", lambda port, timeout_s=1.5: False)
-    bok._start_llm({}, tmp_path, tmp_path)
+    bok.servers._start_llm({}, tmp_path, tmp_path)
     assert started == []
     err = capsys.readouterr().err
     assert "tcp-up but /v1/models not ready" in err
@@ -342,7 +342,7 @@ def test_start_llm_tcp_skip_warns_when_http_not_ready(monkeypatch, tmp_path, cap
 
     # /v1/models 就绪 → 零告警、照旧跳过
     patch_bok(monkeypatch, "_llm_http_ready", lambda port, timeout_s=1.5: True)
-    bok._start_llm({}, tmp_path, tmp_path)
+    bok.servers._start_llm({}, tmp_path, tmp_path)
     assert started == []
     assert "not ready" not in capsys.readouterr().err
 

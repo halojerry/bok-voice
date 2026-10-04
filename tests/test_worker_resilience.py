@@ -90,7 +90,7 @@ def _import_bok():
 
 def test_worker_specs_three_workers_ports_and_env():
     bok = _import_bok()
-    specs = bok._worker_specs(sys.executable)
+    specs = bok.servers._worker_specs(sys.executable)
     assert [s["port"] for s in specs] == [8081, 8082, 8083]
     assert [s["name"] for s in specs] == ["agent", "interp-fwd", "interp-rev"]
     for s in specs:

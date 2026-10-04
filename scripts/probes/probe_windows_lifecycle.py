@@ -241,9 +241,10 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
         pidfile = tmp / "run" / "probe-tree.pid"
         logfile = tmp / "logs" / "probe-tree.log"
 
-        # A1 起真进程树(bok._start_proc 同款:POSIX start_new_session=True)
+        # A1 起真进程树(bok._start_proc 同款:POSIX start_new_session=True;
+        # servers 波后 spawn 原语住 bokctl.servers,门面经 bok.servers 取)
         try:
-            child_pid = mod._start_proc(
+            child_pid = mod.servers._start_proc(
                 [sys.executable, "-c", _CHILD_CODE, str(tmp)], pidfile, logfile)
         except Exception as exc:
             # 窄匹配:只有 nt + ValueError 且消息点名 start_new_session 这一种

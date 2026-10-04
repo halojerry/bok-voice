@@ -318,7 +318,7 @@ def test_dev_9b_off_skips_settle_llm_start(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("BOK_DEV_9B", "0")
     started: list[list[str]] = []
     patch_bok(monkeypatch, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
-    rc = bok._start_settle_llm({}, tmp_path, tmp_path)
+    rc = bok.servers._start_settle_llm({}, tmp_path, tmp_path)
     assert rc is False
     assert not started
     err = capsys.readouterr().err

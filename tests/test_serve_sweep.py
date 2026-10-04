@@ -369,7 +369,7 @@ def test_start_proc_writes_env_stamp_and_marker(monkeypatch, tmp_path):
     logfile = tmp_path / "logs" / "x.log"
     logfile.parent.mkdir(parents=True, exist_ok=True)
 
-    pid = bok._start_proc(["true"], run_dir / "x.pid", logfile, env={"A": "b"})
+    pid = bok.servers._start_proc(["true"], run_dir / "x.pid", logfile, env={"A": "b"})
     assert pid == _FAKE_PID
     assert (run_dir / "x.pid").read_text() == str(_FAKE_PID)
     # Popen 会被调两次：真 spawn 一次 + _ps_field 的 subprocess.run 内部一次

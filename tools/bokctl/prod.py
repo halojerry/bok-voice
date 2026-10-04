@@ -2,9 +2,12 @@
 """prod 域(launchd/systemd 常驻安装、prod install/uninstall/status;G2 W② 从 core 搬出,
 搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core` 拿模块对象:凡仍住在 core 的名字(ROOT/
-  PROD_HTTP_CHECKS/_agent_prod_env/app_data_dir/healthy/repo_python/is_mac/is_linux
-  等)一律 `core.X` 调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性)。
+- 本模块只 `from bokctl import core`(及 servers 域)拿模块对象:凡仍住在 core 的
+  名字(ROOT/PROD_HTTP_CHECKS/_agent_prod_env/app_data_dir/healthy/repo_python/
+  is_mac/is_linux 等)一律 `core.X` 调用时取——patch 与后续域搬运在 core 侧保持
+  可见(patch 缝=模块属性)。`_realtime_demo_enabled` 属 serve 装配门,W②-servers
+  波搬入 bokctl.servers,本域穿 `servers.X` 取(servers 波新例:域间消费=改穿
+  所属域,core 不做值转发)。
 - 本域自有函数(_prod_units/_systemd_staging_dir/cmd_prod_install/uninstall/status/
   cmd_prod)域内裸名互调(同模块全局=call-time 可 patch)。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把 "cmd_prod"
@@ -19,7 +22,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from bokctl import core
+from bokctl import core, servers
 
 
 def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
@@ -69,7 +72,7 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
                 "模型面常驻（asr/llm/mt/settle/tts；bok up --models-only 幂等重扫）",
             )
         )
-    if core._realtime_demo_enabled():
+    if servers._realtime_demo_enabled():
         # 演示档常驻单元（opt-in，同 _worker_specs 门）：BOK_QWEN_REALTIME=1 才
         # 生成 launchd/schtasks/systemd 单元——健康面 WORKER_PORTS 不收 :8084
         # （默认栈不跑演示档，常列会令 prod status 对未启用部署恒 DEGRADED）。

@@ -64,20 +64,20 @@ def _local_children(el: ET.Element) -> list[str]:
 def test_spawn_kwargs_windows_uses_process_group(monkeypatch) -> None:
     monkeypatch.setattr(bok.os, "name", "nt")
     # subprocess.CREATE_NEW_PROCESS_GROUP 只在 Windows 存在；POSIX 上用字面量 0x200 断言。
-    assert bok._spawn_kwargs() == {"creationflags": 512}
+    assert bok.servers._spawn_kwargs() == {"creationflags": 512}
 
 
 def test_spawn_kwargs_posix_start_new_session() -> None:
     if bok.os.name == "nt":
         pytest.skip("POSIX-only contract")
-    assert bok._spawn_kwargs() == {"start_new_session": True}
+    assert bok.servers._spawn_kwargs() == {"start_new_session": True}
 
 
 def test_start_proc_writes_pidfile_posix(tmp_path: Path) -> None:
     """POSIX 真起一炮：pidfile 落盘、返回 pid（probe_windows_lifecycle A 段的同款路径）。"""
     (tmp_path / "logs").mkdir()
     pidfile = tmp_path / "run" / "x.pid"
-    pid = bok._start_proc([sys.executable, "-c", "pass"], pidfile, tmp_path / "logs" / "x.log")
+    pid = bok.servers._start_proc([sys.executable, "-c", "pass"], pidfile, tmp_path / "logs" / "x.log")
     assert pid > 0
     assert pidfile.read_text().strip() == str(pid)
 
@@ -729,7 +729,7 @@ def test_prod_units_cp_bind_host_defaults_loopback(monkeypatch, tmp_path: Path) 
     monkeypatch.delenv("BOK_BIND_HOST", raising=False)
     argv = _cp_unit_args(monkeypatch, tmp_path)
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
-    serve_src = inspect.getsource(bok.cmd_serve)
+    serve_src = inspect.getsource(bok.servers.cmd_serve)
     assert "_cp_bind_host()" in serve_src, (
         "cmd_serve must consume the same _cp_bind_host() helper as _prod_units")
 

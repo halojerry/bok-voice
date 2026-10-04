@@ -70,10 +70,10 @@ def test_worker_specs_port_follows_env(monkeypatch, tmp_path) -> None:
     patch_bok(monkeypatch, "_agent_worker_env", lambda py: {})
     patch_bok(monkeypatch, "_realtime_demo_enabled", lambda: False)
     monkeypatch.delenv("BOK_WORKER_PORT", raising=False)
-    specs = bok._worker_specs("/py")
+    specs = bok.servers._worker_specs("/py")
     assert specs[0]["port"] == 8081
     monkeypatch.setenv("BOK_WORKER_PORT", "9081")
-    specs = bok._worker_specs("/py")
+    specs = bok.servers._worker_specs("/py")
     assert specs[0]["port"] == 9081
     assert [s["port"] for s in specs[1:]] == [8082, 8083], "interp 两件保持固定"
 
@@ -116,7 +116,7 @@ def test_shared_iteration_sites_use_dynamic_table() -> None:
 def test_monitor_banner_and_serve_wiring() -> None:
     """monitor 横幅与 serve 等待环都必须吃动态口。"""
     assert "_agent_worker_port()" in inspect.getsource(bok.cmd_monitor)
-    assert "_desktop_stack_targets()" in inspect.getsource(bok.cmd_serve)
+    assert "_desktop_stack_targets()" in inspect.getsource(bok.servers.cmd_serve)
 
 
 def test_relaxed_healthy_worker_http_surface_follows_env(monkeypatch) -> None:

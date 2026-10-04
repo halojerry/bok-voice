@@ -82,7 +82,7 @@ def test_start_settle_proxy_lifecycle(monkeypatch, tmp_path) -> None:
         monkeypatch, "_start_proc",
         lambda argv, pid, log, env=None: spawned.append((argv, pid, log, env)),
     )
-    assert bok._start_settle_proxy(tmp_path, tmp_path) is True
+    assert bok.servers._start_settle_proxy(tmp_path, tmp_path) is True
     assert len(spawned) == 1
     argv, pid, log, env = spawned[0]
     assert "queue_proxy.py" in " ".join(str(x) for x in argv)
@@ -93,12 +93,12 @@ def test_start_settle_proxy_lifecycle(monkeypatch, tmp_path) -> None:
     # 已健康=幂等跳过（healthy 早退路径同款）
     spawned.clear()
     patch_bok(monkeypatch, "healthy", lambda p: True)
-    assert bok._start_settle_proxy(tmp_path, tmp_path) is True
+    assert bok.servers._start_settle_proxy(tmp_path, tmp_path) is True
     assert spawned == []
     # queue 关=不起
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
     patch_bok(monkeypatch, "healthy", lambda p: False)
-    assert bok._start_settle_proxy(tmp_path, tmp_path) is False
+    assert bok.servers._start_settle_proxy(tmp_path, tmp_path) is False
     assert spawned == []
 
 

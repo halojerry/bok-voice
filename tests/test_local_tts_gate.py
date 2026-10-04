@@ -45,7 +45,7 @@ def _gate(monkeypatch, tmp_path: Path, env: str | None = None) -> tuple[bool, st
         monkeypatch.delenv("BOK_LOCAL_TTS", raising=False)
     else:
         monkeypatch.setenv("BOK_LOCAL_TTS", env)
-    return bok._local_tts_needed()
+    return bok.servers._local_tts_needed()
 
 
 def test_cloud_global_minimax_skips_local(monkeypatch, tmp_path):

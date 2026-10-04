@@ -35,10 +35,10 @@ def test_models_only_skips_call_plane(monkeypatch) -> None:
         monkeypatch, "_start_call_plane",
         lambda py: (calls.append(("call_plane",)), True)[1])
     patch_bok(monkeypatch, "repo_python", lambda: "/py")
-    assert bok.cmd_up(models_only=True) == 0
+    assert bok.servers.cmd_up(models_only=True) == 0
     assert calls == [("services", True)], "models-only 不得拉通话面"
     calls.clear()
-    assert bok.cmd_up() == 0
+    assert bok.servers.cmd_up() == 0
     assert calls == [("services", False), ("call_plane",)], "缺省全栈行为零变化"
 
 
@@ -68,7 +68,7 @@ def test_models_only_service_set(monkeypatch, tmp_path) -> None:
     patch_bok(monkeypatch, "_start_settle_llm", lambda *a, **k: (started.append("settle-lane"), True)[1])
     patch_bok(monkeypatch, "_start_laya", lambda *a, **k: (started.append("laya-lane"), False)[1])
     patch_bok(monkeypatch, "_ports_down_after_grace", lambda targets, probe=None: [])
-    assert bok._cmd_up_services(models_only=True) == 0
+    assert bok.servers._cmd_up_services(models_only=True) == 0
     assert "8787" in started and "8788" in started
     assert "llm-lane" in started and "mt-lane" in started and "settle-lane" in started
     for call_port in ("7880", "8081", "8082", "8083"):

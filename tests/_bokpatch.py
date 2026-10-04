@@ -31,6 +31,20 @@ PATCH_TARGETS: dict[str, str] = {
     "_http_ok": "bokctl.health",
     "_llm_http_ready": "bokctl.health",
     "_ports_down_after_grace": "bokctl.health",
+    # servers 域(W② 搬出:serve/up 服务面+spawn 原语)
+    "cmd_up": "bokctl.servers",
+    "_cmd_up_services": "bokctl.servers",
+    "_start_call_plane": "bokctl.servers",
+    "_start_llm": "bokctl.servers",
+    "_start_mt_llm": "bokctl.servers",
+    "_start_settle_llm": "bokctl.servers",
+    "_start_laya": "bokctl.servers",
+    "_apply_mlx_template_fix": "bokctl.servers",
+    "_worker_specs": "bokctl.servers",
+    "_local_tts_needed": "bokctl.servers",
+    "_start_proc": "bokctl.servers",
+    "_realtime_demo_enabled": "bokctl.servers",
+    "_physical_mem_gib": "bokctl.servers",
 }
 
 _DEFAULT_TARGET = "bokctl.core"

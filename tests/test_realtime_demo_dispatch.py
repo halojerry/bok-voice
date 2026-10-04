@@ -376,10 +376,10 @@ def test_bok_realtime_worker_spec_opt_in(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "repo_python", lambda: "py")
     monkeypatch.delenv("BOK_QWEN_REALTIME", raising=False)
-    names = [s["name"] for s in bok_mod._worker_specs("py")]
+    names = [s["name"] for s in bok_mod.servers._worker_specs("py")]
     assert "realtime-demo" not in names
     monkeypatch.setenv("BOK_QWEN_REALTIME", "1")
-    specs = {s["name"]: s for s in bok_mod._worker_specs("py")}
+    specs = {s["name"]: s for s in bok_mod.servers._worker_specs("py")}
     assert specs["realtime-demo"]["port"] == 8084
     assert specs["realtime-demo"]["argv"][-1].endswith("agent_runtime.realtime_demo")
     assert specs["realtime-demo"]["env"]["BOK_SERVICE"] == "realtime-demo"

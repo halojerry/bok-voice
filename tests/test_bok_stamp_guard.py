@@ -195,11 +195,11 @@ def test_stop_pidfile_refuses_foreign_kills_unknown(monkeypatch, tmp_path, capsy
         unknown = pool.spawn(None)
         run = _run_dir(home)
         (run / "tts.pid").write_text(str(foreign.pid))
-        bok._stop_pidfile(run / "tts.pid")
+        bok.servers._stop_pidfile(run / "tts.pid")
         _assert_alive(foreign)
         assert "属另一代码树" in capsys.readouterr().err
         (run / "tts.pid").write_text(str(unknown.pid))
-        bok._stop_pidfile(run / "tts.pid")
+        bok.servers._stop_pidfile(run / "tts.pid")
         _wait_dead(unknown)
     finally:
         pool.cleanup()
@@ -280,6 +280,7 @@ def test_respawn_skips_healthy_port(monkeypatch, tmp_path):
     """monitor _respawn 起拉循环：端口已有健康监听跳过（杀被守卫挡下后不硬起刷
     bind 失败噪声）。_respawn 是 cmd_monitor 闭包——按同源逻辑最小复刻验证。"""
     import bokctl.core as core  # 权威命名空间（W① 补丁契约：读与补丁同源）
+    import bokctl.servers as servers  # servers 波:_start_proc 权威命名空间
 
     _tmp_home(monkeypatch, tmp_path)
     started: list[int] = []
@@ -293,11 +294,12 @@ def test_respawn_skips_healthy_port(monkeypatch, tmp_path):
          "logfile": Path("/tmp/x.log"), "argv": [], "env": {}},
     ]
     # 与 cmd_monitor._respawn 的起拉循环同构（健康跳过段逐字同款）——
-    # 循环体读 core 全局（生产闭包同源），不吃门面镜像（补丁打在 core）。
+    # 循环体读生产同源全局（healthy 留 core、_start_proc 随 servers 波入
+    # bokctl.servers；补丁按 _bokpatch 权威模块打）。
     for spec in specs:
         if core.healthy(spec["port"]):
             continue
-        core._start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+        servers._start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
     assert started == [1], "只有不健康端口该被拉起"
 
 

@@ -27,7 +27,7 @@ def test_prefix_family_passthrough(monkeypatch) -> None:
     monkeypatch.setenv("QWEN3_ASR_CONFIDENCE", "0")
     monkeypatch.setenv("QWEN3_ASR_FINISH_LOCK_WAIT", "1.0")
     monkeypatch.setenv("QWEN3_ASR_PARTIAL_MAX_SEC", "12")
-    env = bok._qwen3_asr_sidecar_env(
+    env = bok.servers._qwen3_asr_sidecar_env(
         {"QWEN3_ASR_MODEL": "/models/asr", "QWEN3_ASR_BACKEND": "mlx"}
     )
     assert env["QWEN3_ASR_SAMPLE_RATE"] == "8000"
@@ -40,7 +40,7 @@ def test_base_keys_win_and_empty_values_skipped(monkeypatch) -> None:
     """必填键优先（setdefault 语义）；空值不透传（TTS 先例同款）。"""
     monkeypatch.setenv("QWEN3_ASR_MODEL", "/env/model")
     monkeypatch.setenv("QWEN3_ASR_SAMPLE_RATE", "")
-    env = bok._qwen3_asr_sidecar_env({"QWEN3_ASR_MODEL": "/base/model"})
+    env = bok.servers._qwen3_asr_sidecar_env({"QWEN3_ASR_MODEL": "/base/model"})
     assert env["QWEN3_ASR_MODEL"] == "/base/model"
     assert "QWEN3_ASR_SAMPLE_RATE" not in env
 
@@ -49,14 +49,14 @@ def test_other_prefixes_not_leaked(monkeypatch) -> None:
     """TTS 等近邻前缀不串门（sidecar 各自的族互不污染）。"""
     monkeypatch.setenv("QWEN3_TTS_STREAM_INTERVAL", "0.1")
     monkeypatch.setenv("BOK_TTS_BOTH_MODELS", "1")
-    env = bok._qwen3_asr_sidecar_env({"QWEN3_ASR_MODEL": "/m"})
+    env = bok.servers._qwen3_asr_sidecar_env({"QWEN3_ASR_MODEL": "/m"})
     assert "QWEN3_TTS_STREAM_INTERVAL" not in env
     assert "BOK_TTS_BOTH_MODELS" not in env
 
 
 def test_bok_asr_engine_and_device_stay_explicit() -> None:
     """BOK_ASR_ENGINE / QWEN3_ASR_DEVICE 的显式处理保留在启动点（不进 helper）。"""
-    src = inspect.getsource(bok._cmd_up_services)
+    src = inspect.getsource(bok.servers._cmd_up_services)
     assert 'asr_env["BOK_ASR_ENGINE"]' in src, "BOK_ASR_ENGINE 显式注入不得丢"
     assert 'asr_env["QWEN3_ASR_DEVICE"]' in src, "Windows/transformers 的 DEVICE 分支不得丢"
     # 启动点必须把 hand-built dict 过 helper（前缀整族透传的接线点）。

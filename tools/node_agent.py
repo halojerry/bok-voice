@@ -950,7 +950,7 @@ def main(argv=None) -> int:
         bok.cmd_down()
 
     _kill_stack_hook = _stop_stack_once
-    bok.cmd_up()
+    bok.servers.cmd_up()
     stop = threading.Event()
     worker = threading.Thread(
         target=functools.partial(heartbeat_loop, cfg, stop,

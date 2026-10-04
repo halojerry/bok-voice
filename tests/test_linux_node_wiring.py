@@ -146,7 +146,7 @@ def test_cmd_up_runs_services_then_call_plane(monkeypatch):
     calls: list[str] = []
     patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 0)[1])
     patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
-    assert bok.cmd_up() == 0
+    assert bok.servers.cmd_up() == 0
     assert calls == ["services", "call_plane"]
 
 
@@ -154,7 +154,7 @@ def test_cmd_up_skips_call_plane_when_services_fail(monkeypatch):
     calls: list[str] = []
     patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 1)[1])
     patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
-    assert bok.cmd_up() == 1
+    assert bok.servers.cmd_up() == 1
     assert calls == ["services"]  # 服务面失败即短路，通话面不拉
 
 
@@ -175,7 +175,7 @@ def test_start_call_plane_waits_livekit_then_starts_workers(monkeypatch, tmp_pat
         ],
     )
     patch_bok(monkeypatch, "_ensure_monitor", lambda py: started.append("monitor"))
-    assert bok._start_call_plane("/py") is True
+    assert bok.servers._start_call_plane("/py") is True
     assert started == ["/py", "monitor"]
 
 
@@ -190,7 +190,7 @@ def test_start_call_plane_returns_false_without_livekit(monkeypatch, tmp_path: P
     patch_bok(monkeypatch, "_worker_specs", lambda py: (_ for _ in ()).throw(AssertionError("worker 不应被拉起")))
     monkeypatch.setattr(bok.time, "sleep", lambda s: None)
     monkeypatch.setattr(bok.time, "monotonic", _deadline_clock())
-    assert bok._start_call_plane("/py") is False
+    assert bok.servers._start_call_plane("/py") is False
 
 
 def _deadline_clock():
