@@ -49,7 +49,7 @@ from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# 与 scripts/mine_qa.py 同款:免 pip install 也能 import 仓库内包。
+# 与 scripts/runtime/mine_qa.py 同款:免 pip install 也能 import 仓库内包。
 for _sub in ("apps/control-plane", "packages/core", "packages/business-db", "packages/knowledge", "packages/observability"):
     _p = str(ROOT / _sub)
     if _p not in sys.path:

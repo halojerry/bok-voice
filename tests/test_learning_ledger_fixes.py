@@ -6,7 +6,7 @@
 - TASK 2 ``gap_mining.compute_coverage``:降级 provider 行单列 degraded 桶、不进
   内容快路分母;
 - TASK 3 ``summarize.Summarizer._render_transcript``:跳过账本噪声行,B 线放行;
-- TASK 4 ``scripts/pregen_tts.py`` 源级 pin:steps_json 必须取详情冻结 overlay。
+- TASK 4 ``scripts/runtime/pregen_tts.py`` 源级 pin:steps_json 必须取详情冻结 overlay。
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ def test_render_transcript_legacy_objects_without_gen_still_render():
 
 
 def test_pregen_tts_reads_frozen_template_detail_not_list_payload():
-    src = (ROOT / "scripts" / "pregen_tts.py").read_text(encoding="utf-8")
+    src = (ROOT / "scripts" / "runtime" / "pregen_tts.py").read_text(encoding="utf-8")
     # 机器通道自报头(与运行时 agent ControlPlaneClient 同款)+ 通道参数
     assert "X-Bok-Channel" in src and '"agent"' in src
     assert "channel=True" in src

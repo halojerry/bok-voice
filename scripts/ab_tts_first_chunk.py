@@ -12,7 +12,7 @@
     .venv312/bin/python scripts/ab_tts_first_chunk.py --out /tmp/ab
 
 API key / 音色来自 CP settings（``GET /api/settings?internal=true`` 的
-``tts.api_key`` + 人设 ``reference_audio``），与运行时 / scripts/pregen_tts.py 同源；
+``tts.api_key`` + 人设 ``reference_audio``），与运行时 / scripts/runtime/pregen_tts.py 同源；
 也可用 ``MINIMAX_API_KEY`` / ``MINIMAX_VOICE`` 覆盖。
 """
 

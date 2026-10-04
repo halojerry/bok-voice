@@ -424,7 +424,7 @@ python tools/bok.py tts-pregen --qa        # 全量补录（admin/root；云配�
 ① 收割：dialing/in_call 的名单项其通话已终态 → 落结果（幂等）；
 ② 串行补位：无进行中项且有 pending → 建通话+显式派单（metadata 带 dial 块）；
 ③ 名单尽 → done。起拨前 gap 冷却：最近终态项距今不足冷却秒不起下一通（首通不受门控）。
-mock 档派生 `scripts/mock_callee.py` 子进程当虚拟客户（answer 逐句轮播 / no_answer 不入房 / reject 进房即离 / 说一句就走四态）；real 档走官方 CreateSIPParticipant + SipCallError 码映射（486/603 拒接、408/480 无人接、5xx trunk 故障），需 Redis + 公网可达 trunk。
+mock 档派生 `scripts/runtime/mock_callee.py` 子进程当虚拟客户（answer 逐句轮播 / no_answer 不入房 / reject 进房即离 / 说一句就走四态）；real 档走官方 CreateSIPParticipant + SipCallError 码映射（486/603 拒接、408/480 无人接、5xx trunk 故障），需 Redis + 公网可达 trunk。
 
 **常见坑**：对象没填电话=名单项直接 skipped 且不占冷却；「开关关不掉」=旧版本只改了表单没传 `{}`，现版本已堵，升级后仍建议点完开关保存后复查一次。
 

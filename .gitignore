@@ -32,7 +32,9 @@ services/*/data/
 .zcode/
 apps/web/AGENTS.md
 apps/web/CLAUDE.md
-runtime
+# 仓库根 build_runtime.sh 生成物（锚定根,勿写成裸 runtime——2026-10-04 G1b 起
+# scripts/runtime/ 是受管产品运行时执行体,必须 tracked）。
+/runtime
 tests/fixtures/audio/e2e_multi/
 
 # SDD plan workspace (superpowers subagent-driven development scratch)

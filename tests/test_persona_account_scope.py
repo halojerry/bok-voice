@@ -6,7 +6,7 @@
   看不到它 → pregen_tts --persona 找不到 → 静默回落默认音色 moss_audio_*,物化
   缓存键与运行时错位(「看起来录好了、通话里永远不播」)。显式 account_id 维持
   原优先级;admin 身份强制本账号;by-ID PUT 未显式携带 account_id 不洗账号。
-- scripts/pregen_tts.py:--persona 指定的人设找不到 → rc=3 响亮失败、零 provider
+- scripts/runtime/pregen_tts.py:--persona 指定的人设找不到 → rc=3 响亮失败、零 provider
   构造、零缓存写,绝不静默回落默认音色。
 - CP 罐头状态端点:voice_source 顶层信息位透传;statuses 三态语义不变(web 按
   三态渲染,改语义会静默破 UI)。

@@ -3,7 +3,7 @@
 统一四态出口，双后端:
 - real:官方 livekit.api CreateSIPParticipant(wait_until_answered=True),
   SipCallError 按 SIP 码映射(486/603 拒接、408/480 无人接、5xx trunk 故障)。
-- mock:CP 派生 scripts/mock_callee.py 子进程(真 TTS 客户语音)进房,
+- mock:CP 派生 scripts/runtime/mock_callee.py 子进程(真 TTS 客户语音)进房,
   agent wait_for_participant;超时=no_answer、进房后 1.5s 内离房且零音频=rejected。
 
 官方铁律:USER_UNAVAILABLE/SIP_TRUNK_FAILURE(即 no_answer/failed)RoomIO 不自动收,

@@ -3,7 +3,7 @@
 
 真实链路（不 mock 任何 CP/LiveKit 组件）：`POST /api/campaigns` 建波 + start
 → CP campaign loop（5s 巡检）串行起拨 → agent 收到 metadata dial 块 → mock 档
-派生 `scripts/mock_callee.py` 真语音被叫进房 → 客户说出 WhatsApp 号码 → agent
+派生 `scripts/runtime/mock_callee.py` 真语音被叫进房 → 客户说出 WhatsApp 号码 → agent
 侦测捕获上报 CP → 名册自动入册 → 电话收线 → loop 收割终态、留 gap 冷却后起下一通。
 
 断言：

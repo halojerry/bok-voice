@@ -160,7 +160,7 @@ CONVERTED = [
     "e2e_barge_in.py",
     "e2e_edge_cases.py",
     "e2e_trilingual_livekit.py",
-    "mock_callee.py",
+    "runtime/mock_callee.py",
     "probe_brand_words.py",
     "probe_hotword_ab.py",
     "probe_interp_continuous.py",

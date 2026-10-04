@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "mock_callee.py"
+_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "runtime" / "mock_callee.py"
 _spec = importlib.util.spec_from_file_location("mock_callee", _SCRIPT)
 assert _spec and _spec.loader
 mock_callee = importlib.util.module_from_spec(_spec)

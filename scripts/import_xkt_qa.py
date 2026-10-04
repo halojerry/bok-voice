@@ -190,7 +190,7 @@ def main() -> int:
             head_ids[str(c["question_text"])] = str(row.get("id"))
         done += 1
     fail_note = f"，失败 {failed} 条" if failed else ""
-    print(f"已入库 {done} 条{fail_note}。下一步: python scripts/pregen_tts.py --qa 物化罐头；步骤挂载请在画布拖线。")
+    print(f"已入库 {done} 条{fail_note}。下一步: python scripts/runtime/pregen_tts.py --qa 物化罐头；步骤挂载请在画布拖线。")
     return 0
 
 

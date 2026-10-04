@@ -1,18 +1,18 @@
 """离线批量预合成 TTS 本地缓存(bok.py tts-pregen 的执行体,2026-09-08;task-14b 按人设物化)。
 
 用法(bok.py 负责带好 PYTHONPATH 与 SSL_CERT_FILE):
-  python scripts/pregen_tts.py --greetings            # 无变量脚本线全量
-  python scripts/pregen_tts.py --objects              # 逐对象渲染开场白/收线/心跳
-  python scripts/pregen_tts.py --greetings --objects  # 一次跑齐
-  python scripts/pregen_tts.py --greetings --object X # 直念步按对象 X 的变量渲染(缺省=账号最近更新对象)
-  python scripts/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
-  python scripts/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
-  python scripts/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
-  python scripts/pregen_tts.py --branches             # 话术分支应答物化(步骤 ref「如果客户X→就Y」)
-  python scripts/pregen_tts.py --branches --texts-file t.txt  # 只物化指定分支应答(CP 按条补录;一行一条,resp 原文含动作标记)
-  python scripts/pregen_tts.py --qa-status            # 逐条目物化状态 JSON(stdout,不合成不碰云)
-  python scripts/pregen_tts.py --branch-status        # 逐分支应答物化状态 JSON(stdout,不合成;键=resp 原文含动作标记,值 ok/missing/ph)
-  python scripts/pregen_tts.py --qa --entry-id X      # 只物化指定 qa 条目 id(--entry-id 可重复)
+  python scripts/runtime/pregen_tts.py --greetings            # 无变量脚本线全量
+  python scripts/runtime/pregen_tts.py --objects              # 逐对象渲染开场白/收线/心跳
+  python scripts/runtime/pregen_tts.py --greetings --objects  # 一次跑齐
+  python scripts/runtime/pregen_tts.py --greetings --object X # 直念步按对象 X 的变量渲染(缺省=账号最近更新对象)
+  python scripts/runtime/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
+  python scripts/runtime/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
+  python scripts/runtime/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
+  python scripts/runtime/pregen_tts.py --branches             # 话术分支应答物化(步骤 ref「如果客户X→就Y」)
+  python scripts/runtime/pregen_tts.py --branches --texts-file t.txt  # 只物化指定分支应答(CP 按条补录;一行一条,resp 原文含动作标记)
+  python scripts/runtime/pregen_tts.py --qa-status            # 逐条目物化状态 JSON(stdout,不合成不碰云)
+  python scripts/runtime/pregen_tts.py --branch-status        # 逐分支应答物化状态 JSON(stdout,不合成;键=resp 原文含动作标记,值 ok/missing/ph)
+  python scripts/runtime/pregen_tts.py --qa --entry-id X      # 只物化指定 qa 条目 id(--entry-id 可重复)
   任意组合 + --dry-run                                # 只打印 (persona,lang,voice,条数) 计划清单
 
 语音解析与运行时同源:CP /api/settings(internal=true 拿明文 api_key)+

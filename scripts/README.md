@@ -1,7 +1,7 @@
 # scripts/ 索引（G1a）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（含 `archive/`；不含 `cuda/`、`artifacts/`、`__pycache__/`）——当前 127 个（顶层 85 + `probes/` 14 + `bench/` 16 + `e2e/` 5 + `seed/` 3 + `ops/` 2 + `archive/` 2，G1b 起分桶）；`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。
+> 覆盖 `scripts/` 下全部受管 .py（含 `archive/`；不含 `cuda/`、`artifacts/`、`__pycache__/`）——当前 127 个（顶层 82 + `probes/` 14 + `bench/` 16 + `e2e/` 5 + `seed/` 3 + `ops/` 2 + `runtime/` 3 + `archive/` 2，G1b 起分桶；**`runtime/` 三件=CP/bok.py 直接起进程的产品运行时执行体**）；`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
@@ -50,16 +50,16 @@
 | `scripts/measure_prompt.py` | 逐段量度实际注入 LLM 的 system 体积（KV-cache 前置的验收工具）。 | 3 脚本 import / probe_judge_parity.py | 否 | 2026-09-22 |
 | `scripts/migrate_templates_8step_0913.py` | 三语模板 6 步 → 8 步迁移(2026-09-13 甲.1 拆步终稿)。 | test_slot_rendering.py import / test_slot_rendering.py | 否 | 2026-10-04 |
 | `scripts/mimosa_triage.py` | Mimosa 扫描 triage：findings.json vs 仓库审定清单 → 只打印未审定增量。 | security/mimosa/suppressions.json / SHAPES.md | 否 | 2026-09-23 |
-| `scripts/mine_qa.py` | 高频问答对挖掘（bok.py tts-mine 执行体；--cluster 走 LLM 同义聚类，与 CP qa_cluster 同源）。 | ★ CP qa_cluster.py 同源 / bok.py tts-mine | 是 | 2026-10-04 |
+| `scripts/runtime/mine_qa.py` | 高频问答对挖掘（bok.py tts-mine 执行体；--cluster 走 LLM 同义聚类，与 CP qa_cluster 同源）。 | ★ CP qa_cluster.py 同源 / bok.py tts-mine | 是 | 2026-10-04 |
 | `scripts/mlx_lm_template_leak_fix.py` | mlx_lm 生成提示边界归一补丁（幂等，BOK_TEMPLATE_LEAK_FIX=0 关闭）。 | bok.py / test_mlx_timing_patch.py | 否 | 2026-10-04 |
 | `scripts/mm_llm_shim.py` | MiniMax chatcompletion_v2 → OpenAI /v1/chat/completions 代理（测试腿）。 | cuda-node-bringup.md | 是 | 2026-10-04 |
 | `scripts/mm_voice.py` | MiniMax 云合成 16k PCM 探针话音线(2026-09-13)。 | probe_stimulus.py import / test_cantonese_terminology.py | 是 | 2026-10-04 |
-| `scripts/mock_callee.py` | mock SIP 客户(模拟联调档):CP 派生的真语音被叫。 | ★ CP main.py exec / bok.py（进程识别 marker） | 是 | 2026-09-21 |
+| `scripts/runtime/mock_callee.py` | mock SIP 客户(模拟联调档):CP 派生的真语音被叫。 | ★ CP main.py exec / bok.py（进程识别 marker） | 是 | 2026-09-21 |
 | `scripts/node_handshake_smoke.py` | 节点握手链路冒烟（P1）：对一个已起 CP 全验 register → heartbeat → 鉴权 → 列表。 | CI node-handshake.yml / redteam_probes.py | 是 | 2026-10-04 |
 | `scripts/ops/check_doc_paths.py` | 活文档仓内路径断链检查（G1a 治理，2026-10-04）。 | 无(手动) | 否 | 2026-10-04 |
 | `scripts/seed/pad_test_audio.py` | 给测试 WAV 前后补静音（Silero VAD 用）。 | 无(手动) | 否 | 2026-09-05 |
 | `scripts/predict_csc_model.py` | CSC 离线预测 harness（配合 eval_csc_model，2026-09-27）。 | test_cantonese_terminology.py / train_csc_model.py | 否 | 2026-10-02 |
-| `scripts/pregen_tts.py` | 离线批量预合成 TTS 本地缓存(bok.py tts-pregen 的执行体,2026-09-08;task-14b 按人设物化)。 | ★ CP pregen.py exec / bok.py tts-pregen | 是 | 2026-10-02 |
+| `scripts/runtime/pregen_tts.py` | 离线批量预合成 TTS 本地缓存(bok.py tts-pregen 的执行体,2026-09-08;task-14b 按人设物化)。 | ★ CP pregen.py exec / bok.py tts-pregen | 是 | 2026-10-02 |
 | `scripts/prep_tts_dataset.py` | 原始客服录音 → Qwen3-TTS SFT 数据集流水线（docs/TTS-SFT-DATA-PREP.md 阶段 C 数据先行）。 | test_prep_tts_dataset.py import / test_prep_tts_dataset.py | 否 | 2026-10-04 |
 | `scripts/prepare_csc_data.py` | 粤语/普通话 CSC（拼写纠错）自训数据挖掘管道（2026-09-27）。 | test_probe_stimulus_tools.py import / CP hotword_mining.py | 否 | 2026-10-04 |
 | `scripts/probe_8khz_asr.py` | 8kHz 窄带重验探针（spec 2026-09-13 §6 前置门；P1.5 Task 5）。 | test_probe_8khz_asr.py / RUNTIME_TOPOLOGY.md | 是 | 2026-09-15 |

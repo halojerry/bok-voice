@@ -2,7 +2,7 @@
 
 「如果上线新人设没有 QA 罐头/垫话应该提醒,并自动触发全部生成」:
 人设 create/update 命中音色变化 → 后台 detached 子进程跑
-`scripts/pregen_tts.py --greetings --fillers --qa --branches --persona <id>`
+`scripts/runtime/pregen_tts.py --greetings --fillers --qa --branches --persona <id>`
 (幂等:已在缓存的 key 跳过,重跑零云调用)。响应带 `tts_pregen` 状态字段
 =提醒面;运行时逐轮提醒仍是 agent.log 的 `BOK_FILLER voice_fallback`。
 
@@ -145,11 +145,11 @@ def persona_pregen_status(
             }
         if not _voice_relevant_changed(existing, persona):
             return {"status": "unchanged"}
-        script = _repo_root() / "scripts" / "pregen_tts.py"
+        script = _repo_root() / "scripts" / "runtime" / "pregen_tts.py"
         if not script.exists():
             return {
                 "status": "script_missing",
-                "hint": "运行目录无 scripts/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --fillers --qa --persona " + pid,
+                "hint": "运行目录无 scripts/runtime/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --fillers --qa --persona " + pid,
             }
         with _SPAWN_LOCK:
             running = _PREGEN_PROCS.get(pid)
@@ -187,7 +187,7 @@ _status_cache: tuple[float, dict | None] = (0.0, None)
 
 
 def _repo_root_script() -> Path:
-    return _repo_root() / "scripts" / "pregen_tts.py"
+    return _repo_root() / "scripts" / "runtime" / "pregen_tts.py"
 
 
 def qa_status_json(base_url: str) -> dict:

@@ -5,7 +5,7 @@
   `pregen_tts.py --greetings --branches --account-id <acct>`;任何 spawn 失败
   只回 `tts_pregen` 状态键,绝不阻发布响应(镜像 personas 自动物化姿势);
   kill-switch `BOK_PUBLISH_AUTO_PREGEN=0` 全关。
-- scripts/pregen_tts.py `_say_step_lines(tpl, obj)` 与运行时
+- scripts/runtime/pregen_tts.py `_say_step_lines(tpl, obj)` 与运行时
   FlowController.step_say_text 对**同一个对象**逐字节同源——同一份 object_vars()+
   render_template_text(),缓存键(文本+音色+模型)才对得上。
 
@@ -127,7 +127,7 @@ def test_publish_spawns_detached_pregen(spawns, monkeypatch):
     assert len(spawns) == 1
     proc = spawns[0]
     assert proc.cmd[0] == sys.executable
-    assert proc.cmd[1] == str(ROOT / "scripts" / "pregen_tts.py")
+    assert proc.cmd[1] == str(ROOT / "scripts" / "runtime" / "pregen_tts.py")
     assert proc.cmd[2:] == ["--greetings", "--branches", "--account-id", "acc-001"]
     kw = proc.kw
     assert kw["start_new_session"] is True           # detached
