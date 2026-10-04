@@ -132,7 +132,7 @@ def _tokenizer():
         import bok  # noqa: PLC0415
         from mlx_lm.utils import load_tokenizer  # noqa: PLC0415
 
-        path = bok.model_path(bok.MODELS[bok.platform_key()], "llm")
+        path = bok.models.model_path(bok.models.MODELS[bok.paths.platform_key()], "llm")
         return load_tokenizer(Path(path))
     except Exception as exc:  # noqa: BLE001 - 缺依赖不该让量度工具挂掉
         print(f"（token 计量不可用，只有字数：{type(exc).__name__}）")

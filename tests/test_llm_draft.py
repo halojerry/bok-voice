@@ -31,9 +31,9 @@ def _clear_draft_env(monkeypatch) -> None:
 def test_draft_off_flags_empty(monkeypatch):
     """默认关(未设/"0")→ 旗标恒空——模型在盘也不追加(开关优先于在盘)。"""
     _clear_draft_env(monkeypatch)
-    assert bok._llm_draft_flags({}) == []
+    assert bok.models._llm_draft_flags({}) == []
     monkeypatch.setenv("BOK_LLM_DRAFT", "0")
-    assert bok._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == []
+    assert bok.models._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == []
 
 
 def test_draft_on_model_present_appends_flags(monkeypatch, tmp_path):
@@ -41,7 +41,7 @@ def test_draft_on_model_present_appends_flags(monkeypatch, tmp_path):
     _clear_draft_env(monkeypatch)
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", str(tmp_path))
-    assert bok._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == [
+    assert bok.models._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == [
         "--draft-model", str(tmp_path), "--num-draft-tokens", "3",
     ]
 
@@ -51,7 +51,7 @@ def test_draft_on_model_absent_no_flags(monkeypatch, tmp_path, capsys):
     _clear_draft_env(monkeypatch)
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", str(tmp_path / "not-on-disk"))
-    assert bok._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == []
+    assert bok.models._llm_draft_flags({"llm_draft": _DRAFT_REPO}) == []
     assert "draft" in capsys.readouterr().err
 
 
@@ -61,10 +61,10 @@ def test_draft_off_argv_byte_identical(monkeypatch):
     2026-10-01 W-ABORT：入口从 ``-m mlx_lm server`` 换成同仓 wrapper
     （services/llm-mlx/bok_mlx_server.py，argv 原样透传），其余旗标/顺序不变。"""
     _clear_draft_env(monkeypatch)
-    argv = bok._mac_llm_server_argv(
+    argv = bok.servers._mac_llm_server_argv(
         Path("py"), "/models/main-4b", "1239", {"llm_draft": _DRAFT_REPO})
     assert argv == [
-        "py", str(bok.MLX_SERVER_WRAPPER),
+        "py", str(bok.paths.MLX_SERVER_WRAPPER),
         "--model", "/models/main-4b", "--host", "127.0.0.1", "--port", "1239",
         "--prompt-cache-size", "128",
         "--prompt-cache-bytes", "4GB",
@@ -79,7 +79,7 @@ def test_draft_on_argv_tail_and_cache_discount(monkeypatch, tmp_path):
     _clear_draft_env(monkeypatch)
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", str(tmp_path))
-    argv = bok._mac_llm_server_argv(Path("py"), "/m", "1239", {})
+    argv = bok.servers._mac_llm_server_argv(Path("py"), "/m", "1239", {})
     assert argv[-4:] == [
         "--draft-model", str(tmp_path), "--num-draft-tokens", "3",
     ]
@@ -91,8 +91,8 @@ def test_cache_bytes_explicit_env_never_discounted(monkeypatch):
     """显式 BOK_LLM_PROMPT_CACHE_BYTES 最优先:draft 开也不折(用户直设=专家值)。"""
     _clear_draft_env(monkeypatch)
     monkeypatch.setenv("BOK_LLM_PROMPT_CACHE_BYTES", "12GB")
-    assert bok._default_prompt_cache_bytes(draft_on=True) == "12GB"
-    assert bok._default_prompt_cache_bytes(draft_on=False) == "12GB"
+    assert bok.servers._default_prompt_cache_bytes(draft_on=True) == "12GB"
+    assert bok.servers._default_prompt_cache_bytes(draft_on=False) == "12GB"
 
 
 def test_cache_bytes_draft_discount_pairing(monkeypatch):
@@ -102,15 +102,15 @@ def test_cache_bytes_draft_discount_pairing(monkeypatch):
     第 8-10 通打穿进 LRU 换页（生成段 tps 崩 2.6 实证）；4GB=日常 8-10 通
     工作集零换页。要回 6GB：env 显式覆盖。"""
     _clear_draft_env(monkeypatch)
-    assert bok._default_prompt_cache_bytes(draft_on=False) == "4GB"
-    assert bok._default_prompt_cache_bytes(draft_on=True) == "3.5GB"
+    assert bok.servers._default_prompt_cache_bytes(draft_on=False) == "4GB"
+    assert bok.servers._default_prompt_cache_bytes(draft_on=True) == "3.5GB"
 
 
 def test_models_table_llm_draft_registration():
     """MODELS 表登记 + 可选增强语义:向导不门禁;windows 表(llama.cpp 后端)无此键。"""
-    assert bok.MODELS["mac"].get("llm_draft") == _DRAFT_REPO
-    assert "llm_draft" in bok.OPTIONAL_MODELS
-    assert not bok.MODELS["windows"].get("llm_draft")
+    assert bok.models.MODELS["mac"].get("llm_draft") == _DRAFT_REPO
+    assert "llm_draft" in bok.models.OPTIONAL_MODELS
+    assert not bok.models.MODELS["windows"].get("llm_draft")
 
 
 def test_draft_model_path_resolves_usable_layout(monkeypatch, tmp_path):
@@ -122,7 +122,7 @@ def test_draft_model_path_resolves_usable_layout(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "is_packaged", lambda: False)
     patch_bok(monkeypatch, "is_mac", lambda: True)
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", "")
-    resolved = bok._llm_draft_model({"llm_draft": _DRAFT_REPO})
+    resolved = bok.models._llm_draft_model({"llm_draft": _DRAFT_REPO})
     assert resolved == str(repo_dir)
 
 
@@ -172,13 +172,13 @@ def test_download_draft_gate_opt_in(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "platform_key", lambda: "mac")
 
     _clear_draft_env(monkeypatch)
-    assert bok.cmd_download() == 0
+    assert bok.models.cmd_download() == 0
     assert _DRAFT_REPO not in calls
 
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
-    assert bok.cmd_download() == 0
+    assert bok.models.cmd_download() == 0
     assert calls.count(_DRAFT_REPO) == 1
 
     monkeypatch.delenv("BOK_LLM_DRAFT", raising=False)
-    assert bok.cmd_download(only={"llm_draft"}) == 0
+    assert bok.models.cmd_download(only={"llm_draft"}) == 0
     assert calls.count(_DRAFT_REPO) == 2

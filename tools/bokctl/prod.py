@@ -2,9 +2,16 @@
 """prod 域(launchd/systemd 常驻安装、prod install/uninstall/status;G2 W② 从 core 搬出,
 搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core` 拿模块对象:凡仍住在 core 的名字(ROOT/
-  PROD_HTTP_CHECKS/_agent_prod_env/app_data_dir/healthy/repo_python/is_mac/is_linux
-  等)一律 `core.X` 调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性)。
+- 本模块 `from bokctl import core/env/paths/servers` 拿模块对象:凡仍住在 core 的
+  名字(PROD_HTTP_CHECKS/healthy/_cp_bind_host)一律 `core.X` 调用时取——patch 与
+  后续域搬运在属主模块侧保持可见(patch 缝=模块属性)。env 组装面
+  (_agent_prod_env/_control_plane_env/_interp_env)W②-env 波(2026-10-04)搬入
+  bokctl.env,本域穿 `env.X` 取(env 波新例:域间消费=改穿所属域,core 不做值
+  转发)。`_realtime_demo_enabled` 属 serve 装配门,
+  W②-servers 波搬入 bokctl.servers,本域穿 `servers.X` 取(servers 波新例:
+  域间消费=改穿所属域,core 不做值转发);路径/平台锚(ROOT/app_data_dir/
+  repo_python/is_mac/is_linux/_embedded_livekit/_livekit_config_path)
+  paths 波(2026-10-04)后穿 `paths.X` 取。
 - 本域自有函数(_prod_units/_systemd_staging_dir/cmd_prod_install/uninstall/status/
   cmd_prod)域内裸名互调(同模块全局=call-time 可 patch)。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把 "cmd_prod"
@@ -19,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from bokctl import core
+from bokctl import core, env, paths, servers
 
 
 def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
@@ -30,29 +37,29 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
     审计）：追加 `bok-model-plane` 单元跑 `bok up --models-only`（RunAtLoad 开机
     补拉模型面 + KeepAlive 幂等重扫；重启后 :8787/:1235/:1236/:1237/:1239 不再
     等人工）。默认 False——既有装机渲染逐字节零变化。"""
-    agent_env = core._agent_prod_env()
-    livekit_bin = str(core._embedded_livekit() or "livekit-server")
-    py = core.repo_python()
+    agent_env = env._agent_prod_env()
+    livekit_bin = str(paths._embedded_livekit() or "livekit-server")
+    py = paths.repo_python()
     # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
     units = [
         (
             "bok-control-plane",
             [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", core._cp_bind_host(), "--port", "8000"],
-            core._control_plane_env((core.app_data_dir() / "bok_voice.db").as_posix()),
+            env._control_plane_env((paths.app_data_dir() / "bok_voice.db").as_posix()),
             "Bok 控制面 API",
         ),
-        ("bok-livekit", [livekit_bin, "--config", str(core._livekit_config_path())], {}, "实时语音信令/媒体"),
+        ("bok-livekit", [livekit_bin, "--config", str(paths._livekit_config_path())], {}, "实时语音信令/媒体"),
         ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
         (
             "bok-interp-fwd",
             [str(py), "-m", "agent_runtime.interpret"],
-            {**core._interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"},
+            {**env._interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"},
             "B 线同传 fwd",
         ),
         (
             "bok-interp-rev",
             [str(py), "-m", "agent_runtime.interpret"],
-            {**core._interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"},
+            {**env._interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"},
             "B 线同传 rev",
         ),
     ]
@@ -64,12 +71,12 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
         units.append(
             (
                 "bok-model-plane",
-                [str(py), str(core.ROOT / "tools" / "bok.py"), "up", "--models-only"],  # G2 W①:同上
+                [str(py), str(paths.ROOT / "tools" / "bok.py"), "up", "--models-only"],  # G2 W①:同上
                 agent_env,
                 "模型面常驻（asr/llm/mt/settle/tts；bok up --models-only 幂等重扫）",
             )
         )
-    if core._realtime_demo_enabled():
+    if servers._realtime_demo_enabled():
         # 演示档常驻单元（opt-in，同 _worker_specs 门）：BOK_QWEN_REALTIME=1 才
         # 生成 launchd/schtasks/systemd 单元——健康面 WORKER_PORTS 不收 :8084
         # （默认栈不跑演示档，常列会令 prod status 对未启用部署恒 DEGRADED）。
@@ -94,7 +101,7 @@ def _systemd_staging_dir(explicit: str = "") -> Path:
     变相代写。注意 /etc 在 macOS 是 /private/etc 的符号链接，两侧都要 resolve
     后再比，守卫才在双平台都成立。"""
     raw = (explicit or os.environ.get("BOK_SYSTEMD_STAGING_DIR") or "").strip()
-    path = Path(raw).expanduser() if raw else core.ROOT / "release-artifacts" / "systemd"
+    path = Path(raw).expanduser() if raw else paths.ROOT / "release-artifacts" / "systemd"
     resolved = path.resolve()
     etc = Path("/etc").resolve()
     if resolved == etc or etc in resolved.parents:
@@ -132,15 +139,15 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
       默认不传 = 既有装机渲染逐字节零变化；Linux systemd 档暂不接（单元面
       由 systemd_units 模块单点，另窗收编）。
     """
-    if core.is_mac() and node_agent:
+    if paths.is_mac() and node_agent:
         print("[prod] --node-agent 是 Windows 节点拓扑模式；mac 全栈机用标准 5 单元安装",
               file=sys.stderr)
         return 2
 
-    if core.is_mac():
-        unit_dir = core.app_data_dir() / "units"
+    if paths.is_mac():
+        unit_dir = paths.app_data_dir() / "units"
         unit_dir.mkdir(parents=True, exist_ok=True)
-        log_dir = core.app_data_dir() / "logs"
+        log_dir = paths.app_data_dir() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         if open_firewall:
             print("[prod] --open-firewall 是 Windows(netsh) 专用；mac 走系统防火墙应用签名规则，忽略")
@@ -155,7 +162,7 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
                 '<plist version="1.0">\n<dict>\n'
                 f"  <key>Label</key><string>{label}</string>\n"
                 "  <key>ProgramArguments</key>\n  <array>\n" + arg_xml + "\n  </array>\n"
-                f"  <key>WorkingDirectory</key><string>{core.ROOT}</string>\n"
+                f"  <key>WorkingDirectory</key><string>{paths.ROOT}</string>\n"
                 "  <key>EnvironmentVariables</key>\n  <dict>\n" + env_xml + "\n  </dict>\n"
                 "  <key>RunAtLoad</key><true/>\n"
                 "  <key>KeepAlive</key><true/>\n"
@@ -165,7 +172,7 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
             )
             out = unit_dir / f"{label}.plist"
             out.write_text(plist)
-            print(f"generated {out.relative_to(core.app_data_dir())}  ({comment})")
+            print(f"generated {out.relative_to(paths.app_data_dir())}  ({comment})")
         print(f"\nunits 目录: {unit_dir}")
         print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
         print(
@@ -175,15 +182,15 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
         return 0
 
-    if core.is_linux() and os.name != "nt":
+    if paths.is_linux() and os.name != "nt":
         # Linux（Ubuntu appliance 全栈，2026-09-24 重构）：systemd 单元只**生成**
         # 到暂存目录（generate-not-execute，同 schtasks 档姿态且更保守——连注册
         # 动作都不代跑）：/etc/systemd/system 与 /etc/bok/bok.env 永不代写，装载
         # 归操作员 root（cp → daemon-reload → enable --now，逐字指引见输出）。
         # Restart=always/RestartSec=3 语义边界见 systemd_units 模块 docstring。
-        # `os.name != "nt"` 与 core.is_linux() 双条件：test_prod_windows 以
-        # os.name="nt" 打桩模拟 Windows，而 CI 跑在 ubuntu-latest（core.is_linux 真）——
-        # 只看 core.is_linux 会在 Linux 上把模拟 Windows 的用例截胡（容器实测 6 红）。
+        # `os.name != "nt"` 与 paths.is_linux() 双条件：test_prod_windows 以
+        # os.name="nt" 打桩模拟 Windows，而 CI 跑在 ubuntu-latest（paths.is_linux 真）——
+        # 只看 paths.is_linux 会在 Linux 上把模拟 Windows 的用例截胡（容器实测 6 红）。
         import systemd_units as _sd
 
         staging = _systemd_staging_dir(staging_dir)
@@ -195,9 +202,9 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
                       "[--license-key KEY] [--ui-dir DIR] ...",
                       file=sys.stderr)
                 return 2
-            rendered = [_sd.render_node_agent_unit(str(core.ROOT), str(core.repo_python()), node_args)]
+            rendered = [_sd.render_node_agent_unit(str(paths.ROOT), str(paths.repo_python()), node_args)]
         else:
-            rendered = _sd.render_all_units(str(core.ROOT), str(core.repo_python()),
+            rendered = _sd.render_all_units(str(paths.ROOT), str(paths.repo_python()),
                                             cp_bind_host=core._cp_bind_host())
         staging.mkdir(parents=True, exist_ok=True)
         for fname, text in rendered:
@@ -214,15 +221,15 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         print("  systemctl enable --now bok-sidecar@asr.service（tts/embed 同式）")
         print("日志面: journalctl -u bok-cp.service -f（各单元同式）")
         print("env 文件 /etc/bok/bok.env 示例（本工具不代写；照抄建文件后按需增删）：")
-        print(_sd.env_file_sample(str(core.ROOT)), end="")
+        print(_sd.env_file_sample(str(paths.ROOT)), end="")
         print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
         return 0
 
     # Windows 前置的 app-data 目录（units 存 xml 副本 / logs 给 cmd 前缀链重定向；
     # mac 分支已各自创建，Linux 暂存档不落 app-data）。
-    unit_dir = core.app_data_dir() / "units"
+    unit_dir = paths.app_data_dir() / "units"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = core.app_data_dir() / "logs"
+    log_dir = paths.app_data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Windows：Task Scheduler 真注册（BootTrigger=开机自起 + RestartOnFailure=
@@ -238,10 +245,10 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
                   "[--node-token TOK | --license-key KEY] [--ui-dir DIR] ...",
                   file=sys.stderr)
             return 2
-        py = core.repo_python()
+        py = paths.repo_python()
         units = [(
             "node-agent",
-            [str(py), str(core.ROOT / "tools" / "node_agent.py"), *node_args],
+            [str(py), str(paths.ROOT / "tools" / "node_agent.py"), *node_args],
             {"PYTHONUNBUFFERED": "1"},
             "薄节点守护（cmd_up 拉全栈 + 心跳；参数原样透传 node_agent）",
         )]
@@ -252,15 +259,15 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
     install_ok = True
     for name, args, env, comment in units:
         tname = _sch.task_name(name)
-        arguments = _sch.build_cmd_arguments(env, args, str(core.ROOT),
+        arguments = _sch.build_cmd_arguments(env, args, str(paths.ROOT),
                                              log_dir / f"{name}.log",
                                              log_dir / f"{name}.err.log")
-        xml = _sch.build_unit_task_xml(name, comspec, arguments, str(core.ROOT))
+        xml = _sch.build_unit_task_xml(name, comspec, arguments, str(paths.ROOT))
         xml_path = _sch.write_task_xml(unit_dir / f"{tname}.xml", xml)
         r = _sch.run_schtasks(_sch.schtasks_create_argv(tname, xml_path))
         if r.returncode == 0:
             print(f"registered {tname}  ({comment})")
-            print(f"  xml: {xml_path.relative_to(core.app_data_dir())}")
+            print(f"  xml: {xml_path.relative_to(paths.app_data_dir())}")
             print(f"  action: {comspec} {arguments}")
         else:
             install_ok = False
@@ -290,9 +297,9 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     2026-09-20 档落在 app-data/units 的旧副本；系统面（/etc/systemd/system +
     enable 状态）归操作员 root 停用删除（逐字指引见输出，本函数零特权动作）。
     """
-    unit_dir = core.app_data_dir() / "units"
+    unit_dir = paths.app_data_dir() / "units"
     failures = 0
-    if core.is_mac():
+    if paths.is_mac():
         names = [u[0] for u in _prod_units()]
         # opt-in 模型面单元（--with-model-plane，2026-10-02）：默认清单不含它——
         # 装过的机器卸载不能残留（bootout+删 plist）；未装=plist 不在,静默
@@ -315,10 +322,10 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
                 tail = ((r.stderr or "").strip().splitlines() or [""])[0][:120]
                 print(f"[uninstall] {label}: bootout rc={r.returncode} {tail}")
             plist.unlink(missing_ok=True)
-            print(f"[uninstall] removed {plist.relative_to(core.app_data_dir())}")
+            print(f"[uninstall] removed {plist.relative_to(paths.app_data_dir())}")
         return 0
 
-    if core.is_linux() and os.name != "nt":
+    if paths.is_linux() and os.name != "nt":
         # Linux（2026-09-24 暂存目录档）：删暂存 bok-*.service 副本 + 兼容清扫
         # 2026-09-20 档落在 app-data/units 的旧副本；系统面需操作员 root 停用
         # 删除后 daemon-reload（本函数不代跑特权命令，双条件同 install 的
@@ -353,7 +360,7 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     # 尾注）→ ③/delete /f 卸载注册。
     for name in names:
         _sch.run_schtasks(_sch.schtasks_end_argv(_sch.task_name(name)))
-    alive = [pf for pf in sorted((core.app_data_dir() / "run").glob("*.pid"))
+    alive = [pf for pf in sorted((paths.app_data_dir() / "run").glob("*.pid"))
              if core._pid_alive(pf)]
     if alive:
         stems = ", ".join(pf.stem for pf in alive)
@@ -380,7 +387,7 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
         xml_path = unit_dir / f"{tname}.xml"
         if xml_path.exists():
             xml_path.unlink()
-            print(f"[uninstall] removed {xml_path.relative_to(core.app_data_dir())}")
+            print(f"[uninstall] removed {xml_path.relative_to(paths.app_data_dir())}")
     return 1 if failures else 0
 
 

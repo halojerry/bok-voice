@@ -99,11 +99,11 @@ def test_bok_log_rotation(tmp_path):
 
     small = tmp_path / "small.log"
     small.write_bytes(b"x" * 100)
-    bok._rotate_log(small)
+    bok.servers._rotate_log(small)
     assert small.read_bytes() == b"x" * 100  # 小文件不动
 
     big = tmp_path / "big.log"
     big.write_bytes(b"y" * (51 * 1024 * 1024))
-    bok._rotate_log(big)
+    bok.servers._rotate_log(big)
     assert big.stat().st_size == 0
     assert (tmp_path / "big.log.1").stat().st_size == 51 * 1024 * 1024

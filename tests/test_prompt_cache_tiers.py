@@ -24,7 +24,7 @@ def _tier(monkeypatch, mem_gib: float, **env: str) -> str:
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    return bok._default_prompt_cache_bytes()
+    return bok.servers._default_prompt_cache_bytes()
 
 
 def test_big_mem_default_is_4gb(monkeypatch):

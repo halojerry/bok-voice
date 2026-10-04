@@ -59,7 +59,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/pipeline/eval_sensevoice.py": re.compile(r"yue"),
     # G2 W①(2026-10-04):bok 实现整体迁 tools/bokctl/core.py——sensevoice repo
     # id(zh-en-ja-ko-yue=HF 仓库名 opaque 标识)随实现搬家,豁免行锚点同迁。
-    "tools/bokctl/core.py": re.compile(r"zh-en-ja-ko-yue"),
+    # G2 W②-models 波(2026-10-04):MODELS 平台表再迁 tools/bokctl/models.py
+    # (该波漏迁锚点=全量套件红;paths 波补迁),core.py 行随之退役。
+    "tools/bokctl/models.py": re.compile(r"zh-en-ja-ko-yue"),
     "tests/test_asr_engine_routing.py": re.compile(r"yue"),
     "scripts/archive/test_volcano_v3.py": None,
     # CSC 管线(2026-10-02 入库):yue 只作**车道标识**(LANE_YUE 常量收口单点,

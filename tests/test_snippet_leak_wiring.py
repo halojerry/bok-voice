@@ -7,7 +7,7 @@ hotword_leak.py,本身已有离线单测)——本文件只钉**接线语义**:
   回退、空词表零变化、纯 dump 丢弃、命中替换 + applied 记账、数字逐字不动;
 - 结构级:落点必须插在所有下游消费者(含 turns 落库面)之前,且 hook 与
   `_on_conversation_item` 用同一条链复算(听 A 记 B 禁令);
-- 立法面:两枚 env 键必须在 `bok._FORWARD_ENV`(test_forward_env 同源契约)。
+- 立法面:两枚 env 键必须在 `bok.env._FORWARD_ENV`(test_forward_env 同源契约)。
 
 参照 test_intent_judge_wiring.py 的源级锚姿势(闭包接线离线起不了真栈)。
 """
@@ -187,8 +187,8 @@ def test_conversation_item_recomputes_same_chain():
 
 def test_forward_env_registers_both_kill_switches():
     """立法动作:两枚 env 键进 _FORWARD_ENV(prod 封闭面 kill-switch 可达)。"""
-    assert "BOK_SNIPPETS" in bok._FORWARD_ENV
-    assert "BOK_HOTWORD_LEAK_SANITIZE" in bok._FORWARD_ENV
+    assert "BOK_SNIPPETS" in bok.env._FORWARD_ENV
+    assert "BOK_HOTWORD_LEAK_SANITIZE" in bok.env._FORWARD_ENV
 
 
 def test_assembly_passes_call_language_into_snippet_scoping():

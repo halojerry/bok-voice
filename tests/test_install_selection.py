@@ -65,20 +65,20 @@ def test_main_dispatch_passes_only_to_download(monkeypatch):
 
 def test_cmd_download_only_filters_table(monkeypatch, tmp_path: Path):
     fake = _install_fake_hf(monkeypatch)
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
-    rc = bok.cmd_download(only={"asr"})
+    rc = bok.models.cmd_download(only={"asr"})
     assert rc == 0
     assert fake.calls == ["Qwen/Qwen3-ASR-1.7B"]  # 只下 asr 一项
 
 
 def test_cmd_download_only_reports_unconfigured(capsys, monkeypatch, tmp_path: Path):
     fake = _install_fake_hf(monkeypatch)
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
-    rc = bok.cmd_download(only={"asr", "mt", "settle"})
+    rc = bok.models.cmd_download(only={"asr", "mt", "settle"})
     out = capsys.readouterr().out
     assert rc == 0
     # 非 mac 表当前无 mt/settle：逐项说明并跳过，不算失败
@@ -93,14 +93,14 @@ def test_resolve_llm_repo_tier_4b_configured(monkeypatch):
     patch_bok(monkeypatch, "_settings_llm_local_model", lambda: "")
     monkeypatch.setenv("BOK_LLM_TIER", "4b")
     table = {"llm": "org/9B-GGUF", "llm_4b": "org/4B-GGUF"}
-    assert bok.resolve_llm_repo(table) == "org/4B-GGUF"
+    assert bok.models.resolve_llm_repo(table) == "org/4B-GGUF"
 
 
 def test_resolve_llm_repo_tier_unconfigured_falls_back(capsys, monkeypatch):
     patch_bok(monkeypatch, "_settings_llm_local_model", lambda: "")
     monkeypatch.setenv("BOK_LLM_TIER", "4b")
     table = {"llm": "org/9B-GGUF", "llm_4b": ""}
-    assert bok.resolve_llm_repo(table) == "org/9B-GGUF"
+    assert bok.models.resolve_llm_repo(table) == "org/9B-GGUF"
     assert "回退默认档" in capsys.readouterr().err
 
 
@@ -108,4 +108,4 @@ def test_resolve_llm_repo_settings_override_wins(monkeypatch):
     patch_bok(monkeypatch, "_settings_llm_local_model", lambda: "org/custom")
     monkeypatch.setenv("BOK_LLM_TIER", "4b")
     table = {"llm": "org/9B-GGUF", "llm_4b": "org/4B-GGUF"}
-    assert bok.resolve_llm_repo(table) == "org/custom"
+    assert bok.models.resolve_llm_repo(table) == "org/custom"

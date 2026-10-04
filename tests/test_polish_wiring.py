@@ -12,7 +12,7 @@
   agent 实时轮）不受影响；
 - 结构级：三处落点的接线位置读源钉死（照 ``test_snippet_leak_wiring.py`` 姿势，
   闭包接线离线起不了真栈）；**实时轮结构性不 import**（绝不进实时轮）；
-- 立法面：``BOK_POLISH_OFFLINE`` 走 CP 面（``bok._control_plane_env``，
+- 立法面：``BOK_POLISH_OFFLINE`` 走 CP 面（``bok.env._control_plane_env``，
   同 ``BOK_SETTLE_LLM_*`` 先例）、**不进** ``_FORWARD_ENV``（那是 agent worker 面）；
 - 测量基线：R1 标注语料 152 轮的改动读数（文件末「测量基线」段）。
 
@@ -317,19 +317,19 @@ def test_live_turn_path_never_imports_polish():
 def test_env_face_is_cp_not_worker_face(monkeypatch, tmp_path):
     """kill-switch 走 CP 面、不进 agent worker 面（_FORWARD_ENV/passthrough）。"""
     assert POLISH_OFFLINE_ENV == "BOK_POLISH_OFFLINE"
-    assert POLISH_OFFLINE_ENV not in bok._FORWARD_ENV
-    assert POLISH_OFFLINE_ENV not in bok._BOK_PASSTHROUGH_KEYS
+    assert POLISH_OFFLINE_ENV not in bok.env._FORWARD_ENV
+    assert POLISH_OFFLINE_ENV not in bok.env._BOK_PASSTHROUGH_KEYS
     monkeypatch.setenv(POLISH_OFFLINE_ENV, "1")
     passed = {}
-    bok._apply_bok_passthrough_env(passed)  # worker 面透传
+    bok.env._apply_bok_passthrough_env(passed)  # worker 面透传
     assert POLISH_OFFLINE_ENV not in passed
-    cp_env = bok._control_plane_env(tmp_path / "x.db")  # CP 面显式注入
+    cp_env = bok.env._control_plane_env(tmp_path / "x.db")  # CP 面显式注入
     assert cp_env.get(POLISH_OFFLINE_ENV) == "1"
 
 
 def test_env_face_absent_when_unset(monkeypatch, tmp_path):
     monkeypatch.delenv(POLISH_OFFLINE_ENV, raising=False)
-    assert POLISH_OFFLINE_ENV not in bok._control_plane_env(tmp_path / "x.db")
+    assert POLISH_OFFLINE_ENV not in bok.env._control_plane_env(tmp_path / "x.db")
 
 
 # ---------------------------------------------------------------- 测量基线

@@ -349,7 +349,7 @@ def test_forward_env_registers_first_chunk(tmp_path, monkeypatch):
     sys.path.insert(0, str(repo_root))
     import tools.bok as bok  # noqa: E402
 
-    assert "BOK_TTS_FIRST_CHUNK_CHARS" in bok._FORWARD_ENV
+    assert "BOK_TTS_FIRST_CHUNK_CHARS" in bok.env._FORWARD_ENV
 
 
 # ---- _RepeatSelfGuardStream 首片段早放（LLM→TTS 句缓冲层的同一早发） ----

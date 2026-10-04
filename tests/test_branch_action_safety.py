@@ -270,4 +270,4 @@ def test_call_sites_pass_hotword_terms():
 
 def test_forward_env_registered():
     for key in ("BOK_BRANCH_REFUSE_CONFIRM", "BOK_BRANCH_REFUSE_HOTWORD_GUARD"):
-        assert key in bok._FORWARD_ENV, f"{key} 未登记 _FORWARD_ENV"
+        assert key in bok.env._FORWARD_ENV, f"{key} 未登记 _FORWARD_ENV"

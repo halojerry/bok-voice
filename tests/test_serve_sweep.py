@@ -287,7 +287,7 @@ def test_sweep_harvests_own_tree_stamped_unhealthy(monkeypatch, tmp_path):
         ps_cmd="python -m qwen3-asr-sidecar.app --port 8787",
         healthy=False, ps_lstart=_MARKER_LSTART,
     )
-    _write_stamp(app_root, _FAKE_PID, str(bok.ROOT))
+    _write_stamp(app_root, _FAKE_PID, str(bok.paths.ROOT))
     swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept and swept[0][0] == 8787 and swept[0][2] == _FAKE_PID
     assert killed == [("killpg", 7000 + _FAKE_PID)]
@@ -303,7 +303,7 @@ def test_down_harvests_own_tree_stamped_even_healthy(monkeypatch, tmp_path):
         ps_cmd="python -m uvicorn control_plane.main:app --port 8000",
         healthy=True, ps_lstart=_MARKER_LSTART,
     )
-    _write_stamp(app_root, _FAKE_PID, str(bok.ROOT))
+    _write_stamp(app_root, _FAKE_PID, str(bok.paths.ROOT))
     swept = bok.proc._sweep_orphan_listeners(kill=True, healthy_ok=False)
     assert swept and swept[0][0] == 8000
     assert killed == [("killpg", 7000 + _FAKE_PID)]
@@ -336,8 +336,8 @@ def test_process_serve_root_marker_branches(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "app_data_dir", lambda: app_root)
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: _MARKER_LSTART)
 
-    _write_stamp(app_root, 101, str(bok.ROOT))
-    assert bok.proc._process_serve_root(101) == str(bok.ROOT)
+    _write_stamp(app_root, 101, str(bok.paths.ROOT))
+    assert bok.proc._process_serve_root(101) == str(bok.paths.ROOT)
 
     _write_stamp(app_root, 102, _FOREIGN_ROOT, "Mon Sep  1 00:00:00 2025")
     assert bok.proc._process_serve_root(102) == ""  # lstart 对不上=pid 已复用
@@ -369,18 +369,18 @@ def test_start_proc_writes_env_stamp_and_marker(monkeypatch, tmp_path):
     logfile = tmp_path / "logs" / "x.log"
     logfile.parent.mkdir(parents=True, exist_ok=True)
 
-    pid = bok._start_proc(["true"], run_dir / "x.pid", logfile, env={"A": "b"})
+    pid = bok.servers._start_proc(["true"], run_dir / "x.pid", logfile, env={"A": "b"})
     assert pid == _FAKE_PID
     assert (run_dir / "x.pid").read_text() == str(_FAKE_PID)
     # Popen 会被调两次：真 spawn 一次 + _ps_field 的 subprocess.run 内部一次
     # （桩也拦 run 的 Popen，且 run 不带 env——断言只认第一次真 spawn）。
     spawn_args, spawn_kwargs = calls[0]
     assert spawn_args[0] == ["true"]
-    assert spawn_kwargs["env"]["BOK_SERVE_ROOT"] == str(bok.ROOT)
+    assert spawn_kwargs["env"]["BOK_SERVE_ROOT"] == str(bok.paths.ROOT)
     assert spawn_kwargs["env"]["A"] == "b"
     assert spawn_kwargs["start_new_session"] is True  # posix 会话组长（killpg 语义）
     raw = (run_dir / f"proc-{_FAKE_PID}.root").read_text()
-    assert raw.startswith(str(bok.ROOT) + "\t")  # 格式=ROOT<TAB>lstart
+    assert raw.startswith(str(bok.paths.ROOT) + "\t")  # 格式=ROOT<TAB>lstart
     assert raw.endswith("\n")
     # 桩环境 lstart 拿不到（空第二字段）→ 来源判定必须落「未知」而非误信。
     assert bok.proc._process_serve_root(_FAKE_PID) == ""
@@ -391,7 +391,7 @@ def test_stale_root_markers_cleaned(monkeypatch, tmp_path):
     killed, _probed, app_root = _patch_stack_io(
         monkeypatch, tmp_path, lsof_out={}, ps_cmd="", healthy=False, ps_alive_rc=1,
     )
-    _write_stamp(app_root, 999001, str(bok.ROOT))
+    _write_stamp(app_root, 999001, str(bok.paths.ROOT))
     assert bok.proc._sweep_orphan_listeners(kill=True) == []
     assert not (app_root / "run" / "proc-999001.root").exists()
     assert killed == []
@@ -402,7 +402,7 @@ def test_live_root_markers_kept(monkeypatch, tmp_path):
     _killed, _probed, app_root = _patch_stack_io(
         monkeypatch, tmp_path, lsof_out={}, ps_cmd="", healthy=False, ps_alive_rc=0,
     )
-    _write_stamp(app_root, 999002, str(bok.ROOT))
+    _write_stamp(app_root, 999002, str(bok.paths.ROOT))
     assert bok.proc._sweep_orphan_listeners(kill=True) == []
     assert (app_root / "run" / "proc-999002.root").exists()
 

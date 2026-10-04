@@ -564,7 +564,7 @@ def dispatch_commands(cfg: NodeConfig, commands: list, *,
             stack: Path | None = None
             try:
                 import bok
-                stack = bok.app_data_dir() / "logs"
+                stack = bok.paths.app_data_dir() / "logs"
             except Exception:  # noqa: BLE001 - 栈日志是增强不是前提
                 stack = None
             err = upload_recent_logs(cfg, stack_dir=stack)
@@ -950,7 +950,7 @@ def main(argv=None) -> int:
         bok.cmd_down()
 
     _kill_stack_hook = _stop_stack_once
-    bok.cmd_up()
+    bok.servers.cmd_up()
     stop = threading.Event()
     worker = threading.Thread(
         target=functools.partial(heartbeat_loop, cfg, stop,

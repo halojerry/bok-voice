@@ -72,12 +72,12 @@ def _tmp_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
-    (bok.app_data_dir() / "run").mkdir(parents=True, exist_ok=True)
+    (bok.paths.app_data_dir() / "run").mkdir(parents=True, exist_ok=True)
     return home
 
 
 def _run_dir(home: Path) -> Path:
-    return bok.app_data_dir() / "run"
+    return bok.paths.app_data_dir() / "run"
 
 
 def _patch_down_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,7 +107,7 @@ def test_pid_reused_stale_helper(monkeypatch, tmp_path) -> None:
     pidfile.write_text("12345")
     assert bok.proc._pid_reused_stale(pidfile, 12345) is False  # 无戳 fail-open
 
-    (run / "proc-12345.root").write_text(f"{bok.ROOT}\tOLD LSTART\n", encoding="utf-8")
+    (run / "proc-12345.root").write_text(f"{bok.paths.ROOT}\tOLD LSTART\n", encoding="utf-8")
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
     assert bok.proc._pid_reused_stale(pidfile, 12345) is True
 
@@ -117,7 +117,7 @@ def test_pid_reused_stale_helper(monkeypatch, tmp_path) -> None:
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "")  # ps 读不出
     assert bok.proc._pid_reused_stale(pidfile, 12345) is False
 
-    (run / "proc-12345.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")  # 坏戳
+    (run / "proc-12345.root").write_text(f"{bok.paths.ROOT}\n", encoding="utf-8")  # 坏戳
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
     assert bok.proc._pid_reused_stale(pidfile, 12345) is False
 
@@ -137,7 +137,7 @@ def test_cmd_down_skips_reused_pid_stamp(monkeypatch, tmp_path, capsys) -> None:
         run = _run_dir(home)
         (run / "agent.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
-            f"{bok.ROOT}\tSTALE LSTART\n", encoding="utf-8")
+            f"{bok.paths.ROOT}\tSTALE LSTART\n", encoding="utf-8")
         patch_bok(
             monkeypatch, "_ps_field",
             lambda pid, field: "LIVE LSTART" if field == "lstart=" else "")
@@ -160,7 +160,7 @@ def test_cmd_down_kills_when_stamp_matches(monkeypatch, tmp_path, capsys) -> Non
         run = _run_dir(home)
         (run / "tts.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
-            f"{bok.ROOT}\tMATCH LSTART\n", encoding="utf-8")
+            f"{bok.paths.ROOT}\tMATCH LSTART\n", encoding="utf-8")
         patch_bok(
             monkeypatch, "_ps_field",
             lambda pid, field: "MATCH LSTART" if field == "lstart=" else "")

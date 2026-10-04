@@ -224,7 +224,7 @@ def _linux(monkeypatch, tmp_path: Path) -> None:
 def test_staging_dir_default(monkeypatch, tmp_path):
     _linux(monkeypatch, tmp_path)
     monkeypatch.delenv("BOK_SYSTEMD_STAGING_DIR", raising=False)
-    assert bok.prod._systemd_staging_dir("") == bok.ROOT / "release-artifacts" / "systemd"
+    assert bok.prod._systemd_staging_dir("") == bok.paths.ROOT / "release-artifacts" / "systemd"
 
 
 def test_staging_dir_env_override_and_flag_precedence(monkeypatch, tmp_path):

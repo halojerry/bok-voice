@@ -316,14 +316,14 @@ def test_max_tail_chars_env(monkeypatch):
 
 
 def test_forward_env_registered():
-    """立法：四个新 env 键（F2 两键+F4 两键）都进 bok._FORWARD_ENV（prod 死门防复发）。"""
+    """立法：四个新 env 键（F2 两键+F4 两键）都进 bok.env._FORWARD_ENV（prod 死门防复发）。"""
     for key in (
         "BOK_LATE_FINAL_GUARD",
         "BOK_LATE_FINAL_MAX_TAIL_CHARS",
         "BOK_BRANCH_REFUSE_CONFIRM",
         "BOK_BRANCH_REFUSE_HOTWORD_GUARD",
     ):
-        assert key in bok._FORWARD_ENV, f"{key} 未登记 _FORWARD_ENV"
+        assert key in bok.env._FORWARD_ENV, f"{key} 未登记 _FORWARD_ENV"
 
 
 # ---- 源级 pin：流内接线 ------------------------------------------------------
@@ -383,7 +383,7 @@ def test_hotword_guard_wiring_source_pins():
     assert lp_src.count("hotword_only'} ") == 2  # 两路打点都要能归因 hotword_only
     bok_src = bok_source()
     assert bok_src.count("BOK_LATE_FINAL_HOTWORD_GUARD") == 1, "登记面只准一处"
-    assert "BOK_LATE_FINAL_HOTWORD_GUARD" in bok._FORWARD_ENV
+    assert "BOK_LATE_FINAL_HOTWORD_GUARD" in bok.env._FORWARD_ENV
 
 
 # ---- 行为面：真 _run 端到端（fake VAD + fake sidecar）------------------------

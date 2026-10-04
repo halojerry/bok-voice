@@ -2,22 +2,25 @@
 """proc 域(进程生命周期:pidfile 读写/来源戳/lstart 复用闸/kill_tree/孤儿清扫
 双件/monitor veto 判定;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core` 拿模块对象:凡仍住在 core 的名字(ROOT/
-  app_data_dir/_pid_alive/_start_proc/_relaxed_healthy 等——共享件判留 core,
+- 本模块只 `from bokctl import core`(及 servers 域)拿模块对象:凡仍住在 core 的
+  名字(_pid_alive/_relaxed_healthy 等——共享件判留 core,
   与 doctor 波同判:healthy/_probe_worker/_http_call/_pid_alive 被
   status/doctor/prod/serve 多面吃)一律 `core.X` 调用时取——patch 与后续域
-  搬运在 core 侧保持可见(patch 缝=模块属性)。
+  搬运在 core 侧保持可见(patch 缝=模块属性);路径/平台锚(ROOT/app_data_dir)
+  paths 波(2026-10-04)后穿 `paths.X` 取。
 - 本域自有函数(_ps_field/_process_serve_root/_pid_origin_foreign/
   _pidfile_alive_stamped/_pid_reused_stale/_write_proc_stamps/_kill_proc_tree/
   _kill_pidfile/_ensure_monitor/_cp_active_calls/_monitor_kill_round/
   _sweep_orphan_workers/_sweep_orphan_listeners 等)域内裸名互调(同模块全局=
   call-time 可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):`_start_proc`/`_spawn_kwargs`/
-  `_rotate_log`/`_stop_pidfile` 是 serve 服务面(cmd_up/serve/_start_* 家族)
-  共用的 spawn 原语,消费者跨面→留 core;`cmd_down`(prod.cmd_prod_uninstall
-  与 node_agent 都吃)/`cmd_monitor`(拉 _worker_specs=serve 装配面)/`cmd_up`
-  (拉 _cmd_up_services 整个服务面)三命令留 core,本域只承接其 proc 专属
-  helper;`_pid_alive` 因 prod 消费留 core(doctor 波先例)。
+- 留守 core 的近邻(边界记录,2026-10-04;servers 波更新):`_start_proc`/
+  `_spawn_kwargs`/`_rotate_log`/`_stop_pidfile` spawn 原语原判留 core(serve
+  面+本域 _ensure_monitor 跨面共用),**servers 波(W②)已随服务面搬入
+  bokctl.servers**——本域 `_ensure_monitor` 改穿 `servers._start_proc`;
+  `cmd_down`(prod.cmd_prod_uninstall 与 node_agent 都吃)/`cmd_monitor`(拉
+  servers._worker_specs=serve 装配面)/`cmd_serve`+`cmd_up`(服务面整族)——
+  前两命令留 core(monitor/down;已改穿 servers.X 取件),serve/up 两命令随
+  服务面入 servers;`_pid_alive` 因 prod 消费留 core(doctor 波先例)。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把
   _sweep_orphan_workers/_sweep_orphan_listeners/_kill_proc_tree/_ensure_monitor/
   _ps_field 改道 bokctl.proc);facade 读用 bok.proc.X。
@@ -33,7 +36,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from bokctl import core
+from bokctl import core, paths, servers
 
 
 def _write_proc_stamps(pidfile: Path, pid: int) -> None:
@@ -46,7 +49,7 @@ def _write_proc_stamps(pidfile: Path, pid: int) -> None:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     pidfile.write_text(str(pid))
     try:
-        (pidfile.parent / f"proc-{pid}.root").write_text(f"{core.ROOT}\t{_ps_field(pid, 'lstart=')}\n")
+        (pidfile.parent / f"proc-{pid}.root").write_text(f"{paths.ROOT}\t{_ps_field(pid, 'lstart=')}\n")
     except Exception:
         pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
 
@@ -86,7 +89,7 @@ def _pid_reused_stale(pidfile: Path, pid: int) -> bool:
     ps 读不出 → False（fail-open 旧语义：无戳遗留照杀，未知绝不挡杀——与
     ``_pid_origin_foreign`` 同纪律）。"""
     recorded = ""
-    for base in (pidfile.parent, core.app_data_dir() / "run"):
+    for base in (pidfile.parent, paths.app_data_dir() / "run"):
         try:
             parts = (base / f"proc-{pid}.root").read_text().strip().split("\t")
         except Exception:
@@ -164,8 +167,8 @@ def _ensure_monitor(py) -> None:
     2026-09-22 盲斑修复：①存活判定升级为 lstart 比对（_pidfile_alive_stamped，
     pidfile 残留 pid 被复用不再误判活 = 栈无 monitor）；②跨树可观测——monitor
     属他树时打日志跳过（共享栈模型既定行为，从静默变有声，不改变动作）。"""
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     pidfile = run_dir / "monitor.pid"
     if _pidfile_alive_stamped(pidfile):
         try:
@@ -177,8 +180,8 @@ def _ensure_monitor(py) -> None:
         except Exception:
             pass
         return
-    core._start_proc(
-        [str(py), str(core.ROOT / "tools" / "bok.py"), "monitor"],  # G2 W①:re-exec 走门面 launcher
+    servers._start_proc(
+        [str(py), str(paths.ROOT / "tools" / "bok.py"), "monitor"],  # G2 W①:re-exec 走门面 launcher
         pidfile,
         log_dir / "monitor.log",
         env={"BOK_MONITOR": "1"},
@@ -335,7 +338,7 @@ def _process_serve_root(pid: int) -> str:
     if os.name == "nt":
         return ""
     try:
-        marker = core.app_data_dir() / "run" / f"proc-{pid}.root"
+        marker = paths.app_data_dir() / "run" / f"proc-{pid}.root"
         if marker.exists():
             parts = marker.read_text().strip().split("\t")
             if len(parts) == 2 and parts[1]:
@@ -378,7 +381,7 @@ def _pid_origin_foreign(pid: int) -> tuple[bool, str]:
     root = _process_serve_root(pid)
     if not root:
         return False, ""
-    if os.path.realpath(root) == os.path.realpath(str(core.ROOT)):
+    if os.path.realpath(root) == os.path.realpath(str(paths.ROOT)):
         return False, root
     return True, root
 
@@ -387,7 +390,7 @@ def _sweep_stale_root_markers() -> None:
     """清 proc-<pid>.root 残留：ps 探不到的 pid 视为死，标记删除（防标记文件
     无限积累）；ps 探测失败=未知一律保留。"""
     try:
-        markers = list((core.app_data_dir() / "run").glob("proc-*.root"))
+        markers = list((paths.app_data_dir() / "run").glob("proc-*.root"))
     except Exception:
         return
     for marker in markers:
@@ -512,7 +515,7 @@ def _sweep_orphan_listeners(kill: bool = True,
             # 不收他树（down=停本树+无戳遗留）。stamp 读不出按来源未知走下面
             # 原健康闸/收割语义，旧行为兜底不变。
             proc_root = _process_serve_root(pid)
-            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(core.ROOT)):
+            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(paths.ROOT)):
                 print(
                     f"[sweep] port {port}: pid {pid} 属另一代码树（{proc_root}）——不动"
                     "（他树进程永不收割；要切换先在对方 down）",

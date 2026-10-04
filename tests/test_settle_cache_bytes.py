@@ -20,11 +20,11 @@ from _bokpatch import patch_bok  # noqa: E402
 
 def test_settle_cache_bytes_default_and_override(monkeypatch) -> None:
     monkeypatch.delenv("BOK_SETTLE_CACHE_BYTES", raising=False)
-    assert bok._settle_cache_bytes() == "4GB"
+    assert bok.servers._settle_cache_bytes() == "4GB"
     monkeypatch.setenv("BOK_SETTLE_CACHE_BYTES", "2GB")
-    assert bok._settle_cache_bytes() == "2GB"
+    assert bok.servers._settle_cache_bytes() == "2GB"
     monkeypatch.setenv("BOK_SETTLE_CACHE_BYTES", "   ")
-    assert bok._settle_cache_bytes() == "4GB", "空白=未设（缺省零漂移）"
+    assert bok.servers._settle_cache_bytes() == "4GB", "空白=未设（缺省零漂移）"
 
 
 def _run_settle_start(monkeypatch, tmp_path):
@@ -39,7 +39,7 @@ def _run_settle_start(monkeypatch, tmp_path):
     patch_bok(
         monkeypatch, "_start_proc",
         lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
-    assert bok._start_settle_llm({}, tmp_path, tmp_path) is True
+    assert bok.servers._start_settle_llm({}, tmp_path, tmp_path) is True
     return started
 
 

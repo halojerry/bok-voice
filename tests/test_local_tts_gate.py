@@ -45,7 +45,7 @@ def _gate(monkeypatch, tmp_path: Path, env: str | None = None) -> tuple[bool, st
         monkeypatch.delenv("BOK_LOCAL_TTS", raising=False)
     else:
         monkeypatch.setenv("BOK_LOCAL_TTS", env)
-    return bok._local_tts_needed()
+    return bok.servers._local_tts_needed()
 
 
 def test_cloud_global_minimax_skips_local(monkeypatch, tmp_path):
@@ -131,9 +131,9 @@ def _mk_model_dir(base, repo, *, with_config=True, with_tokenizer=False):
 def test_usable_model_dir_extra_required(monkeypatch, tmp_path):
     broken = _mk_model_dir(tmp_path, "broken", with_config=True, with_tokenizer=False)
     good = _mk_model_dir(tmp_path, "good", with_config=True, with_tokenizer=True)
-    assert bok._usable_model_dir(broken) is True  # 旧判据:config.json 即真
-    assert bok._usable_model_dir(broken, extra_required="speech_tokenizer") is False
-    assert bok._usable_model_dir(good, extra_required="speech_tokenizer") is True
+    assert bok.models._usable_model_dir(broken) is True  # 旧判据:config.json 即真
+    assert bok.models._usable_model_dir(broken, extra_required="speech_tokenizer") is False
+    assert bok.models._usable_model_dir(good, extra_required="speech_tokenizer") is True
 
 
 def test_tts_model_path_skips_broken_lmstudio_copy(monkeypatch, tmp_path):
@@ -144,8 +144,8 @@ def test_tts_model_path_skips_broken_lmstudio_copy(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "model_dir", lambda repo: tmp_path / "appdata" / repo.replace("/", "--"))
     _mk_model_dir(tmp_path / "lmstudio", "mlx-community/TTS-Base", with_config=True, with_tokenizer=False)
     _mk_model_dir(tmp_path / "appdata", "mlx-community--TTS-Base", with_config=True, with_tokenizer=True)
-    got = bok.model_path({"tts_clone": "mlx-community/TTS-Base"}, "tts_clone")
+    got = bok.models.model_path({"tts_clone": "mlx-community/TTS-Base"}, "tts_clone")
     assert "appdata" in got
     # 非 TTS 键不收紧(照旧 config.json 判据)
-    got2 = bok.model_path({"asr": "mlx-community/TTS-Base"}, "asr")
+    got2 = bok.models.model_path({"asr": "mlx-community/TTS-Base"}, "asr")
     assert "lmstudio" in got2

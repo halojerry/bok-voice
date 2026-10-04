@@ -42,8 +42,8 @@ def test_gate_default_off(monkeypatch):
 
 
 def test_forward_env_registration():
-    """立法门禁呼应：BOK_SMART_TURN 必须在 bok._FORWARD_ENV（prod 封闭 env 面）。"""
-    assert "BOK_SMART_TURN" in bok._FORWARD_ENV
+    """立法门禁呼应：BOK_SMART_TURN 必须在 bok.env._FORWARD_ENV（prod 封闭 env 面）。"""
+    assert "BOK_SMART_TURN" in bok.env._FORWARD_ENV
 
 
 def test_decide_pure():

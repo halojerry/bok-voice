@@ -26,7 +26,7 @@ _SLOT_SRC = (_AGENT / "slot_actor.py").read_text(encoding="utf-8")
 
 def test_slot_env_registered_in_forward_env():
     """BOK_SLOT_ACTOR 进 tools/bok.py _FORWARD_ENV（prod launchd 封闭 env 面可达）。"""
-    assert "BOK_SLOT_ACTOR" in bok._FORWARD_ENV
+    assert "BOK_SLOT_ACTOR" in bok.env._FORWARD_ENV
     assert 'os.environ.get("BOK_SLOT_ACTOR", "0")' in _SLOT_SRC, "闸读法=字面量缺省 0"
 
 

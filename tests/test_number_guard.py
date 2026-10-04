@@ -386,7 +386,7 @@ def test_source_pins_agent_writes_turn_user_text():
 def test_source_pin_forward_env_registered():
     import bok  # noqa: E402  (tools/bok.py：_FORWARD_ENV 立法门禁源)
 
-    assert "BOK_NUMBER_GUARD" in bok._FORWARD_ENV
+    assert "BOK_NUMBER_GUARD" in bok.env._FORWARD_ENV
 
 
 # ------------------------------------------------- 合法源之三:对象档案(2026-10-01 补)

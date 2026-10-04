@@ -8,15 +8,16 @@
 - 本域自有函数(_http_ok/_llm_http_ready/_ports_down_after_grace/
   _only_optional_ports/_serve_ready_probe/_serve_ready_probe_relaxed/
   _wait_desktop_ready)域内裸名互调(同模块全局=call-time 可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):健康面**共享面**不搬——
+- 留守 core 的近邻(边界记录,2026-10-04;servers 波更新):健康面**共享面**不搬——
   healthy/_relaxed_healthy/_http_call/_probe_worker 被 status/doctor/prod/
   proc/serve 多面吃(doctor 波同判);CORE_PORTS/WORKER_PORTS/PROD_HTTP_CHECKS/
   _SWEEP_HTTP_PATHS/_agent_worker_port/_worker_ports/_desktop_stack_targets
   是端口拓扑单点表(status/doctor/prod/proc 共用);_provider_health_summary+
   _PROVIDER_HEALTH_MODULE 被 cmd_status+cmd_doctor 两面吃;
   _llm_raw_expected(doctor)/_llm_raw_status_check_expected(prod)同属跨域。
-  本域只承接「就绪真话+等待环+可选线闸」这一自洽 web,core 侧消费点
-  (_warn_llm_not_http_ready/_cmd_up_services/cmd_serve)已改穿 health.X。
+  本域只承接「就绪真话+等待环+可选线闸」这一自洽 web;消费点
+  (_warn_llm_not_http_ready/_cmd_up_services/cmd_serve)W②-servers 波已随
+  服务面搬入 bokctl.servers,照旧穿 health.X 取件。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把
   _http_ok/_llm_http_ready/_ports_down_after_grace 改道 bokctl.health);
   facade 读用 bok.health.X。

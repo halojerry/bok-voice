@@ -168,7 +168,7 @@ def test_famine_env_keys_in_forward_env():
 
     for k in ("BOK_LLM_FAMINE", "BOK_LLM_FAMINE_TTFT_S",
               "BOK_LLM_FAMINE_FIRST_S", "BOK_LLM_FAMINE_DRAIN_S"):
-        assert k in bok._FORWARD_ENV, k
+        assert k in bok.env._FORWARD_ENV, k
 
 
 def test_source_pin_timeout_branch_records_sample():

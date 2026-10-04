@@ -115,8 +115,8 @@ def test_forward_env_registers_first_clause(tmp_path, monkeypatch):
     sys.path.insert(0, str(repo_root))
     import tools.bok as bok  # noqa: E402
 
-    assert "BOK_TTS_FIRST_CLAUSE" in bok._FORWARD_ENV
-    assert "BOK_TTS_FIRST_CLAUSE_CHARS" in bok._FORWARD_ENV
+    assert "BOK_TTS_FIRST_CLAUSE" in bok.env._FORWARD_ENV
+    assert "BOK_TTS_FIRST_CLAUSE_CHARS" in bok.env._FORWARD_ENV
 
 
 # ---- 流级 wiring 腿（fake WS，镜像 test_minimax_ws_pool.py 姿势） ----
