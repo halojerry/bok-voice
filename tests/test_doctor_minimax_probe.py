@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
-import bok
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def _make_db(tmp: Path, tts: dict) -> Path:
@@ -72,9 +77,9 @@ def test_probe_resolves_configured_voice(tmp_path, monkeypatch):
             }
         ).encode()
 
-    import bok as bok_mod
+    import bok as bok_mod  # noqa: F401  (门面在读面仍可用;补丁走权威模块)
 
-    monkeypatch.setattr(bok_mod, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     _make_db(
         tmp_path,
         {"provider": "minimax", "api_key": "k", "speaker_cantonese": "Cantonese_Male_news_anchor_vv2"},
@@ -95,9 +100,9 @@ def test_probe_fails_when_voice_not_in_account_list(tmp_path, monkeypatch):
             }
         ).encode()
 
-    import bok as bok_mod
+    import bok as bok_mod  # noqa: F401  (门面在读面仍可用;补丁走权威模块)
 
-    monkeypatch.setattr(bok_mod, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     _make_db(
         tmp_path,
         {"provider": "minimax", "api_key": "k", "speaker_zh": "not_a_real_voice"},

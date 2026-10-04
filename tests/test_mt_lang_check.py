@@ -22,6 +22,7 @@ from bok_voice_core import mt_lang_check as mlc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
 import agent_runtime.interpret as interpret  # noqa: E402
 
 
@@ -312,7 +313,7 @@ def test_kill_switch_default_on_and_env_registered():
             os.environ["BOK_INTERP_MT_LANGGUARD"] = saved
     assert "BOK_INTERP_MT_LANGGUARD" in _INTERP.read_text(encoding="utf-8")
     # 注册在 _interp_env 的 B 线透传元组（与 BOK_INTERP_MT_CONTEXT 同机制）。
-    bok_src = (Path(__file__).resolve().parents[1] / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert '"BOK_INTERP_MT_CONTEXT",' in bok_src and '"BOK_INTERP_MT_LANGGUARD",' in bok_src
 
 

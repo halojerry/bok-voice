@@ -15,12 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.agent import _prewarm_should_yield  # noqa: E402
 
 AGENT_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
     encoding="utf-8"
 )
-BOK_SRC = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+BOK_SRC = bok_source()
 
 
 def test_should_yield_returns_other_room():

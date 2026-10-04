@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bok_src import bok_source  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _LIVE_WORKER_PAYLOAD = {
     "worker_type": "JT_ROOM",
@@ -69,11 +71,11 @@ def test_prod_units_control_plane_env_carries_auth_trio(monkeypatch, tmp_path):
     BOK_AUTH_REQUIRED——_control_plane_env 只是中间层，单元定义才是 prod 真源。"""
     monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
     monkeypatch.setenv("BOK_CP_TOKEN", "test-cp-token")
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: "py")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "_agent_prod_env", lambda: {})
-    monkeypatch.setattr(bok, "_interp_env", lambda env: {})
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
+    patch_bok(monkeypatch, "_interp_env", lambda env: {})
     units = {name: env for name, _args, env, _comment in bok._prod_units()}
     cp_env = units["bok-control-plane"]
     assert cp_env["BOK_AUTH_REQUIRED"] == "1"
@@ -100,21 +102,21 @@ def test_llm_raw_1239_optional_semantics(monkeypatch):
     assert 1239 in bok._OPTIONAL_LLM_PORTS
     assert bok._only_optional_ports([1239]) is True
     # 队列代理关 → 不预期；mac + 开 → 预期
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
     assert bok._llm_raw_expected() is False
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
     assert bok._llm_raw_expected() is True
     # 非 mac（Windows/Linux 走 llama.cpp，无 :1239 拓扑）→ 不预期
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
     assert bok._llm_raw_expected() is False
 
 
 def test_prod_status_queue_off_does_not_report_1239(monkeypatch, capsys):
     """queue proxy 关 = mlx 直跑 :1235：prod status 不得因 :1239 缺席判 DEGRADED。"""
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "healthy", lambda port: False)  # 无栈在场
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "healthy", lambda port: False)  # 无栈在场
 
     def fake_urlopen(url, timeout=None):
         if url.endswith("/worker"):
@@ -133,8 +135,8 @@ def test_prod_status_flags_half_dead_mlx(monkeypatch, capsys):
     """代理活（:1235 在听）而 :1239 死 = 半瘫——prod status 必须点名 DEGRADED
     （本轮收编的核心收益；旧四表对此结构性失明）。"""
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "healthy", lambda port: port == 1235)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "healthy", lambda port: port == 1235)
 
     def fake_urlopen(url, timeout=None):
         if ":1239" in url:
@@ -166,26 +168,26 @@ def test_llm_http_ready_only_200(monkeypatch):
         seen["timeout"] = timeout_s
         return 200, b'{"data": []}'
 
-    monkeypatch.setattr(bok, "_http_call", fake_200)
+    patch_bok(monkeypatch, "_http_call", fake_200)
     assert bok._llm_http_ready(1235) is True
     assert seen["url"] == "http://127.0.0.1:1235/v1/models"
     assert seen["timeout"] == 1.5
 
-    monkeypatch.setattr(bok, "_http_call",
+    patch_bok(monkeypatch, "_http_call",
                         lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0: (404, b"nf"))
     assert bok._llm_http_ready(1235) is False
 
-    monkeypatch.setattr(bok, "_http_call",
+    patch_bok(monkeypatch, "_http_call",
                         lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0: (503, b"loading"))
     assert bok._llm_http_ready(1239) is False
 
     def fake_timeout(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(bok, "_http_call", fake_timeout)
+    patch_bok(monkeypatch, "_http_call", fake_timeout)
     assert bok._llm_http_ready(1239) is False
     # 显式放宽窗（宽松终检档）透传到 _http_call
-    monkeypatch.setattr(bok, "_http_call",
+    patch_bok(monkeypatch, "_http_call",
                         lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0:
                         seen.update({"t2": timeout_s}) or (200, b""))
     assert bok._llm_http_ready(1235, timeout_s=5.0) is True
@@ -200,11 +202,11 @@ def test_http_ok_requires_200_on_path(monkeypatch):
         seen["url"] = url
         return 503, b'{"status": "loading"}'
 
-    monkeypatch.setattr(bok, "_http_call", fake)
+    patch_bok(monkeypatch, "_http_call", fake)
     assert bok._http_ok(8788, "/health") is False
     assert seen["url"] == "http://127.0.0.1:8788/health"
 
-    monkeypatch.setattr(bok, "_http_call",
+    patch_bok(monkeypatch, "_http_call",
                         lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0:
                         (200, b'{"status": "ready"}'))
     assert bok._http_ok(8787, "/health") is True
@@ -212,7 +214,7 @@ def test_http_ok_requires_200_on_path(monkeypatch):
     def fake_err(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         raise OSError("refused")
 
-    monkeypatch.setattr(bok, "_http_call", fake_err)
+    patch_bok(monkeypatch, "_http_call", fake_err)
     assert bok._http_ok(8787, "/health") is False
 
 
@@ -237,9 +239,9 @@ def _patch_serve_probes(monkeypatch, *, llm_ready=True, sidecar_ready=True,
         calls.append(("http", port, path, timeout_s))
         return sidecar_ready
 
-    monkeypatch.setattr(bok, "healthy", fake_healthy)
-    monkeypatch.setattr(bok, "_llm_http_ready", fake_llm)
-    monkeypatch.setattr(bok, "_http_ok", fake_http)
+    patch_bok(monkeypatch, "healthy", fake_healthy)
+    patch_bok(monkeypatch, "_llm_http_ready", fake_llm)
+    patch_bok(monkeypatch, "_http_ok", fake_http)
     return calls
 
 
@@ -275,7 +277,7 @@ def test_wait_desktop_ready_blocks_until_http_ready(monkeypatch):
         asserts["n"] += 1
         return asserts["n"] > 2  # 第三轮起就绪
 
-    monkeypatch.setattr(bok, "_http_ok", sidecar_flips)
+    patch_bok(monkeypatch, "_http_ok", sidecar_flips)
     assert bok._wait_desktop_ready([8788, 8000], tries=5) is True
     assert sleeps == [1, 1]
 
@@ -293,7 +295,7 @@ def test_serve_relaxed_probe_keeps_http_and_relaxed_semantics(monkeypatch):
     """宽松终检：严格口维持 HTTP-200（但用 5s 窗吸收调度延迟），其余端口退回
     _relaxed_healthy 旧语义（互杀事故收编不得因本轮收窄）。"""
     relaxed_calls: list[int] = []
-    monkeypatch.setattr(bok, "_relaxed_healthy",
+    patch_bok(monkeypatch, "_relaxed_healthy",
                         lambda port, timeout_s=5.0: relaxed_calls.append(port) or True)
     calls = _patch_serve_probes(monkeypatch)
     assert bok._serve_ready_probe_relaxed(1235) is True
@@ -311,7 +313,7 @@ def test_serve_wait_wiring_source_pins():
     宽松终检必须带 _serve_ready_probe_relaxed；裸 all(healthy(...)) 不得回潮。"""
     import inspect
 
-    src = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    src = bok_source()
     assert "def _wait_desktop_ready(" in src
     assert "def _serve_ready_probe(" in src
     assert "def _serve_ready_probe_relaxed(" in src
@@ -326,12 +328,12 @@ def test_serve_wait_wiring_source_pins():
 def test_start_llm_tcp_skip_warns_when_http_not_ready(monkeypatch, tmp_path, capsys):
     """TCP 健康跳过点必须补一次 /v1/models 真话探针：权重装载中/半死 → 大声
     告警一行；TCP 跳过语义本身不变（绝不双起）。"""
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
-    monkeypatch.setattr(bok, "healthy", lambda port: True)
+    patch_bok(monkeypatch, "healthy", lambda port: True)
     started: list = []
-    monkeypatch.setattr(bok, "_start_proc", lambda *a, **k: started.append(a))
-    monkeypatch.setattr(bok, "_llm_http_ready", lambda port, timeout_s=1.5: False)
+    patch_bok(monkeypatch, "_start_proc", lambda *a, **k: started.append(a))
+    patch_bok(monkeypatch, "_llm_http_ready", lambda port, timeout_s=1.5: False)
     bok._start_llm({}, tmp_path, tmp_path)
     assert started == []
     err = capsys.readouterr().err
@@ -339,7 +341,7 @@ def test_start_llm_tcp_skip_warns_when_http_not_ready(monkeypatch, tmp_path, cap
     assert "1235" in err and "1239" in err
 
     # /v1/models 就绪 → 零告警、照旧跳过
-    monkeypatch.setattr(bok, "_llm_http_ready", lambda port, timeout_s=1.5: True)
+    patch_bok(monkeypatch, "_llm_http_ready", lambda port, timeout_s=1.5: True)
     bok._start_llm({}, tmp_path, tmp_path)
     assert started == []
     assert "not ready" not in capsys.readouterr().err

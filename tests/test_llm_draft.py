@@ -16,6 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bok_src import bok_source  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _DRAFT_REPO = "mlx-community/Qwen3-0.6B-4bit"
 
@@ -117,8 +119,8 @@ def test_draft_model_path_resolves_usable_layout(monkeypatch, tmp_path):
     repo_dir.mkdir(parents=True)
     (repo_dir / "config.json").write_text("{}")
     monkeypatch.setenv("LMSTUDIO_MODELS_DIR", str(tmp_path))
-    monkeypatch.setattr(bok, "is_packaged", lambda: False)
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_packaged", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", "")
     resolved = bok._llm_draft_model({"llm_draft": _DRAFT_REPO})
     assert resolved == str(repo_dir)
@@ -131,12 +133,12 @@ def test_doctor_draft_warning_states(monkeypatch):
     assert bok._doctor_draft_warning(table) == ""
 
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
-    monkeypatch.setattr(bok, "_model_present", lambda repo: False)
+    patch_bok(monkeypatch, "_model_present", lambda repo: False)
     warn = bok._doctor_draft_warning(table)
     assert "download --only llm_draft" in warn
     assert _DRAFT_REPO in warn
 
-    monkeypatch.setattr(bok, "_model_present", lambda repo: True)
+    patch_bok(monkeypatch, "_model_present", lambda repo: True)
     assert bok._doctor_draft_warning(table) == ""
     # 表无条目(如 windows 表)同回 "",不炸。
     assert bok._doctor_draft_warning({}) == ""
@@ -147,8 +149,7 @@ def test_doctor_draft_warning_never_enters_fails(monkeypatch, capsys):
     「doctor 末行语义」判:消息出现而末行不是 'doctor: warnings'(fails 空时
     应为 'doctor: OK')。真跑 cmd_doctor 需钉住全部探测面(端口/导入),此处
     改为源级钉死接线:调用点只 print、无 fails.append(_doctor_draft_warning)。"""
-    src = (Path(__file__).resolve().parents[1] / "tools" / "bok.py").read_text(
-        encoding="utf-8")
+    src = bok_source()
     assert "fails.append(_doctor_draft_warning" not in src
     assert "fails.append(draft_warn" not in src
     call_site = "draft_warn = _doctor_draft_warning(current)"
@@ -165,10 +166,10 @@ def test_download_draft_gate_opt_in(monkeypatch, tmp_path):
 
     fake_hub = types.SimpleNamespace(snapshot_download=_fake_download)
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
-    monkeypatch.setattr(bok, "model_dir", lambda repo: tmp_path / "never" / repo)
+    patch_bok(monkeypatch, "model_dir", lambda repo: tmp_path / "never" / repo)
     # llm_draft 只在 mac(mlx)平台表——CI Linux 走 windows 表会 [skip] 平台
     # 未配置,断言恒 0。钉住 mac 表测的是**下载闸逻辑本身**,与宿主平台无关。
-    monkeypatch.setattr(bok, "platform_key", lambda: "mac")
+    patch_bok(monkeypatch, "platform_key", lambda: "mac")
 
     _clear_draft_env(monkeypatch)
     assert bok.cmd_download() == 0

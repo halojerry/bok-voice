@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.room_claim import RoomClaim, room_claim_enabled  # noqa: E402
 
 
@@ -114,6 +115,6 @@ def test_wiring_pinned():
     assert "from .room_claim import RoomClaim" in agent_src
     assert "[room-claim] duplicate dispatch stand-down" in agent_src
     assert "ctx.add_shutdown_callback(_release_room_claim)" in agent_src
-    bok_src = (root / "tools/bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert '"BOK_ROOM_CLAIM"' in bok_src
     assert '"BOK_ROOM_CLAIM_DIR"' in bok_src

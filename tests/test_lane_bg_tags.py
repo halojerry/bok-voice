@@ -8,12 +8,14 @@ setdefault "reply"）优先，后台预热（prefix_prewarm / 投机 prefill / _
 
 from pathlib import Path
 
+from _bok_src import bok_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 PLUGINS = (
     ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py"
 ).read_text(encoding="utf-8")
-BOK = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+BOK = bok_source()
 
 
 def test_prewarm_and_warmup_tag_bg_lane():

@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from _bok_src import bok_source
+
 _REPO = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +46,7 @@ def test_live_stt_exposes_confidence():
 
 
 def test_forward_env_carries_polish_keys():
-    src = (_REPO / "tools" / "bok.py").read_text(encoding="utf-8")
+    src = bok_source()
     for key in ("BOK_ASR_POLISH", "BOK_CSC_SIDECAR", "BOK_CSC_URL", "BOK_CSC_CONF_GATE"):
         assert f'"{key}"' in src, key
 

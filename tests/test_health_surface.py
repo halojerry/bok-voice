@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 # 2026-09-17 实机抓录的 livekit-agents 1.8.0 GET /worker 真实 payload 形状
 # (注意:没有 active_jobs 字段——旧 prod status 打印它恒 None 属谎报)。
@@ -64,12 +65,12 @@ def test_worker_ports_triple_matches_prod_units(monkeypatch, tmp_path):
         ("interp-rev", 8083),
     )
     # 与 _prod_units 单元名交叉对齐(桩法对齐 test_prod_windows,不碰真实 app-data)。
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: "py")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "_agent_prod_env", lambda: {})
-    monkeypatch.setattr(bok, "_interp_env", lambda env: {})
-    monkeypatch.setattr(bok, "_control_plane_env", lambda db: {})
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
+    patch_bok(monkeypatch, "_interp_env", lambda env: {})
+    patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
     unit_names = {name for name, _args, _env, _comment in bok._prod_units()}
     assert {"bok-agent", "bok-interp-fwd", "bok-interp-rev"} <= unit_names
 
@@ -115,7 +116,7 @@ def test_probe_llm_uses_absolute_model_path(monkeypatch):
         seen["body"] = json.loads(body.decode())
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
-    monkeypatch.setattr(bok, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm()
     assert ok
     assert seen["body"]["model"] == "/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
@@ -130,7 +131,7 @@ def test_probe_llm_timeout_env_and_fail_wording(monkeypatch):
         assert timeout_s == 4.0
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(bok, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm()
     assert not ok
     assert "FAIL" in detail
@@ -152,7 +153,7 @@ def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
         seen["body"] = json.loads(body.decode())
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
-    monkeypatch.setattr(bok, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm(
         "http://127.0.0.1:1236/v1",
         model="/Users/x/Hy-MT2-1.8B-8bit",
@@ -166,9 +167,9 @@ def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
 def test_model_present_recognizes_lmstudio_layout(monkeypatch, tmp_path):
     """9B settle 只以 lmstudio 布局在盘时 doctor 不得报 MISSING(与 cmd_download
     的 ensure 同款判定;app-data 布局优先不变)。"""
-    monkeypatch.setattr(bok, "model_dir", lambda repo: tmp_path / "appdata" / repo)
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
+    patch_bok(monkeypatch, "model_dir", lambda repo: tmp_path / "appdata" / repo)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
     repo = "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"
     # 两处都不在 → MISSING
     assert not bok._model_present(repo)
@@ -183,7 +184,7 @@ def test_model_present_recognizes_lmstudio_layout(monkeypatch, tmp_path):
     (lm / "model.safetensors").write_text("x")
     assert bok._model_present(repo)
     # 非 mac 平台不认 lmstudio 布局(用两边都不在盘的另一个 repo 验证)
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
     assert not bok._model_present("mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
 
 
@@ -271,7 +272,7 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     9B 关但外部显式设了端点 → 照传（云端钩子不受开关误伤）。"""
     fake_model = tmp_path / "settle-9b"
     fake_model.write_text("x")
-    monkeypatch.setattr(bok, "_settle_llm_model", lambda cur: str(fake_model))
+    patch_bok(monkeypatch, "_settle_llm_model", lambda cur: str(fake_model))
     for key in ("BOK_DEV_9B", "FLOW_JUDGE_LLM_BASE_URL", "FLOW_JUDGE_LLM_MODEL",
                 "BOK_SETTLE_LLM_BASE_URL", "BOK_SETTLE_LLM_MODEL"):
         monkeypatch.delenv(key, raising=False)
@@ -299,7 +300,7 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
 
     # CP 面 settle env：9B 显式关(=0)不注入（Summarizer 回退 MLX）；缺省/=1 注入
     monkeypatch.setenv("BOK_DEV_9B", "0")
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.delenv("FLOW_JUDGE_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FLOW_JUDGE_LLM_MODEL", raising=False)
     cp_off = bok._control_plane_env(tmp_path / "db.sqlite")
@@ -316,7 +317,7 @@ def test_dev_9b_off_skips_settle_llm_start(monkeypatch, tmp_path, capsys):
     不等 :1237）；stderr 留一行明示回退。2026-10-01 P2 翻档后缺省=开。"""
     monkeypatch.setenv("BOK_DEV_9B", "0")
     started: list[list[str]] = []
-    monkeypatch.setattr(bok, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
+    patch_bok(monkeypatch, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
     rc = bok._start_settle_llm({}, tmp_path, tmp_path)
     assert rc is False
     assert not started

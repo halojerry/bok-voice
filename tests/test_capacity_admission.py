@@ -31,6 +31,7 @@ os.environ.setdefault("BOK_JWT_SECRET", "test-secret-for-capacity")
 
 import pytest  # noqa: E402
 
+from _bok_src import bok_source  # noqa: E402
 from control_plane import capacity  # noqa: E402
 
 GB = 1024 ** 3
@@ -392,6 +393,6 @@ def test_wiring_source_pins():
     assert "format_limit_detail(_limit)" in main_src
     assert "_max_active_calls_env" not in main_src
     # bok CP 面登记三个容量键（prod launchd 封闭 env 面下发点）。
-    bok_src = (root / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     for k in ("BOK_DEPLOY_PROFILE", "BOK_MAX_CALLS_FLOOR", "BOK_MAX_CALLS_CEILING"):
         assert f'"{k}"' in bok_src, k

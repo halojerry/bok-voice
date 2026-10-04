@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from _bok_src import bok_source
+
 ROOT = Path(__file__).resolve().parents[1]
 for p in ("apps/agent", "packages/core", "scripts"):
     sp = str(ROOT / p)
@@ -28,7 +30,7 @@ def _agent_src() -> str:
 
 
 def _bok_src() -> str:
-    return (ROOT / "tools/bok.py").read_text(encoding="utf-8")
+    return bok_source()
 
 
 # ---- ① 出声前守卫接线 ----

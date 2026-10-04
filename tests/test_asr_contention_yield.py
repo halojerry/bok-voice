@@ -16,6 +16,8 @@ import importlib.util
 import os
 from pathlib import Path
 
+from _bok_src import bok_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 os.environ.setdefault("QWEN3_ASR_BACKEND", "mlx")
@@ -151,7 +153,7 @@ def test_finish_contention_skip_disabled_by_env(monkeypatch, capsys):
 def test_wiring_source_pins():
     """三条 generate 入口全包计数 + 两处让位 + bok.py prod 透传。"""
     src = (ROOT / "services" / "qwen3-asr-sidecar" / "app.py").read_text(encoding="utf-8")
-    bok = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok = bok_source()
     # 计数包裹三条入口(partial/增量尾段/整句含 conf 路)
     assert src.count("with _inflight():") >= 3
     # 让位①/②

@@ -13,6 +13,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+from _bokpatch import patch_bok
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location("bok_tool", _ROOT / "tools" / "bok.py")
 bok = importlib.util.module_from_spec(_SPEC)
@@ -41,10 +43,10 @@ def _wire(monkeypatch, tmp_path) -> tuple[Path, Path]:
     app_root = tmp_path / "appdata"
     lm_root.mkdir()
     app_root.mkdir()
-    monkeypatch.setattr(bok, "is_mac", lambda: True)
-    monkeypatch.setattr(bok, "is_packaged", lambda: False)
-    monkeypatch.setattr(bok, "_lmstudio_models_dir", lambda: lm_root)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: app_root)
+    patch_bok(monkeypatch, "is_mac", lambda: True)
+    patch_bok(monkeypatch, "is_packaged", lambda: False)
+    patch_bok(monkeypatch, "_lmstudio_models_dir", lambda: lm_root)
+    patch_bok(monkeypatch, "app_data_dir", lambda: app_root)
     return lm_root, app_root
 
 
@@ -74,7 +76,7 @@ def test_shell_alone_falls_back_to_lmstudio_path(monkeypatch, tmp_path):
 def test_packaged_mode_ignores_lmstudio(monkeypatch, tmp_path):
     """packaged 档恒走 app-data（判据不参与）。"""
     lm_root, app_root = _wire(monkeypatch, tmp_path)
-    monkeypatch.setattr(bok, "is_packaged", lambda: True)
+    patch_bok(monkeypatch, "is_packaged", lambda: True)
     _make_model(lm_root, REPO)
     good = _make_model(app_root / "models", REPO.replace("/", "--"))
     assert bok.model_path({"m": REPO}, "m") == str(good)

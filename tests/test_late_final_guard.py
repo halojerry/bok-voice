@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "apps" / "agent"))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bok_src import bok_source  # noqa: E402
 from livekit.agents.utils.aio.channel import ChanClosed, ChanEmpty  # noqa: E402
 
 from agent_runtime.agent import agent_busy_for_state  # noqa: E402
@@ -380,7 +381,7 @@ def test_hotword_guard_wiring_source_pins():
     assert "if agent_busy and vocab_terms and _vocab_only_net(norm, vocab_terms):" in lp_src
     assert "hotword_only'} " in lp_src  # DROP 打点 reason 三态（closing/tail_append/hotword_only）
     assert lp_src.count("hotword_only'} ") == 2  # 两路打点都要能归因 hotword_only
-    bok_src = (ROOT / "tools/bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert bok_src.count("BOK_LATE_FINAL_HOTWORD_GUARD") == 1, "登记面只准一处"
     assert "BOK_LATE_FINAL_HOTWORD_GUARD" in bok._FORWARD_ENV
 

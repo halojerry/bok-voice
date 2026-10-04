@@ -15,10 +15,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def _tier(monkeypatch, mem_gib: float, **env: str) -> str:
-    monkeypatch.setattr(bok, "_physical_mem_gib", lambda: mem_gib)
+    patch_bok(monkeypatch, "_physical_mem_gib", lambda: mem_gib)
     for key in ("BOK_DEMO_PRESET", "BOK_LLM_PROMPT_CACHE_BYTES"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():

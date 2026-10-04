@@ -25,6 +25,7 @@ import asyncio  # noqa: E402
 
 from livekit.agents import llm  # noqa: E402
 
+from _bok_src import bok_source  # noqa: E402
 from agent_runtime.providers.livekit_plugins import (  # noqa: E402
     _RepeatSelfGuardStream,
     _repeat_head_max_hold,
@@ -33,7 +34,7 @@ from agent_runtime.providers.livekit_plugins import (  # noqa: E402
 PLUGINS_SRC = (
     ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py"
 ).read_text(encoding="utf-8")
-BOK_SRC = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+BOK_SRC = bok_source()
 
 
 class _EndlessInner(llm.LLMStream):

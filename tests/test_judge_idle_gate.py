@@ -25,6 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
+from _bok_src import bok_source  # noqa: E402
+
 from agent_runtime.agent import (  # noqa: E402
     _judge_capped_skip_enabled,
     _judge_yield_env,
@@ -135,5 +137,5 @@ def test_both_judges_gate_on_capped_narrowed():
     assert "[judge] skipped reason=capped" in _SRC
     assert "FLOW_GRAPH judge_skipped reason=capped" in _SRC
     # env 立法:新键必须进 _FORWARD_ENV(prod 封闭 env 面可达)。
-    bok_src = (Path(__file__).resolve().parents[1] / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     assert '"BOK_JUDGE_CAPPED_SKIP",' in bok_src

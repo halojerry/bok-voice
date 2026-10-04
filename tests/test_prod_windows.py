@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
 import schtasks_units  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
 
@@ -170,11 +171,11 @@ def test_cmd_down_posix_stdout_contract(monkeypatch, tmp_path: Path, capsys) -> 
     if bok.os.name == "nt":
         pytest.skip("POSIX-only contract")
     tmp = _make_run_dir(tmp_path, {"good.pid": "111\n", "dead.pid": "222\n", "bad.pid": "not-a-pid"})
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp)
-    monkeypatch.setattr(bok, "_sweep_orphan_workers", lambda: [])
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp)
+    patch_bok(monkeypatch, "_sweep_orphan_workers", lambda: [])
     # 端口级清扫必须一并打桩(2026-09-19 二次灭栈实案):healthy_ok=False 的
     # down 档会真杀本机活栈——本测试只测 pidfile stdout 契约,不吃真 lsof。
-    monkeypatch.setattr(bok, "_sweep_orphan_listeners", lambda **_kw: [])
+    patch_bok(monkeypatch, "_sweep_orphan_listeners", lambda **_kw: [])
 
     killed: list[int] = []
 
@@ -183,7 +184,7 @@ def test_cmd_down_posix_stdout_contract(monkeypatch, tmp_path: Path, capsys) -> 
             raise ProcessLookupError
         killed.append(pid)
 
-    monkeypatch.setattr(bok, "_kill_proc_tree", fake_kill)
+    patch_bok(monkeypatch, "_kill_proc_tree", fake_kill)
     rc = bok.cmd_down()
     out = capsys.readouterr().out
     assert rc == 0
@@ -195,7 +196,7 @@ def test_cmd_down_posix_stdout_contract(monkeypatch, tmp_path: Path, capsys) -> 
 def test_cmd_down_windows_failure_surfaced_and_continues(monkeypatch, tmp_path: Path, capsys) -> None:
     """Windows：taskkill 真失败 → stderr 留痕 + rc=1，且继续清其余 pidfile（不重演静默吞）。"""
     tmp = _make_run_dir(tmp_path, {"a.pid": "10\n", "b.pid": "20\n"})
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp)
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(
         bok.subprocess, "run",
@@ -213,7 +214,7 @@ def test_cmd_down_windows_success_and_notfound(monkeypatch, tmp_path: Path, caps
         rc = 0 if argv[-1] == "10" else 128
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
 
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp)
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
     rc = bok.cmd_down()
@@ -395,8 +396,8 @@ def test_firewall_execute_all_ok(monkeypatch, capsys) -> None:
 
 def test_doctor_gpu_gate_skipped_on_mac(monkeypatch, capsys) -> None:
     calls: list[int] = []
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "_nvidia_gate", lambda: calls.append(1) or (True, "x"))
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "x"))
     fails: list[str] = []
     bok._doctor_gpu_gate(packaged=True, fails=fails)
     assert calls == []  # mac 无 nvidia-smi：门禁不适用
@@ -407,9 +408,9 @@ def test_doctor_gpu_gate_skipped_on_mac(monkeypatch, capsys) -> None:
 def test_doctor_gpu_gate_runs_on_linux(monkeypatch, capsys) -> None:
     """Linux CUDA 节点同门同判（runbook §5⑥，2026-09-22）：门禁必须被评估。"""
     calls: list[int] = []
-    monkeypatch.setattr(bok, "is_linux", lambda: True)
+    patch_bok(monkeypatch, "is_linux", lambda: True)
     monkeypatch.setattr(bok.os, "name", "posix")
-    monkeypatch.setattr(bok, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
+    patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
     bok._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]
@@ -423,7 +424,7 @@ def test_doctor_gpu_gate_runs_regardless_of_virtual_audio(monkeypatch, capsys) -
     """回归核心：va_ok=True（装了虚拟声卡）也必须评估门禁（曾误缩进在 if not va_ok 下）。"""
     calls: list[int] = []
     monkeypatch.setattr(bok.os, "name", "nt")
-    monkeypatch.setattr(bok, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
+    patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
     bok._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]  # 门禁被评估（虚拟声卡状态无关——本函数根本不读它）
@@ -433,7 +434,7 @@ def test_doctor_gpu_gate_runs_regardless_of_virtual_audio(monkeypatch, capsys) -
 
 def test_doctor_gpu_gate_packaged_failure_fails_doctor(monkeypatch) -> None:
     monkeypatch.setattr(bok.os, "name", "nt")
-    monkeypatch.setattr(bok, "_nvidia_gate", lambda: (False, "NVIDIA GPU 未检测到"))
+    patch_bok(monkeypatch, "_nvidia_gate", lambda: (False, "NVIDIA GPU 未检测到"))
     fails: list[str] = []
     bok._doctor_gpu_gate(packaged=False, fails=fails)
     assert fails == []  # dev 模式只提示
@@ -454,9 +455,9 @@ def _fake_schtasks_factory(rc: int = 0, record: list | None = None):
 
 def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     rc = bok.cmd_prod_install()
     assert rc == 0
@@ -476,9 +477,9 @@ def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) 
 
 def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     node_args = ["--cp-url", "http://127.0.0.1:8000", "--node-token", "tok",
                  "--ui-dir", "C:\\a b\\out"]
@@ -496,17 +497,17 @@ def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tm
 
 
 def test_prod_install_windows_node_agent_requires_cp_url(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     rc = bok.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
     assert rc == 2
 
 
 def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
     assert bok.cmd_prod_install() == 1
 
@@ -515,15 +516,15 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
                     reason="mac 契约测试:--node-agent 的 mac 拒绝分支只在 mac 生效;"
                            "Linux 上 prod install 走不到该分支(跟进项:非 mac/nt 平台应有显式 unsupported 挡板)")
 def test_prod_install_mac_node_agent_rejected(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     assert bok.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
 
 
 def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     (tmp_path / "units").mkdir()
     (tmp_path / "units" / "bok-agent.xml").write_text("x", encoding="utf-16")
@@ -538,9 +539,9 @@ def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Pat
 
 
 def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
 
     def fake_run(argv, timeout=60.0):
         return subprocess.CompletedProcess(argv, 1, stdout="",
@@ -551,9 +552,9 @@ def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_pat
 
 
 def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
     assert bok.cmd_prod_uninstall() == 1
 
@@ -644,13 +645,13 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
     best-effort cmd_down()（taskkill /T /F 按 pidfile）清掉，且全部 /end 先于
     全部 /delete（先停动作进程→清子进程→再删注册）。"""
     calls: list[list[str]] = []
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
-    monkeypatch.setattr(bok, "_pid_alive", lambda pf: True)
+    patch_bok(monkeypatch, "_pid_alive", lambda pf: True)
     down_calls: list[int] = []
-    monkeypatch.setattr(bok, "cmd_down", lambda: down_calls.append(1))
+    patch_bok(monkeypatch, "cmd_down", lambda: down_calls.append(1))
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "bok-agent.pid").write_text("111\n")
@@ -668,13 +669,13 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
 
 def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: Path, capsys) -> None:
     """无 pidfile 存活：不打 WARNING、不跑 cmd_down（silence = 没有要 surface 的东西）。"""
-    monkeypatch.setattr(bok, "is_mac", lambda: False)
-    monkeypatch.setattr(bok, "is_linux", lambda: False)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "is_mac", lambda: False)
+    patch_bok(monkeypatch, "is_linux", lambda: False)
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, []))
-    monkeypatch.setattr(bok, "_pid_alive", lambda pf: False)
+    patch_bok(monkeypatch, "_pid_alive", lambda pf: False)
     down_calls: list[int] = []
-    monkeypatch.setattr(bok, "cmd_down", lambda: down_calls.append(1))
+    patch_bok(monkeypatch, "cmd_down", lambda: down_calls.append(1))
     assert bok.cmd_prod_uninstall() == 0
     captured = capsys.readouterr()
     assert down_calls == []
@@ -709,12 +710,12 @@ def test_doctor_gpu_gate_called_at_function_top_level() -> None:
 
 def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
     """_prod_units 的环境依赖全部钉到无害桩（不碰真实 app-data / 模型路径）。"""
-    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(bok, "repo_python", lambda: "py")
-    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
-    monkeypatch.setattr(bok, "_agent_prod_env", lambda: {})
-    monkeypatch.setattr(bok, "_interp_env", lambda env: {})
-    monkeypatch.setattr(bok, "_control_plane_env", lambda db: {})
+    patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
+    patch_bok(monkeypatch, "repo_python", lambda: "py")
+    patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
+    patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
+    patch_bok(monkeypatch, "_interp_env", lambda env: {})
+    patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
 
 
 def _cp_unit_args(monkeypatch, tmp_path: Path) -> list[str]:

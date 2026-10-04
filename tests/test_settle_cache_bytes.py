@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 
 def test_settle_cache_bytes_default_and_override(monkeypatch) -> None:
@@ -31,12 +32,12 @@ def _run_settle_start(monkeypatch, tmp_path):
     model = tmp_path / "settle-model"
     model.mkdir()
     monkeypatch.setenv("BOK_DEV_9B", "1")
-    monkeypatch.setattr(bok, "healthy", lambda port: False)
-    monkeypatch.setattr(bok, "sidecar_python", lambda name: tmp_path / "py")
-    monkeypatch.setattr(bok, "_apply_mlx_template_fix", lambda py: None)
-    monkeypatch.setattr(bok, "_settle_llm_model", lambda cur: str(model))
-    monkeypatch.setattr(
-        bok, "_start_proc",
+    patch_bok(monkeypatch, "healthy", lambda port: False)
+    patch_bok(monkeypatch, "sidecar_python", lambda name: tmp_path / "py")
+    patch_bok(monkeypatch, "_apply_mlx_template_fix", lambda py: None)
+    patch_bok(monkeypatch, "_settle_llm_model", lambda cur: str(model))
+    patch_bok(
+        monkeypatch, "_start_proc",
         lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
     assert bok._start_settle_llm({}, tmp_path, tmp_path) is True
     return started

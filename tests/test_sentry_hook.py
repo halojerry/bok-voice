@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from _bok_src import bok_source
 import pytest
 from bok_voice_obs import sentry_hook
 
@@ -130,7 +131,7 @@ def test_sentry_env_keys_flow_to_both_faces():
     assert "SENTRY_DSN" in bok._FORWARD_ENV
     assert "SENTRY_ENVIRONMENT" in bok._FORWARD_ENV
     assert "SENTRY_SEND_PII" in bok._FORWARD_ENV
-    bok_src = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
+    bok_src = bok_source()
     cp_loop = bok_src[bok_src.index("for _k in (\"BOK_LOG_LEVEL\""):]
     cp_loop = cp_loop[: cp_loop.index(")") + 1]
     for _k in ("SENTRY_DSN", "SENTRY_ENVIRONMENT", "SENTRY_SEND_PII"):

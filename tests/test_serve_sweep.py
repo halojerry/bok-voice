@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
+from _bokpatch import patch_bok  # noqa: E402
 
 _FAKE_PID = 424242  # 不得与测试进程自身 pid 撞（sweep 跳过自身）
 
@@ -65,8 +66,8 @@ def _patch_stack_io(monkeypatch, tmp_path, lsof_out: dict[int, str], ps_cmd: str
         return healthy
 
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    monkeypatch.setattr(bok, "_relaxed_healthy", fake_relaxed)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: app_root)
+    patch_bok(monkeypatch, "_relaxed_healthy", fake_relaxed)
+    patch_bok(monkeypatch, "app_data_dir", lambda: app_root)
     monkeypatch.setattr(bok.os, "getpgid", lambda pid: 7000 + pid)
     monkeypatch.setattr(bok.os, "killpg",
                         lambda pgid, sig, *_a, **_k: killed.append(("killpg", pgid)))
@@ -164,7 +165,7 @@ def test_relaxed_healthy_http_surface(monkeypatch):
         seen["url"], seen["timeout"] = url, timeout_s
         return 200, b"ok"
 
-    monkeypatch.setattr(bok, "_http_call", fake_http_call)
+    patch_bok(monkeypatch, "_http_call", fake_http_call)
     assert bok._relaxed_healthy(8000)
     assert seen["url"] == "http://127.0.0.1:8000/health"
     assert seen["timeout"] == 5.0  # 放宽窗口：CPU 风暴下 1s 会假死
@@ -215,7 +216,7 @@ def test_ports_down_after_grace():
     assert bok._ports_down_after_grace([], probe=probe) == []
 
 
-def test_ports_down_after_grace_default_probe():
+def test_ports_down_after_grace_default_probe(monkeypatch):
     """缺省探针=_relaxed_healthy（打桩验证接线，防手滑换回 1s healthy()）。"""
     monkey_hits: list[int] = []
 
@@ -223,12 +224,8 @@ def test_ports_down_after_grace_default_probe():
         monkey_hits.append(port)
         return port != 8787
 
-    orig = bok._relaxed_healthy
-    bok._relaxed_healthy = fake_relaxed
-    try:
-        assert bok._ports_down_after_grace([8000, 8787]) == [8787]
-    finally:
-        bok._relaxed_healthy = orig
+    patch_bok(monkeypatch, "_relaxed_healthy", fake_relaxed)
+    assert bok._ports_down_after_grace([8000, 8787]) == [8787]
     assert monkey_hits == [8000, 8787]
 
 
@@ -336,8 +333,8 @@ def test_process_serve_root_marker_branches(monkeypatch, tmp_path):
     """来源鉴定纯函数分支：本树命中 / lstart 不符作废 / 无标记未知 / 格式坏未知。"""
     app_root = tmp_path / "appdata"
     (app_root / "run").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(bok, "app_data_dir", lambda: app_root)
-    monkeypatch.setattr(bok, "_ps_field", lambda pid, field: _MARKER_LSTART)
+    patch_bok(monkeypatch, "app_data_dir", lambda: app_root)
+    patch_bok(monkeypatch, "_ps_field", lambda pid, field: _MARKER_LSTART)
 
     _write_stamp(app_root, 101, str(bok.ROOT))
     assert bok._process_serve_root(101) == str(bok.ROOT)

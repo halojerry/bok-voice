@@ -1,0 +1,4931 @@
+#!/usr/bin/env python
+"""bokctl — cross-platform (no-Docker) launcher for the Bok voice stack.
+
+Subcommands:
+  catalog    List per-platform models + sizes.
+  download   Download missing models into the app-data dir (resume + progress).
+  status     Summarize service health + model readiness.
+  up         Ensure models + runtimes, then start ASR/TTS/LLM.
+  serve      Full desktop stack: control-plane + LiveKit + up + agent worker.
+  down       Stop services started by bokctl (pidfiles).
+  doctor     Preflight diagnostics (structure/deps/hardware; strict when packaged).
+
+Platform split (MLX is Apple-only):
+  mac -> MLX sidecars + mlx_lm server on :1235 + optional MT server on :1236
+  win -> transformers sidecars (CUDA torch) + llama.cpp CUDA server on :1235
+Zero-Ollama: there is no Ollama anywhere in the distribution path.
+"""
+from __future__ import annotations
+
+import argparse
+import http.client
+import ipaddress
+import json
+import os
+import platform as _platform
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Sequence
+from pathlib import Path
+
+_BOK_ROOT_ENV = os.environ.get("BOK_ROOT", "")
+# G2 W①:core.py 比 bok.py 深一层,repo 根=parents[2]
+ROOT = Path(_BOK_ROOT_ENV).resolve() if _BOK_ROOT_ENV else Path(__file__).resolve().parents[2]
+
+
+def is_packaged() -> bool:
+    """True when running from the desktop bundle (Tauri resources)."""
+    return os.environ.get("BOK_PACKAGED") == "1"
+
+
+def is_mac() -> bool:
+    return _platform.system() == "Darwin"
+
+
+def is_linux() -> bool:
+    """Linux 档判定（Ubuntu 节点形态，2026-09-20）。按真实 OS 判定而非
+    `not is_mac() and os.name != "nt"`——Windows 单测以 is_mac=False+os.name
+    打桩模拟 Windows，过度宽松的判定会把桩吃掉（test_prod_windows 实证）。"""
+    return _platform.system() == "Linux"
+
+
+def app_data_dir() -> Path:
+    """app-data 根（…/BokVoice）：SQLite/vault/logs/units/models 全落这里。
+
+    平台分档（2026-09-20 Ubuntu 节点形态补齐）：nt=LOCALAPPDATA；Darwin=
+    ~/Library/Application Support；Linux=XDG_DATA_HOME 或 ~/.local/share——
+    旧版非 nt 恒落 mac 路径，Ubuntu 上会把数据写到不存在的 Library 目录树。
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    elif is_mac():
+        base = Path(os.environ.get("HOME", ".")) / "Library" / "Application Support"
+    else:
+        base = Path(
+            os.environ.get("XDG_DATA_HOME")
+            or str(Path(os.environ.get("HOME", ".")) / ".local" / "share")
+        )
+    return base / "BokVoice"
+
+
+def runtime_root() -> Path:
+    """Locate the bundled runtime dir (python/node/llama/livekit).
+
+    规范位置 = 仓库根 ``<root>/runtime``（2026-09-17 迁出 desktop/，Tauri 退役
+    前置）。仍向上走祖先目录兜底：兼容历史布局与未来打包形态把代码根埋深一层
+    的场景（runtime 与代码根同级或在其上方）。
+    """
+    cur = ROOT
+    for _ in range(5):
+        cand = cur / "runtime"
+        if (
+            (cand / "python" / "bin" / "python3").exists()
+            or (cand / "python" / "python.exe").exists()
+            or (cand / ".venv").exists()
+            or (cand / "livekit-server").exists()
+            or (cand / "livekit-server.exe").exists()
+            or (cand / "llama").exists()
+        ):
+            return cand
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return ROOT / "runtime"
+
+
+MODELS: dict[str, dict[str, str]] = {
+    "mac": {
+        # ASR 维持 8bit(2026-09-08 A/B 实证回退):4bit 快 ~24% 但数字路径同音字
+        # 滑失(九→狗/號→后,同渲染音频 8bit 逐字全对)——WhatsApp 捕获零降级铁律
+        # 优先。GPU 减负靠 partial 会话级抑制(见 agent BOK_ASR_PARTIAL_SLOW_MS)。
+        "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
+        # P1 SV-CPU 引擎车道(2026-10-01 三层解耦):SenseVoice-small int8 ONNX,
+        # 纯 CPU 三语识别(zh 2.8%/en 5.4%/canto 8.6%、WA 数字 16/16、40-48ms/句;
+        # reports/sensevoice-eval/)。HF 镜像仓(repo 内即 model.int8.onnx+tokens.txt
+        # 布局,与 k2-fsa release 同源)。可选:缺模型时 asr engine fail-open 回
+        # Qwen3 路径;--only sensevoice 显式落盘(~230MB)。
+        "sensevoice": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+        "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+        # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),
+        # 港式粤语/夹英文/数字读法实测达标。更重任务(蒸馏/知识分析)另走大模型。
+        "llm": "avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit",
+        # B 线同传专用翻译小模型(Hy-MT2,逐句无状态 MT):与主 LLM 分进程分端口,
+        # prefill 互不挤占。可选(首启向导不门禁,缺失时 B 线回退主 LLM :1235)。
+        "mt": "mlx-community/Hy-MT2-1.8B-Abliterated-8bit",
+        # 后台重活专线(:1237,2026-09-17):settle 纪要/知识蒸馏与 flow judge 指到
+        # 这颗 9B——延迟不敏感的岗位吃大模型质量,与活通话的 4B(:1235)分进程,
+        # 争用实测可控(9B 出 512-token 纪要时 4B 暖轮 +60ms/冷轮 +360ms,单篇
+        # 纪要 4-9s)。可选:模型缺失时 :1237 不起,settle/judge 自动回退 :1235。
+        # 2026-09-25 实测否决 TheCluster-mxfp4 顶此岗:其 prefill 窗把 :1235
+        # 打到 41s、单篇纪要 48.5s(mxfp4 核慢)——Huihui-4bit 重下回归(同日其
+        # 权重被误删);TheCluster 只进 5.x 隔离 A/B,不进常驻车道。
+        "settle": "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
+        # W1b 意图语义车道 embedding(:8789 sidecar,2026-09-23):bge-m3 4bit,
+        # CLS+L2 池化(壳内自做——mlx-embeddings 0.1.0 硬编码 mean 池化)。
+        # 单句前向 p50 10.5ms。可选:模型缺失时 sidecar 不起,agent 装配面
+        # 降级闩自动关语义车道(关键词+judge 双车道=现状)。
+        "embedding": "mlx-community/bge-m3-mlx-4bit",
+        # Laya 决策 sidecar(:8791,2026-09-26):0.4B 非自回归判定引擎
+        # (aac6fef/laya-multilingual-mlx,~690MB FP16,上下文硬顶 1024 token),
+        # 暖态单判 ~10ms——意图/流程判定的边缘快路,带校准置信度
+        # (below_floor 调用方回落 9B)。可选:缺失时 sidecar 不起,agent 走
+        # 原 9B judge。评估数据与坑见 docs/LAYA-EVAL.md。
+        "laya": "aac6fef/laya-multilingual-mlx",
+        # Draft 模型(speculative decoding,2026-09-25):Qwen3-0.6B-4bit(HF API
+        # 只读探活核实存在,base_model:Qwen/Qwen3-0.6B,repo 自带 config.json
+        # +tokenizer,~335MB)——与主 LLM(avan-ag Qwen3.5-4B)同族 Qwen3 分词器,
+        # 满足 mlx_lm server --draft-model 的「draft/target 同分词器」前提。
+        # 注意:mlx-lm#846 丢 token 风险在 Qwen3-Next 架构,dense 4B 不同族;
+        # 上线前仍须输出一致性 A/B(同 prompt 逐 token 对比)。可选增强:默认不
+        # 下载(cmd_download 有 opt-in 门),BOK_LLM_DRAFT=1 才挂旗标。
+        "llm_draft": "mlx-community/Qwen3-0.6B-4bit",
+    },
+    "windows": {
+        "asr": "Qwen/Qwen3-ASR-1.7B",
+        # P1:SV CPU 车道跨平台同一份 ONNX(见 mac 表注释)。
+        "sensevoice": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "tts_preset": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "tts_clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        # GGUF for llama.cpp; only the Q4_K_M file is downloaded (see patterns).
+        "llm": "lukey03/Qwen3.5-9B-abliterated-GGUF",
+        # 4B 档（2026-09-20 装机分档机制；口径「配置够 9B / 不够 4B」）：**repo id
+        # 留空 = 档位未配置**——install-node.sh 按 VRAM 探测给建议档，空值明确
+        # 告警并回退 9B（resolve_llm_repo 同判）。运维选定 4B GGUF 权重后填此键
+        # 即生效，勿臆造仓库。
+        "llm_4b": "",
+        # B 线 MT / settle 专线在非 mac 表当前缺项（缺=对应功能回退主 LLM :1235，
+        # 与 OPTIONAL_MODELS 语义一致）；补权重后填 "mt"/"settle" 键即被选型/
+        # 下载/启动三面自动识别。
+    },
+}
+
+# Only pull the Q4_K_M GGUF (the repo also carries F16/vision variants).
+WINDOWS_LLM_GGUF_PATTERNS = ["*Q4_K_M.gguf", "README.md"]
+
+# 首启向导不门禁的模型(可选增强,缺失时对应功能自动回退:B 线 MT 回退主 LLM :1235,
+# settle/judge 专线回退 :1235,意图语义车道回退关键词+judge 双车道,Laya judge
+# 回退 :1237/:1235 生成式判定链,llm_draft 回退无 draft 普通解码)。
+OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya", "llm_draft", "sensevoice"}
+
+
+def platform_key() -> str:
+    """模型表键：Darwin=mac（mlx 栈）；其余（Windows/Linux）=windows（llama.cpp
+    GGUF + transformers ASR/TTS）。旧版非 nt 恒回 "mac"，Linux 会去下 mlx 模型
+    并在 :1235 起 mlx_lm——Ubuntu 节点形态修复（2026-09-20）。"""
+    return "mac" if is_mac() else "windows"
+
+
+def model_dir(repo_id: str) -> Path:
+    return app_data_dir() / "models" / repo_id.replace("/", "--")
+
+
+def _lmstudio_models_dir() -> Path:
+    return Path(os.environ.get("LMSTUDIO_MODELS_DIR", str(Path.home() / ".lmstudio" / "models")))
+
+
+def _usable_model_dir(path: Path, extra_required: str = "") -> bool:
+    """目录里是否**真有一份可加载的模型**——不是「目录存在」，也不是「非空」。
+
+    `config.json` 是 mlx/HF 布局的加载入口（各 sidecar 缺它就报 `Config not found`）。
+    2026-09-21 实证：`~/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
+    只剩一个 `.cache/` 空壳（别家工具建的空目录），而 app-data 里那份是好的——旧判据
+    `dir.exists()` 认空壳为真并**优先**返回它，于是 TTS sidecar 加载失败、探针收到
+    **0 字节音频**（HTTP 还回 200），表象是「agent 听不到客户、整通全哑」。
+    空壳必须让位给真模型。
+    2026-09-28 追加（`extra_required`）：同一剧本第二集——LM Studio 重新下载把
+    `Base-8bit/speech_tokenizer/` 整个弄丢，`config.json` 还在 → 判据通过 → lmstudio
+    空壳副本**压过** app-data 完整副本，sidecar 加载「成功」、合成时才炸
+    `Speech tokenizer not loaded`（`no audio frames were pushed`，本地车道整通哑）。
+    TTS 两模型目录必须有 `speech_tokenizer/`，调用点传 `extra_required` 收紧判据。
+    """
+    if not (path / "config.json").is_file():
+        return False
+    if extra_required and not (path / extra_required).exists():
+        return False
+    return True
+
+
+def model_path(current: dict[str, str], name: str) -> str:
+    """Resolve a model to a path the running backend accepts.
+
+    packaged -> app-data/models/<repo-with--->
+    mac dev   -> ~/.lmstudio/models/<repo>  (LM Studio layout)
+    win dev   -> repo id (transformers/hf cache)
+    """
+    repo = current.get(name, "")
+    if not repo:
+        return ""
+    if is_packaged():
+        return str(model_dir(repo))
+    if is_mac():
+        # mac dev 惯例优先 ~/.lmstudio;但 bok.py download 落地在 app-data——
+        # 哪边**真有一份可加载的模型**用哪边,否则「download 成功但 serve 找不到」断层
+        # (2026-09-08 ASR 4bit 实证:health model_ready=false 指着不存在的 lmstudio 路径)。
+        # 判据用 `_usable_model_dir`(要 config.json)而非 `exists()`:空壳目录优先返回
+        # 会把好模型挡在后面(2026-09-21 TTS 实证)。TTS 模型再要 `speech_tokenizer/`
+        # (2026-09-28 实证:lmstudio 副本缺 tokenizer 目录静默过判据,合成时才炸)。
+        extra = "speech_tokenizer" if name in ("tts_preset", "tts_clone") else ""
+        lm = _lmstudio_models_dir() / repo
+        if _usable_model_dir(lm, extra_required=extra):
+            return str(lm)
+        app = model_dir(repo)
+        if _usable_model_dir(app, extra_required=extra):
+            return str(app)
+        return str(lm)
+    if is_linux():
+        # Linux dev（runbook §5②，2026-09-22）：cmd_download 只落 *Q4_K_M.gguf 进
+        # app-data/models/<repo>（WINDOWS_LLM_GGUF_PATTERNS），llama-server 只认
+        # .gguf **文件**路径——repo id 是 win-dev 的 hf cache 语义，直传会 :1235
+        # 起不来/model not found。保守解析：布局里真有 gguf 才返回文件路径，
+        # 否则保持 repo id 兜底（与 mac「哪边真有模型用哪边」同纪律）；真机验收
+        # 仍以 runbook §4 上栈第一验为准。
+        try:
+            _ggufs = sorted(model_dir(repo).glob("*.gguf"))
+        except OSError:
+            _ggufs = []
+        if _ggufs:
+            return str(_ggufs[0])
+        return repo
+    return repo
+
+
+def _settings_llm_local_model() -> str:
+    """读设置页存的本地 LLM 模型(settings.llm.local_model);失败/空回退 ""。
+
+    bok serve 决定 :1235 起哪个模型时优先用用户选定的模型;控制面/agent 注入的
+    MLX_LLM_MODEL 与 Summarizer 用同一本机模型,必须保持一致。DB 不存在/损坏
+    时静默回退默认,不让启动器因设置问题崩。
+    """
+    try:
+        import sqlite3
+
+        db_path = app_data_dir() / "bok_voice.db"
+        if not db_path.exists():
+            return ""
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT llm_json FROM global_settings WHERE id='global'"
+            ).fetchone()
+            if not row or not row[0]:
+                return ""
+            return str((json.loads(row[0]) or {}).get("local_model") or "").strip()
+        finally:
+            con.close()
+    except Exception:
+        return ""
+
+
+# 云端 TTS provider 集（serve 本地 TTS 门控判据；与 agent 装配分支同名值对齐——
+# agent.py effective_tts_provider 消费 {"minimax","minimax_streaming","volcano",
+# "volcano_streaming","fake","fake_tts"}，其余值（qwen3_tts/未知）都算本地车道）。
+_CLOUD_TTS_PROVIDERS = frozenset(
+    {"minimax", "minimax_streaming", "volcano", "volcano_streaming", "fake", "fake_tts"}
+)
+
+
+def _local_tts_needed() -> tuple[bool, str]:
+    """读 CP 设置判定本地 TTS sidecar（:8788）要不要拉起（2026-09-27）。
+
+    全云端形态（全局 tts.provider 指云端、且无人设覆盖回本地）跳过 :8788——
+    MLX 权重常驻零消费还挤内存。A 线 minimax 分支与 B 线 interpret 云端档都
+    不碰本地 TTS；云端失败回退是 hd→turbo 同云换档（FallbackAdapter），不落
+    本地。判据与 agent 装配 `effective_tts_provider`（F-11）同一条规则：
+    persona.tts_provider 覆盖 > 全局 tts.provider > 缺省 qwen3_tts（本地）。
+    env：BOK_LOCAL_TTS=1 强制拉起（E2E 探针渲染客户话音直打 :8788）、=0 强制
+    跳过；DB 缺失/损坏 → 拉起（保守=旧行为零变化）。返回 (needed, 原因)。
+    """
+    override = os.environ.get("BOK_LOCAL_TTS", "").strip()
+    if override == "1":
+        return True, "BOK_LOCAL_TTS=1 强制"
+    if override == "0":
+        return False, "BOK_LOCAL_TTS=0 强制跳过"
+    try:
+        import sqlite3
+
+        db_path = app_data_dir() / "bok_voice.db"
+        if not db_path.exists():
+            return True, "无设置库默认拉起"
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT tts_json FROM global_settings WHERE id='global'"
+            ).fetchone()
+            global_p = ""
+            if row and row[0]:
+                global_p = str(
+                    (json.loads(row[0]) or {}).get("provider") or ""
+                ).strip().lower()
+            overrides = [
+                str(r[0] or "").strip().lower()
+                for r in con.execute(
+                    "SELECT tts_provider FROM persona_profiles"
+                ).fetchall()
+            ]
+        finally:
+            con.close()
+        cloud_global = (global_p or "qwen3_tts") in _CLOUD_TTS_PROVIDERS
+        local_persona = [p for p in overrides if p and p not in _CLOUD_TTS_PROVIDERS]
+        if local_persona:
+            return True, f"人设 tts_provider={local_persona[0]!r} 用本地"
+        if cloud_global:
+            return False, f"全云端 tts.provider={global_p}"
+        return True, f"tts.provider={global_p!r}(空/本地=默认拉起)"
+    except Exception as exc:  # noqa: BLE001 - 启动器不因设置问题崩
+        return True, f"读取失败({exc.__class__.__name__})默认拉起"
+
+
+def _qwen3_tts_sidecar_env(base: dict[str, str]) -> dict[str, str]:
+    """TTS sidecar 启动 env：必填键 + `QWEN3_TTS_*` 前缀整族透传（2026-09-28）。
+
+    sidecar 是独立进程，`_FORWARD_ENV`（agent worker 表）不覆盖它——此前两处
+    启动点是硬编码最小集，调参键（STREAM_INTERVAL/SPLIT_MAX_CHARS/SILENCE_*
+    等）dev 靠 `_start_proc` merge `os.environ` 才生效，prod 封闭 env 结构性
+    不可调（`BOK_FLOW_GRAPH`/`_interp_env` 同款教训；xiaozhi 对标调研发现的
+    当天新键 `QWEN3_TTS_SPLIT_MAX_CHARS` 正落在死区）。前缀整族透传：新增
+    sidecar 调参键自动可达，不用回改本函数。空值不透传（必填键优先）。"""
+    env = dict(base)
+    # 双模型强制键(第十七波 2026-10-02):TTS sidecar 启动期条件加载的逃生键
+    # (registry 空时 clone 不载省 2.9GB;"1"=无条件双载回旧行为)——无 QWEN3_TTS_
+    # 前缀,单独透传。
+    if os.environ.get("BOK_TTS_BOTH_MODELS", "") != "":
+        env.setdefault("BOK_TTS_BOTH_MODELS", os.environ["BOK_TTS_BOTH_MODELS"])
+    for key, val in os.environ.items():
+        if key.startswith("QWEN3_TTS_") and val != "":
+            env.setdefault(key, val)
+    return env
+
+
+def _qwen3_asr_sidecar_env(base: dict[str, str]) -> dict[str, str]:
+    """ASR sidecar 启动 env：必填键 + `QWEN3_ASR_*` 前缀整族透传（2026-10-02，
+    镜像 `_qwen3_tts_sidecar_env` 先例）。
+
+    sidecar 是独立进程，`_FORWARD_ENV`（agent worker 表）不覆盖它——此前启动点
+    是硬编码最小集（MODEL/BACKEND/DEVICE/CONTENTION_YIELD/SV_*），而 sidecar
+    实际读 ~25 个 `QWEN3_ASR_*` 键（SAMPLE_RATE/INC_MIN_CPS/PARTIAL_*/
+    FINISH_*/TRIM_*/CONFIDENCE…）：调参键 dev 靠 `_start_proc` merge
+    `os.environ` 才活，prod 封闭 env 结构性不可调（TTS 先例同款死门）。
+    前缀整族透传：新增 sidecar 调参键自动可达，不用回改本函数。空值不透传
+    （必填键优先）。BOK_ASR_ENGINE / QWEN3_ASR_DEVICE 仍由启动点显式处理。"""
+    env = dict(base)
+    for key, val in os.environ.items():
+        if key.startswith("QWEN3_ASR_") and val != "":
+            env.setdefault(key, val)
+    return env
+
+
+def resolve_llm_repo(current: dict[str, str]) -> str:
+    """选定要启动/注入的本地 LLM repo：设置页 local_model 优先 → 档位 env
+    （`BOK_LLM_TIER=4b` 且表内 `llm_4b` 非空）→ 表默认 `llm`。
+
+    档位（2026-09-20 装机分档，口径「配置够 9B / 不够 4B」）：4b 档未配置时
+    明确告警一次并回退默认档——绝不静默去起一个不存在的仓库。
+    """
+    override = _settings_llm_local_model()
+    if override:
+        return override
+    tier = (os.environ.get("BOK_LLM_TIER") or "").strip().lower()
+    if tier in ("4b", "small"):
+        repo_4b = (current.get("llm_4b") or "").strip()
+        if repo_4b:
+            return repo_4b
+        print("[bok] BOK_LLM_TIER=4b 但当前平台表未配置 llm_4b —— 回退默认档",
+              file=sys.stderr)
+    return current.get("llm") or ""
+
+
+def _mt_llm_model(current: dict[str, str]) -> str:
+    """B 线 MT 翻译小模型路径:MT_LLM_MODEL 显式覆盖 > MODELS 表 mt 条目;无则 ""。
+
+    与主 LLM 的解析同一套路(路径须是后端真认的模型路径);解析不出(未下载/
+    表里无 mt 条目)返回 "",启动侧跳过 :1236、interp env 侧不下发 MT_*
+    (interpret 侧回退主 LLM :1235,唔会指去死端口)。
+    """
+    override = os.environ.get("MT_LLM_MODEL", "").strip()
+    if override:
+        return override
+    return model_path(current, "mt")
+
+
+def _settle_llm_model(current: dict[str, str]) -> str:
+    """后台重活专线模型路径(:1237,纪要/蒸馏/judge):BOK_SETTLE_LLM_MODEL 显式
+    覆盖 > MODELS 表 settle 条目;无则 ""(调用方跳过 :1237、env 不下发,
+    settle/judge 自动回退主 LLM :1235,唔会指去死端口)。"""
+    override = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+    if override:
+        return override
+    return model_path(current, "settle")
+
+
+def _settle_cache_bytes() -> str:
+    """:1237 prompt-cache-bytes 档位：``BOK_SETTLE_CACHE_BYTES`` 显式覆盖 >
+    缺省 4GB（2026-10-02 编排审计第二波——该键此前只活在注释里，argv 恒硬编码
+    4GB，注释承诺的「16GB 机型可显式下调」旋钮实际不存在）。与 :1235 的
+    ``BOK_LLM_PROMPT_CACHE_BYTES`` 覆盖独立（两进程各自预算）。空/空白=未设。"""
+    override = os.environ.get("BOK_SETTLE_CACHE_BYTES", "").strip()
+    return override or "4GB"
+
+
+def _usable_laya_dir(path: Path) -> bool:
+    """laya 检查点在盘判据——不能借 `_usable_model_dir`（config.json 是 mlx/HF
+    布局入口；laya 检查点入口是 rl_agent_config.json + model.safetensors +
+    encoder/config.json，与 sidecar 侧 _is_checkpoint 同源）。"""
+    return (
+        (path / "rl_agent_config.json").is_file()
+        and (path / "model.safetensors").is_file()
+        and (path / "encoder" / "config.json").is_file()
+    )
+
+
+def laya_model_path(current: dict[str, str]) -> str:
+    """Laya 决策 sidecar(:8791) 模型路径:LAYA_MODEL_DIR 显式覆盖 > MODELS 表
+    laya 条目(mac dev 走 lmstudio/app-data 双布局「哪边真实在盘用哪边」同款
+    次序,判据用 laya 专属 `_usable_laya_dir`)。解析不出返回 ""(调用方跳过
+    :8791,agent 走原 9B judge 回落链,唔会指去死端口)。"""
+    override = os.environ.get("LAYA_MODEL_DIR", "").strip()
+    if override:
+        return override
+    repo = current.get("laya", "")
+    if not repo:
+        return ""
+    if is_packaged():
+        return str(model_dir(repo))
+    if is_mac():
+        lm = _lmstudio_models_dir() / repo
+        if _usable_laya_dir(lm):
+            return str(lm)
+        app = model_dir(repo)
+        if _usable_laya_dir(app):
+            return str(app)
+        return ""
+    return repo
+
+
+def _dev_9b_enabled() -> bool:
+    """9B 专线(:1237)是否随栈常驻:``BOK_DEV_9B=0`` 显式关,**默认启动(2026-10-01
+    P2 翻档,模型在盘才拉)**。
+
+    历史与翻档理由:9B 常驻曾是夜间崩速主犯(LANE-AB-2026-09-25 附 3:judge 9B
+    与回复 4B 共挤统一内存,swap 颠簸,in-call tps 4-12)。**该结论的前提已被
+    P1 拆除**——ASR 全量迁 CPU 后 MPS 只剩 LLM,统一内存压力位换人;且 9B 现在
+    的角色是 a_reply 专线(Huihui-Qwen3.5-9B-abliterated):暖态 TTFT 175ms
+    (:1237 直连,无队列代理头排),soak 11/11 p50 912ms/0 fallback,双引擎
+    (4B 判官 :1235 + 9B 回复 :1237)分进程分端口互不挤占。模型缺盘时保持旧
+    形状(不拉,judge/settle 回退 :1235)——a_reply 车道的回滚键=BOK_DEV_9B=0
+    或路由表改回缺省链。读法与全仓同款(env=="0" 显式关)。"""
+    return os.environ.get("BOK_DEV_9B", "") != "0"
+
+
+def _llm_draft_enabled() -> bool:
+    """Draft 模型 speculative decoding 开关(:1235 主 LLM,BOK_LLM_DRAFT,默认关;
+    ="1" 才开)。mlx_lm 0.31.3 server 支持 ``--draft-model <path>`` +
+    ``--num-draft-tokens``(默认 3),与 prompt cache 同槽共管(cache key 含 draft
+    维度,不破坏「上一轮请求=下一轮严格前缀」的追加式缓存);队列代理零改动已
+    核实(2026-09-25 读码):queue_proxy 透传原始 body 仅换 content-type/
+    x-bok-lane 头,draft 是 server 启动旗标而非 body 参数,LaneGate 并发=1 本就
+    与带 draft 的单发路径契合。风险面:mlx-lm#846 丢 token 见 MODELS 表 llm_draft
+    注——上线前必须输出一致性 A/B(归审计方)。读法与全仓同款 ``=="1"``。"""
+    return os.environ.get("BOK_LLM_DRAFT", "") == "1"
+
+
+def _llm_draft_model(current: dict[str, str]) -> str:
+    """Draft 模型路径解析:BOK_LLM_DRAFT_MODEL 显式覆盖 > MODELS 表 llm_draft
+    条目(mac dev 走 lmstudio/app-data 双布局「哪边真实在盘用哪边」,与主 LLM
+    同一 model_path 语义);表无条目/非 mac 表回 ""(调用方跳过 draft 旗标)。"""
+    override = os.environ.get("BOK_LLM_DRAFT_MODEL", "").strip()
+    if override:
+        return override
+    return model_path(current, "llm_draft")
+
+
+def _llm_draft_flags(current: dict[str, str]) -> list[str]:
+    """Draft 旗标组装(离线可单测):BOK_LLM_DRAFT=1 且 draft 模型在盘 →
+    ``["--draft-model", <path>, "--num-draft-tokens", "3"]``;其余情形(默认关/
+    模型缺席)回 [](调用方零追加=无 draft 普通解码,**不 fail**)。
+
+    模型缺席时打一行 stderr 明示跳过——opt-in 特性静默降级违背可观测纪律,
+    但绝不让 serve 起不来。num-draft-tokens 取官方默认 3,不另设 env(实弹
+    调优后再谈)。
+
+    【2026-09-27 隔离 A/B 实弹判死缓期(scripts/probes/probe_llm_draft_ab.py;基准
+    读数 TTFT 暖档 141ms / decode tps 70.8)——勿在无新证据时开启】:
+    1. mlx-lm 0.31.3 ``speculative_generate_step`` 硬性要求 trimmable prompt
+       cache,而 server 的 ArraysCache(--prompt-cache-size 路径)**任何配置
+       下都不可 trim**——首条生成即 ValueError「requires a trimmable prompt
+       cache (got {'ArraysCache'})」。有无 --prompt-cache-bytes 同错,与本仓
+       旗标无关;server 路径 spec decode 与 prompt cache 架构(TTFT 命中的
+       承重墙)结构性互斥,弃缓存换 spec 不可接受(每轮全量重 prefill)。
+    2. 独立第二记:Qwen3-0.6B 与主模型(avan-ag Qwen3.5-4B)tokenizer 不匹配
+       (server 警告「may not work as expected」)——同分词器前提不成立。
+    复活条件(任一):上游 mlx-lm 让 server cache 可 trim;或 Qwen3.5 家族
+    0.6B 级 draft 发布且分词器匹配。届时重跑 probe_llm_draft_ab.py 三面
+    (tps 加速比 / greedy 逐字节一致 / 内存)达标才准翻闸。"""
+    if not _llm_draft_enabled():
+        return []
+    draft_model = _llm_draft_model(current)
+    if not draft_model or not Path(draft_model).exists():
+        print(f"[bok] llm draft model not present, start without draft "
+              f"({draft_model or 'unset'}); 补齐: python tools/bok.py download --only llm_draft",
+              file=sys.stderr)
+        return []
+    return ["--draft-model", draft_model, "--num-draft-tokens", "3"]
+
+
+def sidecar_python(name: str) -> Path:
+    """Bundled runtime python, else the repo venv for that service."""
+    if os.name == "nt":
+        cands = [
+            runtime_root() / "python" / "python.exe",
+            ROOT / "services" / name / ".venv" / "Scripts" / "python.exe",
+        ]
+    else:
+        cands = [
+            runtime_root() / "python" / "bin" / "python3",
+            ROOT / "services" / name / ".venv" / "bin" / "python",
+        ]
+    for c in cands:
+        if c.exists():
+            return c
+    return cands[-1]
+
+
+def sidecar_venv_python(name: str) -> Path:
+    if os.name == "nt":
+        return ROOT / "services" / name / ".venv" / "Scripts" / "python.exe"
+    return ROOT / "services" / name / ".venv" / "bin" / "python"
+
+
+def repo_python() -> Path:
+    """Pick a Python interpreter that can import control_plane + obs packages."""
+    if os.name == "nt":
+        candidates = [
+            runtime_root() / "python" / "python.exe",
+            ROOT / ".venv312" / "Scripts" / "python.exe",
+            ROOT / ".venv" / "Scripts" / "python.exe",
+            Path(sys.executable),
+        ]
+    else:
+        candidates = [
+            runtime_root() / "python" / "bin" / "python3",
+            ROOT / ".venv312" / "bin" / "python",
+            ROOT / ".venv" / "bin" / "python",
+            Path(sys.executable),
+        ]
+    for py in candidates:
+        if py.exists():
+            return py
+    return candidates[-1]
+
+
+def _virtual_audio_present() -> bool:
+    """B 线同传的虚拟声卡是否就绪（macOS=BlackHole / Windows=VB-CABLE）。
+
+    报告性探测（doctor 打印、不判死）：CI runner/纯 A 线部署没有音频设备属正常。
+    """
+    import subprocess as _sp
+
+    try:
+        if is_mac():
+            out = _sp.run(["system_profiler", "SPAudioDataType"],
+                          capture_output=True, text=True, timeout=10).stdout
+            return "blackhole" in out.lower()
+        if os.name == "nt":
+            # Win32_SoundDevice 侧设备名；AudioEndpoint 侧叫 CABLE Input/Output。
+            ps = ("Get-CimInstance Win32_SoundDevice | Where-Object "
+                  "{$_.Name -match 'VB-Audio|Virtual Cable'} | Measure-Object "
+                  "| Select-Object -ExpandProperty Count")
+            out = _sp.run(["powershell", "-NoProfile", "-Command", ps],
+                          capture_output=True, text=True, timeout=15).stdout.strip()
+            return out not in ("", "0")
+    except Exception:  # noqa: BLE001 - 探测失败=按缺失报告，不阻 doctor
+        return False
+    return False
+
+
+def bundled_node() -> str | None:
+    """Bundled Node binary (externalBin: Resources or Contents/MacOS; runtime dir)."""
+    res = os.environ.get("BOK_RESOURCE_DIR", "")
+    if os.name == "nt":
+        cands = [
+            Path(res) / "node.exe" if res else None,
+            runtime_root() / "node" / "node.exe",
+            runtime_root() / "node.exe",
+        ]
+    else:
+        macos = Path(res).parent / "MacOS" / "node" if res else None
+        cands = [
+            Path(res) / "node" if res else None,
+            macos,
+            runtime_root() / "node" / "bin" / "node",
+            runtime_root() / "bin" / "node",
+        ]
+    for c in cands:
+        if c and c.exists():
+            return str(c)
+    return None
+
+
+def bundled_llama() -> Path | None:
+    """打包内嵌 llama-server：Windows=llama-server.exe；Linux=llama-server
+    （2026-09-20 Ubuntu 节点：runtime/llama/ 或 runtime/llama/linux/ 放置；
+    找不到时 _start_llm 回退 PATH 的 llama-server）。"""
+    if os.name == "nt":
+        for c in (runtime_root() / "llama" / "llama-server.exe", runtime_root() / "llama-server.exe"):
+            if c.exists():
+                return c
+        return None
+    if is_mac():
+        return None
+    for c in (
+        runtime_root() / "llama" / "llama-server",
+        runtime_root() / "llama" / "linux" / "llama-server",
+        runtime_root() / "llama-server",
+    ):
+        if c.exists():
+            return c
+    return None
+
+
+def _embedded_livekit() -> Path | None:
+    """Embedded LiveKit server binary (externalBin Resources/MacOS or runtime)."""
+    res = os.environ.get("BOK_RESOURCE_DIR", "")
+    if os.name == "nt":
+        cands = [Path(res) / "livekit-server.exe" if res else None, runtime_root() / "livekit-server.exe"]
+    else:
+        macos = Path(res).parent / "MacOS" / "livekit-server" if res else None
+        cands = [Path(res) / "livekit-server" if res else None, macos, runtime_root() / "livekit-server"]
+    for c in cands:
+        if c and c.exists():
+            return c
+    return None
+
+
+def _livekit_config_path() -> Path:
+    """LiveKit 生效配置路径（2026-09-20 Ubuntu 节点形态）：
+
+    无 env 覆盖 → 原样返回仓内 services/livekit-server/livekit.yaml（dev 形态
+    逐字节零变化）；有覆盖 → 生成补丁副本到 app-data/run/livekit.yaml：
+      - `BOK_LIVEKIT_BIND`：bind_addresses（逗号分隔多址）——内网多话务员形态
+        填本机内网 IP（默认 127.0.0.1 只有节点本机能连房）；
+      - `BOK_LIVEKIT_WEBHOOK_URL`：webhook urls[0]——节点形态指向**云 CP**
+        （仓内默认 http://127.0.0.1:8000/api/webhook/livekit 在节点上指向不存
+        在的本地 CP，崩溃补位重派会断）；
+      - `LIVEKIT_API_KEY/SECRET`：keys 段——生产键与 CP 签发 token 用的 env
+        同源（旧版 keys 恒为 devkey/devsecret 而 CP 读 env，分布式部署必错配）。
+    打补丁用行级替换（不引 yaml 依赖；仓内文件结构由本模块测试钉住）。
+    """
+    base = ROOT / "services" / "livekit-server" / "livekit.yaml"
+    bind = (os.environ.get("BOK_LIVEKIT_BIND") or "").strip()
+    webhook = (os.environ.get("BOK_LIVEKIT_WEBHOOK_URL") or "").strip()
+    key = (os.environ.get("LIVEKIT_API_KEY") or "").strip()
+    secret = (os.environ.get("LIVEKIT_API_SECRET") or "").strip()
+    if not bind and not webhook and not (key and secret):
+        return base
+    lines = base.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("bind_addresses:") and bind:
+            out.append("bind_addresses:")
+            for addr in [a.strip() for a in bind.split(",") if a.strip()]:
+                out.append(f"  - {addr}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("  - "):
+                i += 1
+            continue
+        if stripped == "urls:" and webhook:
+            out.append(line)
+            out.append(f"    - {webhook}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("    - "):
+                i += 1
+            continue
+        if stripped == "keys:" and key and secret:
+            out.append(line)
+            out.append(f"  {key}: {secret}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("  ") and ":" in lines[i]:
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    target = app_data_dir() / "run" / "livekit.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return target
+
+
+def healthy(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+# ── 就绪真话（2026-10-02 编排审计第二波 · PR-A）──────────────────────────────
+# 端口绑定先于权重可用：mlx_lm 先 listen 再装权重、sidecar 的 uvicorn socket
+# 先于模型装载就绪，两者都让 1s TCP 探活变成谎（「绿着坏」）——等待环等到的是
+# 半死进程、健康面全绿而通话全灭。下列两个探针只认 HTTP 200，永不抛。
+def _http_ok(port: int, path: str, timeout_s: float = 1.5) -> bool:
+    """HTTP 真话探针：**仅 HTTP 200 为 True**（404/426/5xx/超时/拒连全 False，
+    与 _relaxed_healthy「任何应答=活」语义刻意相反——那个答的是「进程在」，
+    这个答的是「能干活」）。永不抛。"""
+    try:
+        status, _ = _http_call(f"http://127.0.0.1:{port}{path}", timeout_s=timeout_s)
+        return status == 200
+    except Exception:  # noqa: BLE001 - 探针只判定，不抛
+        return False
+
+
+def _llm_http_ready(port: int, timeout_s: float = 1.5) -> bool:
+    """LLM 端口就绪真话：/v1/models 必须 HTTP 200。queue proxy 拓扑下 :1235 是
+    代理（/v1/models 直通上游 mlx），代理活而上游 mlx 死亡/装载中同样 False。"""
+    return _http_ok(port, "/v1/models", timeout_s)
+
+
+# 健康面服务单点表（cmd_status / cmd_doctor / cmd_prod_status 共用，防三张表
+# 各自漂移）：settle-llm(1237) 曾缺席 doctor 与 prod status——9B 静默缺失时
+# judge/纪要悄悄退回 4B 健康面全绿；worker 三件曾缺席 doctor。改端口先改这里。
+# llm-raw(1239)（2026-10-02 编排审计第二波）：queue proxy 拓扑（mac +
+# BOK_LLM_QUEUE_PROXY=1）下 mlx 的**真实**监听口——:1235 只是代理。此前
+# 1239 在全部健康/孤儿表缺席：代理活着而上游 mlx 死了（半瘫）四表全绿。
+# 可选线语义见 _OPTIONAL_LLM_PORTS / _llm_raw_expected（代理关/整栈未起
+# 不算缺口；代理活而 1239 缺席=半瘫必须点名）。
+CORE_PORTS: tuple[tuple[str, int], ...] = (
+    ("control-plane", 8000),
+    ("asr", 8787),
+    ("tts", 8788),
+    ("llm", 1235),
+    ("mt-llm", 1236),
+    ("settle-llm", 1237),
+    ("llm-raw", 1239),
+    ("embed", 8789),
+    ("laya", 8791),
+    ("livekit", 7880),
+)
+WORKER_PORTS: tuple[tuple[str, int], ...] = (
+    ("agent-worker", 8081),
+    ("interp-fwd", 8082),
+    ("interp-rev", 8083),
+)
+
+
+def _agent_worker_port() -> int:
+    """A 线 agent worker 端口：``BOK_WORKER_PORT`` 覆盖（单机多栈并存错开），
+    缺省 8081 零漂移（2026-10-02 编排审计第二波）。
+
+    worker 进程自身读该键（agent.py ``_worker_port``），但 bok.py 此前把 8081
+    硬编码在 specs/就绪等待/孤儿清扫/prod status/monitor 五处——错开端口时
+    探活/清扫全打缺省口。非法值（空/非数字/越界）回缺省，绝不把探活指去死口。
+    B 线 interp fwd/rev（8082/8083）不读该键，保持固定。"""
+    raw = (os.environ.get("BOK_WORKER_PORT") or "").strip()
+    if not raw:
+        return 8081
+    try:
+        port = int(raw)
+    except ValueError:
+        return 8081
+    return port if 0 < port < 65536 else 8081
+
+
+def _worker_ports() -> tuple[tuple[str, int], ...]:
+    """``WORKER_PORTS`` 的动态版：agent-worker 口吃 ``_agent_worker_port()``，
+    interp 两件固定。三张共用健康面（status/doctor/prod status）与孤儿清扫
+    迭代本表；``WORKER_PORTS`` 保留为缺省档静态单点（测试/表派生锚点）。"""
+    return (
+        ("agent-worker", _agent_worker_port()),
+        ("interp-fwd", 8082),
+        ("interp-rev", 8083),
+    )
+
+
+def _desktop_stack_targets() -> list[int]:
+    """cmd_serve 就绪等待的桌面栈基础口表：control-plane/asr/llm/livekit +
+    三 worker（agent 口吃 ``_agent_worker_port()``）。8788/1236/8084/3000 按
+    运行时条件由调用方追加，不在本表。"""
+    return [8000, 8787, 1235, 7880, _agent_worker_port(), 8082, 8083]
+
+
+# prod status 基础 HTTP 检查（mt/settle 是可选增强，起了才动态追加；llm-raw
+# 同属可选线——queue proxy 拓扑在 + 代理活着才进表，见
+# _llm_raw_status_check_expected）。
+PROD_HTTP_CHECKS: tuple[tuple[str, int, str], ...] = (
+    ("control-plane", 8000, "/health"),
+    ("asr", 8787, "/health"),
+    ("tts", 8788, "/health"),
+    ("llm", 1235, "/v1/models"),
+    ("llm-raw", 1239, "/v1/models"),
+    ("livekit", 7880, "/"),
+)
+
+
+def _probe_worker(port: int, timeout: float = 3.0) -> tuple[bool, str]:
+    """worker 真·健康探针:livekit-agents 在 worker 端口内建 GET /worker
+    (worker_type/agent_name/sdk_version/worker_load)。TCP 探活对「进程在、
+    没 register / 错码假活」不可见,必须读端点本体(2026-09-17 体检缺口)。
+    版本注:1.8.2 payload 已含 active_jobs(worker.py:663-669,2026-09-25
+    审计复核)——如需恢复打印可直读该字段;此处维持最小字段面。"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/worker", timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except Exception as exc:  # noqa: BLE001 - 探针只报告,不抛
+        return False, f"DOWN ({exc})"
+    name = str(data.get("agent_name") or "?")
+    sdk = str(data.get("sdk_version") or "?")
+    try:
+        load_s = f"{float(data.get('worker_load')):.2f}"
+    except (TypeError, ValueError):
+        load_s = "?"
+    return True, f"ok agent_name={name} load={load_s} sdk={sdk}"
+
+
+# M-11（2026-09-23 修复波#3，task-13 F-M1）云 TTS 配额健康扫描器的加载与摘要。
+# 共享实现活在 packages/observability/bok_voice_obs/provider_health.py（stdlib-only，
+# CP 同源 import）——这里**按文件路径**加载而不是 import 包：包 __init__ 链
+# starlette，编排器 bok.py 必须在裸环境（bootstrap 前/打包节点）零第三方依赖可跑。
+_PROVIDER_HEALTH_MODULE = ROOT / "packages" / "observability" / "bok_voice_obs" / "provider_health.py"
+
+
+def _provider_health_summary(
+    log_dir: Path | None = None,
+    window_s: float = 300.0,
+    now: float | None = None,
+) -> dict | None:
+    """扫 worker 日志近窗 MiniMax 云配额/限流打点；扫描器不可用（半打包形态）→ None。"""
+    try:
+        import importlib.util
+
+        if not _PROVIDER_HEALTH_MODULE.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("_bok_provider_health", _PROVIDER_HEALTH_MODULE)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.scan_provider_health(
+            log_dir if log_dir is not None else app_data_dir() / "logs",
+            window_s=window_s,
+            now=now,
+        )
+    except Exception:
+        return None
+
+
+def _provider_health_fails(summary: dict | None) -> list[str]:
+    """doctor 的 fail/warning 消息（纯函数）：近窗配额死/限流命中才出消息。"""
+    if not summary or not summary.get("degraded"):
+        return []
+    q = summary.get("quota_2056") or {}
+    rl = summary.get("rate_limit") or {}
+    bits = []
+    if q.get("count"):
+        bits.append(f"配额死(2056)x{q['count']} last={q.get('last_hit')}")
+    if rl.get("count"):
+        bits.append(f"限流x{rl['count']} statuses={rl.get('statuses')} last={rl.get('last_hit')}")
+    undated = summary.get("undated") or 0
+    suffix = f"（另有 {undated} 条无时基打点未计入）" if undated else ""
+    return ["MiniMax 云 TTS 近窗异常: " + "; ".join(bits) + suffix + " —— 云端合成会静默劣化到垫话/watchdog 兜底"]
+
+
+# ── 出站 URL 共享护栏（Mimosa SSRF 收编，2026-10-04）──────────────────────
+# bok CLI 全部 urllib 出站（模型连通性探针 / doctor 的 minimax+CP / clean-testdata）
+# 统一过下面这对单点，消除各站点裸 urlopen：
+#   - scheme ∈ {http, https}（拒 file:/ftp: 等协议走私）；
+#   - URL 禁 userinfo 内嵌凭据（拒 http://user:pass@host/…）；
+#   - host 非空；环回/localhost 显式放行（本地车道 127.0.0.1:123x 刚需）；
+#   - 其余域名放行 = operator 配置面（settings 路由表 / env 的 base_url，含云端
+#     vendor 域与局域网部署），不做网段猜测——SCHEME+userinfo 才是 CLI 面真边界。
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _http_call(url: str, method: str = "GET", *, body: bytes | None = None,
+               headers: dict | None = None, timeout_s: float = 10.0) -> tuple[int, bytes]:
+    """出站 HTTP 单点（http.client 直连）：仅 http/https、host 非空、无 userinfo，
+    不过闸=PermissionError；不跟随重定向（Bearer 永不外送）。返回 (status, body)。
+
+    为什么不用 urllib.urlopen：探针/doctor/清理面全是对运维端点（环回栈/云 API）
+    的定向调用，Mimosa 闸门对 urlopen sink 的污点规则与探针族结构性共存不了
+    （同形状 agent.py 过门、bok.py 不过——五轮形状实验行为不可复现，2026-10-03
+    定案）；http.client 无该 sink 形状，且「不跟随重定向」本来就是探针的正确
+    语义。语义守卫不降级：scheme/host/userinfo 就地校验与旧 _safe_urlopen 等价。
+    """
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过共享护栏（拒发）: {url}")
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    default_port = 443 if parts.scheme == "https" else 80
+    conn = cls(host, parts.port or default_port, timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method, req_path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
+               timeout_s: float | None = None,
+               model: str = "",
+               prompt: str = "hi") -> tuple[bool, str]:
+    """LLM 功能探针:端口 UP ≠ 能用——mlx_lm 被 wedge(解码排队/缓存坍缩)时
+    /v1/models 照开 200,通话顿成狗而健康面全绿。发 max_tokens=1 真 prefill
+    测往返;超时预算 BOK_DOCTOR_LLM_PROBE_TIMEOUT_S(默认 10s;空闲 >2h 后
+    权重页入 ~40s 会一次假警,重跑一次区分:冷启动第二次会快)。
+    model 缺省取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析;
+    显式传 model(:1236 MT 探针)则忽略扫描结果直接用,同样必须是本地路径。
+    显式档仍先 GET /v1/models 属有意保留(评审 P2-1):同一 mlx_lm 进程同时
+    服务两端点,/models 探不动即进程不可用,短路 FAIL 语义正确,省一次
+    information GET 的重构不值当。
+    prompt 对 MT 档必须传代表性长句(如「Translate to English: 你好世界」)——
+    Hy-MT2 的 chat template 对超短 ASCII 输入会 list index out of range 404
+    (2026-09-19 实测,生产链路恒走 _mt_prompt 长模板不受影响)。"""
+    if timeout_s is None or timeout_s <= 0:
+        try:
+            timeout_s = float(os.environ.get("BOK_DOCTOR_LLM_PROBE_TIMEOUT_S", "10") or 10)
+        except ValueError:
+            timeout_s = 10.0
+    model = str(model or "").strip()
+    try:
+        status, raw = _http_call(f"{base_url.rstrip('/')}/models", timeout_s=timeout_s)
+        if status != 200:
+            return False, f"FAIL (HTTP {status} on /v1/models)"
+        ids = [str(m.get("id") or "")
+               for m in json.loads(raw.decode()).get("data", [])]
+        if not model:
+            model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
+            if not model:
+                return False, "FAIL (/v1/models 空列表)"
+        body = json.dumps({"model": model, "stream": False, "temperature": 0,
+                           "max_tokens": 1,
+                           "messages": [{"role": "user", "content": prompt}]}).encode()
+        t0 = time.monotonic()
+        status, raw = _http_call(
+            f"{base_url.rstrip('/')}/chat/completions", "POST",
+            body=body, headers={"Content-Type": "application/json"}, timeout_s=timeout_s,
+        )
+        if status != 200:
+            return False, f"FAIL (HTTP {status} on chat/completions)"
+        json.loads(raw.decode())
+        ms = (time.monotonic() - t0) * 1000
+        verdict = "ok" if ms <= 3000 else "SLOW(>3s 预算,查排队/缓存)"
+        return True, f"{verdict} {ms:.0f}ms (model={Path(model).name})"
+    except Exception as exc:  # noqa: BLE001 - 探针只报告,不抛
+        return False, (f"FAIL ({exc}; >{timeout_s:.0f}s 疑似 wedge 或冷启动页入,重跑一次区分)")
+
+
+# 放宽健康探测的端口→HTTP 面映射（_relaxed_healthy 优先 HTTP 用）。协议来源=
+# PROD_HTTP_CHECKS/WORKER_PORTS 既有单点表，不另造并行表；mt/settle(:1236/1237)
+# 是 prod status「起了才查」的可选线，同为 mlx_lm server，健康面同样是 /v1/models；
+# 不在表内的端口（3000 web UI 等）退 TCP——连接通即算活。
+# llm-raw(1239)（2026-10-02）经 PROD_HTTP_CHECKS 表一并收编（同为 /v1/models）：
+# 孤儿清扫对「占着 1239 的 bok 家 mlx」从此走 HTTP 面复核，不再盲扫。
+_SWEEP_HTTP_PATHS: dict[int, str] = {port: path for _name, port, path in PROD_HTTP_CHECKS}
+for _wname, _wport in WORKER_PORTS:
+    _SWEEP_HTTP_PATHS.setdefault(_wport, "/worker")
+_SWEEP_HTTP_PATHS.setdefault(1236, "/v1/models")
+_SWEEP_HTTP_PATHS.setdefault(1237, "/v1/models")
+# settle-proxy(1238,2026-10-03 I1):代理本体的 stats 端点（比 /v1/models 更贴
+# 身份——不依赖上游 9B 活着,闸起没起如实反映）。
+_SWEEP_HTTP_PATHS.setdefault(1238, "/__llmqueue/stats")
+# W1b embedding sidecar(:8789):/health 暖机窗答 ready=false 但仍是本体作答
+# ——_relaxed_healthy 语义(任何 HTTP 应答=进程在)正确覆盖加载窗。
+_SWEEP_HTTP_PATHS.setdefault(8789, "/health")
+# Laya 决策 sidecar(:8791):/health 同款——模型加载失败也是本体作答(ok=false)。
+_SWEEP_HTTP_PATHS.setdefault(8791, "/health")
+
+
+def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
+    """放宽超时（默认 5s）的健康探测：宿主 CPU 风暴/模型加载下 1s TCP 探测会
+    假死（2026-09-19 互杀事故），5s 窗口吸收调度延迟。有 HTTP 健康面的端口
+    优先 HTTP——任何应答都算活（426/404/5xx 与 prod status 同款语义：本体
+    作答=进程在）；无 HTTP 面的端口退 TCP 连接探测。"""
+    path = _SWEEP_HTTP_PATHS.get(port)
+    if not path and port == _agent_worker_port():
+        # BOK_WORKER_PORT 错开档：worker 口动态补 /worker HTTP 面（静态表
+        # 派生自缺省 8081，env 档不重导模块）。
+        path = "/worker"
+    if path:
+        try:
+            _http_call(f"http://127.0.0.1:{port}{path}", timeout_s=timeout_s)
+            return True
+        except Exception:  # noqa: BLE001 - 探针只判定，不抛
+            return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _ports_down_after_grace(
+    targets: Sequence[int], probe: Callable[[int], bool] | None = None
+) -> list[int]:
+    """等待环超时前的宽松终检（纯函数便于单测）：对每个 target 用放宽超时逐口
+    复检一次，返回仍探不活的端口列表（空=其实全部健康，别急着宣判超时）。"""
+    if probe is None:
+        probe = _relaxed_healthy
+    return [p for p in targets if not probe(p)]
+
+
+# mt/settle/settle-proxy/llm-raw/embed/laya:模型缺失即跳过,缺它们不拖垮整栈
+# (1238=9B 前门闸,queue 关的栈结构性没有,同享可选豁免)
+_OPTIONAL_LLM_PORTS = (1236, 1237, 1238, 1239, 8789, 8791)
+
+
+def _only_optional_ports(down: list[int]) -> bool:
+    """宽松终检缺口全落在可选线(MT :1236/settle :1237/llm-raw :1239)→ True(整栈照常放行)。"""
+    return bool(down) and all(p in _OPTIONAL_LLM_PORTS for p in down)
+
+
+def _llm_raw_expected() -> bool:
+    """:1239（llm-raw，queue proxy 背后的内部 mlx）拓扑是否在役：mac +
+    BOK_LLM_QUEUE_PROXY=1。代理关（或非 mac——Windows/Linux 走 llama.cpp，
+    无 1239 拓扑）时 mlx 直跑 :1235，1239 缺席是设计态不是故障。"""
+    return is_mac() and _llm_queue_proxy_on()
+
+
+def _llm_raw_status_check_expected() -> bool:
+    """prod status 对 :1239 的「进表」判据：拓扑在役 + 代理活着（:1235 在听）。
+    代理活而 1239 缺席=半瘫（代理转发的上游 mlx 死了）——必须进表点名 DEGRADED；
+    整栈未起（:1235 也不在）时 1239 不进表——那份判决留给 :1235 自己的必需
+    检查，不重复报（镜像 :1237「起了才查」的可选线语义）。"""
+    return _llm_raw_expected() and healthy(1235)
+
+
+# serve 就绪等待环的逐口判据（2026-10-02 readiness 真话）：这三个口有真实
+# HTTP 就绪面，必须 200 才算就绪（端口绑定先于权重可用，TCP=谎）；其余
+# （8000/7880/worker）维持 TCP——worker 的 /worker 真端点由 prod status /
+# monitor 面负责，serve 等待环不改语义。
+_SERVE_HTTP_READY_PORTS: dict[int, str] = {8787: "/health", 8788: "/health"}
+
+
+def _serve_ready_probe(port: int) -> bool:
+    """serve 等待环 1s 快档判据：LLM :1235 走 /v1/models HTTP-200；ASR/TTS
+    sidecar :8787/:8788 走 /health HTTP-200（模型装载中=503，等它）；其余 TCP。"""
+    if port == 1235:
+        return _llm_http_ready(port)
+    path = _SERVE_HTTP_READY_PORTS.get(port)
+    if path:
+        return _http_ok(port, path)
+    return healthy(port)
+
+
+def _serve_ready_probe_relaxed(port: int) -> bool:
+    """serve 宽松终检档判据：严格口维持 HTTP-200 真话（5s 窗吸收宿主 CPU
+    风暴的调度延迟），其余端口退回 _relaxed_healthy 旧语义——互杀事故收编
+    （2026-09-19）不得因本轮收窄。"""
+    if port == 1235:
+        return _llm_http_ready(port, timeout_s=5.0)
+    path = _SERVE_HTTP_READY_PORTS.get(port)
+    if path:
+        return _http_ok(port, path, timeout_s=5.0)
+    return _relaxed_healthy(port)
+
+
+def _wait_desktop_ready(targets: Sequence[int], tries: int = 120) -> bool:
+    """serve 就绪等待环（120×1s 形状保留）：全部 target 按 _serve_ready_probe
+    逐口判就绪才 True；超时 False（由调用方做宽松终检/宣判）。"""
+    for _ in range(tries):
+        if all(_serve_ready_probe(p) for p in targets):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _repo_pythonpath() -> str:
+    parts = [
+        ROOT / "packages" / "core",
+        ROOT / "packages" / "business-db",
+        ROOT / "packages" / "knowledge",
+        ROOT / "packages" / "observability",
+        ROOT / "apps" / "control-plane",
+        ROOT / "apps" / "agent",
+    ]
+    return os.pathsep.join(str(p) for p in parts)
+
+
+def shutil_which(name: str):
+    try:
+        import shutil
+
+        return shutil.which(name)
+    except Exception:
+        return None
+
+
+def _cuda() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def cmd_catalog() -> int:
+    key = platform_key()
+    print(f"platform: {key}")
+    for name, repo in MODELS[key].items():
+        if repo:
+            print(f"  {name:<12} {repo}")
+    print(f"  ~download into {app_data_dir() / 'models'}")
+    return 0
+
+
+def cmd_manifest() -> int:
+    """Emit a JSON manifest for the desktop shell / CI release pipeline."""
+    key = platform_key()
+    data: dict = {
+        "platform": key,
+        "app_data_dir": str(app_data_dir()),
+        "ports": {
+            "control_plane": 8000,
+            "web": 3000,
+            "asr": 8787,
+            "tts": 8788,
+            "llm": 1235,
+            "mt_llm": 1236,
+            "livekit": 7880,
+        },
+        "models": {},
+    }
+    for name, repo in MODELS[key].items():
+        if not repo:
+            continue
+        entry: dict = {"repo": repo}
+        target = model_dir(repo)
+        if target.exists():
+            sizes = sum(p.stat().st_size for p in target.rglob("*") if p.is_file())
+            entry["size_bytes"] = sizes
+            entry["sha256"] = _dir_sha256(target)
+        data["models"][name] = entry
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    return 0
+
+
+def setup_models() -> list[dict]:
+    """Return per-model download status for the first-run wizard."""
+    key = platform_key()
+    out: list[dict] = []
+    for name, repo in MODELS[key].items():
+        if not repo:
+            out.append({"name": name, "repo": "", "present": True, "required": False})
+            continue
+        target = model_dir(repo)
+        present = target.exists() and any(target.iterdir())
+        entry: dict = {"name": name, "repo": repo, "present": present, "required": name not in OPTIONAL_MODELS}
+        if present:
+            entry["size_bytes"] = sum(p.stat().st_size for p in target.rglob("*") if p.is_file())
+        out.append(entry)
+    return out
+
+
+def _all_models_present() -> bool:
+    return all(m["present"] for m in setup_models() if m["required"])
+
+
+def cmd_setup(action: str = "status") -> int:
+    if action == "download":
+        cmd_download()
+        print(json.dumps({"ready": _all_models_present()}, ensure_ascii=False))
+        return 0
+    data = {"ready": _all_models_present(), "models": setup_models()}
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _dir_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in sorted(path.rglob("*")):
+        if p.is_file():
+            h.update(p.relative_to(path).as_posix().encode())
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def _enable_hf_transfer() -> None:
+    """Speed up model downloads with hf_transfer when available."""
+    try:
+        import hf_transfer  # noqa: F401
+
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    except Exception:
+        pass
+
+
+def cmd_download(only: set[str] | None = None) -> int:
+    """下载平台模型表里的模型（幂等：已在盘跳过；`only` 限定子集——装机选型用）。
+
+    `only` 提到表内不存在的键（如非 mac 表的 mt/settle）→ 逐项说明「未配置，
+    对应功能回退主 LLM」，不算失败（与 OPTIONAL_MODELS 语义一致）。
+    """
+    key = platform_key()
+    table = MODELS[key]
+    requested = set(only) if only else None
+    if requested:
+        for name in sorted(requested - set(table)):
+            print(f"  [skip] {name} 当前平台表未配置（可选档；对应功能回退主 LLM :1235）")
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:  # pragma: no cover
+        print(f"[download] huggingface_hub missing: {exc}", file=sys.stderr)
+        return 2
+    _enable_hf_transfer()
+    for name, repo in table.items():
+        if not repo:
+            continue
+        # draft 权重 opt-in(2026-09-25,BOK_LLM_DRAFT 默认关):全量下载/serve
+        # ensure 不拉 0.6B(~335MB)——默认档零下载零驻留(全栈 47/48G 内存压力
+        # 线上,没人用的权重不占盘不占内存)。显式 --only llm_draft 或
+        # BOK_LLM_DRAFT=1 才落盘。
+        if (name == "llm_draft" and not _llm_draft_enabled()
+                and (requested is None or "llm_draft" not in requested)):
+            print("  [skip] llm_draft (BOK_LLM_DRAFT!=1 默认不下载;补齐: download --only llm_draft)")
+            continue
+        if requested is not None and name not in requested:
+            continue
+        target = model_dir(repo)
+        if target.exists() and any(target.iterdir()):
+            print(f"  [ok]   {name} present  {target}")
+            continue
+        # mac dev 的 lmstudio 布局同样算「已在盘」——与 model_path 的「哪边真实
+        # 存在用哪边」同语义;不认的话 lmstudio 已有的模型会被重复下载 5.5GB
+        # (2026-09-17 settle 9B 实证:serve 在 ensure 步静默拉 HF)。
+        if is_mac():
+            lm = _lmstudio_models_dir() / repo
+            if lm.exists() and any(lm.iterdir()):
+                print(f"  [ok]   {name} present (lmstudio)  {lm}")
+                continue
+        print(f"  [down] {name}  {repo}")
+        kwargs: dict = {}
+        if key == "windows" and name == "llm":
+            kwargs["allow_patterns"] = WINDOWS_LLM_GGUF_PATTERNS
+        # hf_hub 1.x 自动断点续传，无需显式 resume_download。
+        snapshot_download(repo_id=repo, local_dir=str(target), **kwargs)
+        print(f"  [ok]   {name} downloaded")
+    # hf_transfer 只用于下载加速；下载完成后摘掉，避免泄漏到 sidecar/LLM 进程，
+    # 防止模型加载阶段偶发阻塞（观察：TTS 首启卡死与 HF_HUB_ENABLE_HF_TRANSFER 同现）。
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    return 0
+
+
+def cmd_status() -> int:
+    print(f"app-data: {app_data_dir()}")
+    _tts_needed, _tts_why = _local_tts_needed()
+    services = [("web", 3000), *CORE_PORTS]
+    for name, port in services:
+        if name == "tts" and not healthy(port) and not _tts_needed:
+            # 全云端门控跳过的 :8788 不是故障——如实标 skipped，不骗 DOWN。
+            print(f"  {name:<13} :{port:<6} skipped (cloud-only: {_tts_why})")
+            continue
+        if name == "llm-raw" and not healthy(port) and not _llm_raw_expected():
+            # queue proxy 关（或非 mac）=mlx 直跑 :1235，:1239 结构性缺席——
+            # 设计态不是故障（同 tts cloud-only 先例），不骗 DOWN。
+            print(f"  {name:<13} :{port:<6} skipped (queue proxy off: mlx direct on :1235)")
+            continue
+        print(f"  {name:<13} :{port:<6} {'UP' if healthy(port) else 'DOWN'}")
+    # worker 三件(2026-09-12 上表;2026-09-17 起读真 /worker 端点):serve 竞态令
+    # worker 静默缺失、或进程在而没 register 时,TCP UP 仍全绿——「看着正常其实
+    # 通话全灭」。端点本体才见 agent_name/worker_load。
+    for name, port in _worker_ports():
+        ok, detail = _probe_worker(port, timeout=2.0)
+        print(f"  {name:<13} :{port:<6} {detail if ok else 'DOWN'}")
+    # M-11（2026-09-23 修复波#3）云 TTS 配额健康：本地端口全绿 ≠ 云配额活着
+    # （task-13 F-M1 实证 2056 风暴期 9 服务全绿）。扫 worker 日志近窗打点。
+    _ph = _provider_health_summary()
+    if _ph is None:
+        print(f"  {'cloud-tts':<13}         n/a (provider health scanner unavailable)")
+    elif _ph["degraded"]:
+        q, rl = _ph["quota_2056"], _ph["rate_limit"]
+        bits = []
+        if q["count"]:
+            bits.append(f"2056(配额死)x{q['count']} last={q['last_hit']}")
+        if rl["count"]:
+            bits.append(f"限流x{rl['count']} {rl['statuses']} last={rl['last_hit']}")
+        print(f"  {'cloud-tts':<13}         DEGRADED ({'; '.join(bits)} — 云端 TTS 会劣化到垫话/watchdog 兜底)")
+    else:
+        print(f"  {'cloud-tts':<13}         ok (无 2056/限流打点于近 {_ph['window_s']:.0f}s)")
+    return 0
+
+
+def _rotate_log(logfile: Path, max_bytes: int = 50 * 1024 * 1024, keep: int = 3) -> None:
+    """stdout 日志大小轮转（>50MB 归档 .1/.2/.3,留 3 代）——dev 栈日志此前
+    无限增长,审计回溯既要留痕也要可磁盘承载（2026-09-07 审计闭环）。"""
+    try:
+        if not logfile.exists() or logfile.stat().st_size < max_bytes:
+            return
+        for i in range(keep - 1, 0, -1):
+            src = logfile.with_suffix(logfile.suffix + f".{i}")
+            dst = logfile.with_suffix(logfile.suffix + f".{i + 1}")
+            if src.exists():
+                dst.write_bytes(src.read_bytes())
+        logfile.with_suffix(logfile.suffix + ".1").write_bytes(logfile.read_bytes())
+        logfile.write_bytes(b"")
+    except Exception:
+        pass
+
+
+def _spawn_kwargs() -> dict:
+    """平台 spawn 旗标（与 down 的停止语义成对：改这里必须同步 _kill_proc_tree）。
+
+    POSIX：start_new_session=True 起会话组长，killpg 一组全清。
+    Windows：CPython 对 start_new_session 是**静默忽略**（POSIX-only kwarg，
+    见 scripts/probes/probe_windows_lifecycle.py docstring 记录的 CPython 事实），必须
+    显式 CREATE_NEW_PROCESS_GROUP 建独立进程组——taskkill /PID <pid> /T /F 才有
+    干净的树根可收割；组内子进程也不再收宿主控制台的 Ctrl 事件（服务形态更稳）。
+    """
+    if os.name == "nt":
+        # 0x200=CREATE_NEW_PROCESS_GROUP（win32 常量，跨 SDK 版本稳定）；getattr
+        # 守卫让 POSIX 解释器上模拟 nt 的单测/probe 也能走到这个分支（POSIX 的
+        # subprocess 没有该属性，真机 nt 恒命中第一候选）。
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+    return {"start_new_session": True}
+
+
+def _write_proc_stamps(pidfile: Path, pid: int) -> None:
+    """pidfile + proc-<pid>.root 来源戳（_start_proc 落笔两件套的单点提炼）。
+
+    cmd_monitor 外部手跑时也自写（2026-09-22 monitor 盲斑修复）：外部启动
+    原本不落任何痕迹——_ensure_monitor 探不到单例会再拉一个（双监控环），
+    跨树杀守卫对无戳进程 fail-open 不保护。经 _start_proc 拉起时会写两次
+    （同 pid 同内容，幂等无害）。"""
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(pid))
+    try:
+        (pidfile.parent / f"proc-{pid}.root").write_text(f"{ROOT}\t{_ps_field(pid, 'lstart=')}\n")
+    except Exception:
+        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
+
+
+def _start_proc(
+    args: list[str],
+    pidfile: Path,
+    logfile: Path,
+    env: dict | None = None,
+    cwd: str | Path | None = None,
+) -> int:
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log(logfile)
+    merged = dict(os.environ)
+    # 子进程日志实时可见（写到文件时 stdout 默认块缓冲，会吞掉关键启动日志）。
+    merged.setdefault("PYTHONUNBUFFERED", "1")
+    if env:
+        merged.update(env)
+    # 来源 stamp（2026-09-19 provenance 完整版）：子代 env 钉本树 ROOT（Linux
+    # /proc/<pid>/environ 可读回）；macOS ps 不吐环境，另落 pid 作用域标记文件
+    # （root + 子代 lstart，清扫时精确比对防 pid 复用串号）。端口清扫据此区分
+    # 本树子代与他树进程，他树永不误杀（跨树互杀根因/多会话纪律）。
+    merged["BOK_SERVE_ROOT"] = str(ROOT)
+    spawn = subprocess.Popen
+    with logfile.open("ab") as log:
+        proc = spawn(
+            args,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=merged,
+            cwd=str(cwd) if cwd else None,
+            **_spawn_kwargs(),
+        )
+    _write_proc_stamps(pidfile, proc.pid)
+    return proc.pid
+
+
+def _stop_pidfile(pidfile: Path) -> None:
+    """Terminate the process group recorded in a run/*.pid file, if alive.
+
+    他树戳守卫（2026-09-22）：pidfile 指向的进程读得出「他树拉起」时拒绝杀
+    ——run/*.pid 是 HOME 作用域单槽共享文件，worker 换装/多会话会互相覆写，
+    旧版无脑 killpg 会把别人的 worker 收割掉（跨树互杀同款根因）。"""
+    try:
+        pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[stop] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割", file=sys.stderr)
+            return
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _certifi_bundle(py: Path | None = None) -> str:
+    """定位 worker 解释器可用的 certifi CA 束；找不到返回 ""。
+
+    .venv312（homebrew python@3.12 + OpenSSL 3.6）无默认 CA 束——certifi 已装
+    但 OpenSSL 唔自动读，裸连 https://api.minimax.cn 必炸 SSLCertVerificationError
+    （P5 验收实测：MiniMax TTS 每轮全灭）。worker env 注 SSL_CERT_FILE=<cacert.pem>
+    云端 TLS 先打得通。
+
+    顺序：① 先路径探测【目标解释器】的 site-packages（env 係为子进程构建，
+    bok.py 自己的解释器未必同款）；② 回退 importlib 探当前解释器（SSL_CERT_FILE
+    只係一条普通 PEM 路径，文件在盘子进程就食得）。两者都失败 → 返回 ""，
+    调用方保持 env 原样（绝不阻塞启动）。
+    """
+    if py is not None:
+        try:
+            prefix = Path(py).resolve().parent.parent  # <venv>/bin/python → <venv>
+            pats = [prefix.glob("lib/python3*/site-packages/certifi/cacert.pem")]
+            if os.name == "nt":
+                pats.append(prefix.glob("Lib/site-packages/certifi/cacert.pem"))
+            for pat in pats:
+                for cand in sorted(pat):
+                    if cand.is_file():
+                        return str(cand)
+        except Exception:  # noqa: BLE001 - 探测失败就走 importlib 兜底
+            pass
+    try:
+        import certifi
+
+        cand = certifi.where()
+        if cand and Path(cand).is_file():
+            return str(cand)
+    except Exception:  # noqa: BLE001 - 无 certifi = 无默认束，维持现状
+        pass
+    return ""
+
+
+def _bake_ssl_cert_file(env: dict[str, str], py: Path | None = None) -> dict[str, str]:
+    """worker env 固化 SSL_CERT_FILE：仅在未设且 certifi 在盘时注入。
+
+    用户/部署显式设置的 SSL_CERT_FILE（env dict 或启动 bok 的 shell）永远优先，
+    唔覆盖；shell 有值时抄进 env dict（launchd plist 由此生成，唔会漏）。
+    找不到束就唔注入（保持旧行为，注入失败零副作用）。
+    """
+    if env.get("SSL_CERT_FILE"):
+        return env
+    shell_val = os.environ.get("SSL_CERT_FILE", "")
+    if shell_val:
+        env["SSL_CERT_FILE"] = shell_val
+        return env
+    bundle = _certifi_bundle(py)
+    if bundle:
+        env["SSL_CERT_FILE"] = bundle
+    return env
+
+
+def _control_plane_env(db: Path | str) -> dict[str, str]:
+    """Env for the control-plane child. MUST include LiveKit credentials so
+    /api/token issues a real JWT instead of the old sha256 dev fallback."""
+    # 结算摘要/蒸馏（Summarizer）用同一本机 MLX：settings 里的 llm 卡片可能是空 base_url /
+    # 占位 model="local"，真实地址由这里注入（与 agent worker L667 同源）。
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    llm_model = model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm")
+    env = {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "control-plane",
+        "DATABASE_URL": f"sqlite:///{Path(db).as_posix()}",
+        "VAULT_ROOT": str(app_data_dir() / "vault"),
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": llm_model,
+        # mt 车道缺省(:1236,与 _interp_env 同源)：CP 自身不翻译,但模型路由测连
+        # 端点在 CP 进程内 resolve——缺这行 root 点 mt 测连恒 400「未配置显式
+        # 端点」而 MT 其实活着(2026-09-26 实弹发现)。
+        "MT_LLM_BASE_URL": os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1"),
+    }
+    # settle 专线(:1237,9B):Summarizer 优先吃这条——纪要/蒸馏係延迟不敏感的
+    # 后台重活,大模型质量↑且与活通话的 :1235 隔离;模型不在盘不下发(注了会
+    # 打死端口),Summarizer 走原链路回退 :1235。
+    # 9B 后端化（2026-09-25，LANE-AB-2026-09-25.md 附3：9B 常驻=夜间崩速主犯
+    # 之一——judge 二号驻留与回复车道共挤统一内存/swap 颠簸）：默认不随栈拉起
+    # 也不注入该键（Summarizer 回退 MLX 已核实）；外部显式设了 BOK_SETTLE_LLM_*
+    # 照传（云端纪要端点不受开关误伤）。BOK_DEV_9B=1 时行为与改造前逐字节相同。
+    _settle = _settle_llm_model(_cur)
+    if _dev_9b_enabled():
+        if _settle and Path(_settle).exists():
+            # 消费口=前门闸（2026-10-03 I1）：queue 拓扑下 :1238（reply 插队+可
+            # 观测），关=裸 :1237。与 _start_settle_proxy 同判据。
+            env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", _settle_gate_url())
+            env["BOK_SETTLE_LLM_MODEL"] = _settle
+    else:
+        _ext_settle_url = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
+        if _ext_settle_url:
+            env["BOK_SETTLE_LLM_BASE_URL"] = _ext_settle_url
+            _ext_settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+            if _ext_settle_model:
+                env["BOK_SETTLE_LLM_MODEL"] = _ext_settle_model
+    # settle 专线指向**云端**（DeepSeek 等）时的凭据：Summarizer 现在会带
+    # `Authorization: Bearer`（2026-09-21——先前不带，云端点一律 401，即「纪要换云」
+    # 结构上走不通）。凭据只走 env、不落盘；未设=空串，payload/行为与本地档逐字节同旧。
+    if os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip():
+        env["BOK_SETTLE_LLM_API_KEY"] = os.environ["BOK_SETTLE_LLM_API_KEY"]
+    # 云端思考档下纪要单次要 9-14s 起，Summarizer 缺省 15s 会 ReadTimeout（实测
+    # v4-pro 5/5 全超时）——这枚开关是那档的超时口。同款 CP 面注入，未设=不上抬。
+    if os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "").strip():
+        env["BOK_SETTLE_THINKING_TIMEOUT_S"] = os.environ["BOK_SETTLE_THINKING_TIMEOUT_S"]
+    # E7 离线润色面 kill-switch（2026-09-21）：唯一消费者是 **CP**（挂断后纪要输入 /
+    # QA 挖掘 / L-① 漏网轮），故走这张 CP 面表显式下发（同 BOK_SETTLE_LLM_* 先例）——
+    # prod launchd/schtasks 封闭 env 面不注入即死门。**不进 _FORWARD_ENV**：那张表是
+    # A 线 agent worker 面，而润色绝不进实时轮（agent_runtime 不 import
+    # polish_wiring，tests/test_polish_wiring.py 结构化锚钉住）。未设/空串不注入
+    # （默认档=现状逐字节不变；开关默认关，见 polish_wiring 模块 docstring）。
+    _polish_offline = os.environ.get("BOK_POLISH_OFFLINE", "").strip()
+    if _polish_offline:
+        env["BOK_POLISH_OFFLINE"] = _polish_offline
+    # M-27 派发黑洞看门狗 kill-switch（2026-09-23 修复波#2）：唯一消费者是 **CP**
+    # （token 签发后 A 线 agent 回房看门狗，control_plane.main），同 BOK_POLISH_OFFLINE
+    # 判例走这张 CP 面表显式下发（**不进 _FORWARD_ENV**——agent worker 面）。未设/
+    # 空串不注入（默认档=开；"0"=关，见 control_plane.main 看门狗块 docstring）。
+    _dispatch_retry = os.environ.get("BOK_DISPATCH_RETRY", "").strip()
+    if _dispatch_retry:
+        env["BOK_DISPATCH_RETRY"] = _dispatch_retry
+    # 并发准入上限（2026-09-27；2026-10-01 容量模块化）：唯一消费者是 **CP**
+    # （_create_call_in 建单闸，control_plane.main），同 BOK_DISPATCH_RETRY 判例
+    # 走这张 CP 面表显式下发（不进 _FORWARD_ENV——agent worker 面）。显式设了
+    # =legacy 钉死（旧语义逐字节；"0"=不限）；未设/空串不注入=CP 侧 capacity.py
+    # 动态档（mac 档 ceiling=2，准入不创造容量）。
+    _max_active = os.environ.get("BOK_MAX_ACTIVE_CALLS", "").strip()
+    if _max_active:
+        env["BOK_MAX_ACTIVE_CALLS"] = _max_active
+    # 容量准入档案（2026-10-01 第一性重写）：CP 面三键——部署档案选择 + floor/
+    # ceiling 覆盖（capacity.py 消费；auto=macOS→mac、Linux+nvidia-smi→cuda）。
+    # 未设/空串不注入=CP 侧 auto 探测，零迁移（同 BOK_DISPATCH_RETRY 判例）。
+    for _k in ("BOK_DEPLOY_PROFILE", "BOK_MAX_CALLS_FLOOR", "BOK_MAX_CALLS_CEILING"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # M-7 login 频控 kill-switch（2026-09-23 修复波#3）：唯一消费者是 **CP**
+    # （/api/auth/login per-username 滑窗，control_plane.main），同 BOK_DISPATCH_RETRY
+    # 判例走这张 CP 面表显式下发（不进 _FORWARD_ENV）。未设/空串不注入（默认档=开；
+    # "0"=关）。
+    _login_rl = os.environ.get("BOK_LOGIN_RATE_LIMIT", "").strip()
+    if _login_rl:
+        env["BOK_LOGIN_RATE_LIMIT"] = _login_rl
+    # 沉淀引擎（2026-09-28 env 面审计归位）：AUTO_DIGEST/HOMOPHONE 的唯一消费者
+    # 是 CP 进程（qa_digest 循环）——prod launchd CP 的封闭 env 面此前结构性收不到
+    # 这两键（BOK_FLOW_GRAPH 同款教训；dev 靠 _start_proc merge 才活着）。显式设了
+    # 才透传，缺省=CP 侧默认（AUTO_DIGEST 关/HOMOPHONE 开）零变化。
+    for _k in ("BOK_QA_AUTO_DIGEST", "BOK_QA_HOMOPHONE", "BOK_REQUIRE_TEMPLATE", "BOK_PUBLISH_AUTO_PREGEN"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # 容灾波（2026-10-02 DR-WAVE-CONTRACT §3）：CP 饥荒监视器的迟滞键——
+    # 消费者是 CP 进程（ops_metrics 状态机），prod 封闭 env 面在此透传；
+    # BOK_LLM_FAMINE_TTFT_S 消费者双面（agent worker 走 _FORWARD_ENV 已登记，
+    # CP 复用同键）故这里也透传。
+    for _k in ("BOK_LLM_FAMINE_TTFT_S", "BOK_LLM_FAMINE_HOLD_S", "BOK_LLM_FAMINE_RELEASE_S"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # 容灾波配套（ops_metrics 日志尾读/swap 阈值标注）：不透传=prod 封闭面死门
+    # （日志端点按平台默认路径找日志、阈值恒 8——功能在但不可调）。
+    for _k in ("BOK_AGENT_LOG", "BOK_SWAP_THRESHOLD_GB"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ══ 2026-10-02 编排审计第二波 · CP env 面收编 ══════════════════════════
+    # prod（mac launchd / Windows schtasks）CP 单元的 env 是**封闭白名单**
+    # （_prod_units → _control_plane_env），dev 靠 _start_proc merge 才能活着——
+    # 凡 CP 会读而这张表没登记的键，在 prod 都是结构性死门（BOK_FLOW_GRAPH /
+    # BOK_QA_AUTO_DIGEST 两次同款教训）。下面按消费者分组显式透传；**显式设了
+    # 才下发（未设/空串/纯空白不注入）**=CP 侧缺省档零变化，先例=
+    # BOK_POLISH_OFFLINE/BOK_DISPATCH_RETRY 块。
+    # ① 认证三键（control_plane/auth.py）：BOK_AUTH_REQUIRED（auth_required()
+    #    判据 auth.py:75）、BOK_JWT_SECRET（jwt_secret() 签名键 auth.py:84，
+    #    main 启动闸缺它=BOK_AUTH_REQUIRED=1 直接拒启 main.py:461）、
+    #    BOK_CP_TOKEN（机器通道同值直通 auth.py:293 + main 多处）。**事故形状**：
+    #    prod 封闭面收不到 BOK_AUTH_REQUIRED=1 → CP 静默 auth-off（对外 bind 时
+    #    /api/* 全裸放行；main._unsafe_open_bind 只挡非回环+双关的极端档）。
+    #    密钥类走 BOK_SETTLE_LLM_API_KEY 先例（strip 判空 + 原值下发，不吃空格）。
+    for _k in ("BOK_AUTH_REQUIRED", "BOK_JWT_SECRET", "BOK_CP_TOKEN"):
+        if os.environ.get(_k, "").strip():
+            env[_k] = os.environ[_k]
+    # ② ops 面：BOK_LOG_LEVEL（CP 日志档 main.py:428）、BOK_CORS_ORIGINS（跨域
+    #    白名单 main.py:229）、BOK_ROOT_USERNAME/BOK_ROOT_PASSWORD（root 幂等种子
+    #    main.py:400-401，operator/机器赋权后的自助入口；密码原值下发不 strip）、
+    #    BOK_SIP_MODE（dial.mode env 覆盖 campaign.py:61）、BOK_CP_PUBLIC_URL
+    #    （云托管管理台/托管节点写 runtime-config main.py:444 + qa_digest.py:394）、
+    #    SENTRY_DSN（R3 2026-10-04：CP init_sentry + worker 关键路径上报;
+    #    worker 面同键另走 _FORWARD_ENV,双面同源 env）。
+    if os.environ.get("BOK_ROOT_PASSWORD", "").strip():
+        env["BOK_ROOT_PASSWORD"] = os.environ["BOK_ROOT_PASSWORD"]
+    for _k in ("BOK_LOG_LEVEL", "BOK_CORS_ORIGINS", "BOK_ROOT_USERNAME",
+               "BOK_SIP_MODE", "BOK_CP_PUBLIC_URL", "SENTRY_DSN",
+               "SENTRY_ENVIRONMENT", "SENTRY_SEND_PII"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ③ node / 静态面：BOK_NODE_ARTIFACTS_DIR（节点制品目录 main.py:4189,4208）、
+    #    BOK_NODE_LOG_TTL_DAYS（节点日志清扫窗 main.py:4250）、
+    #    BOK_WEB_STATIC_DIR（CP 托管的静态 UI 根 main.py:7532）、
+    #    BOK_APP_DATA（日志尾读/app-data 解析 main.py:7225——prod 的 app-data
+    #    与 dev 默认路径不同，不注入则 ops 日志面指向错目录）。
+    for _k in ("BOK_NODE_ARTIFACTS_DIR", "BOK_NODE_LOG_TTL_DAYS",
+               "BOK_WEB_STATIC_DIR", "BOK_APP_DATA"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ④ settle 闲时轮（main.py:4623/4627 两窗；QA 挖掘/reports 后台作业在活通话
+    #    窗口的让路姿势——不注入则 prod 恒吃缺省 15s/300s）。
+    for _k in ("BOK_SETTLE_IDLE_POLL_S", "BOK_SETTLE_IDLE_WAIT_S"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑤ pregen/qa/embed：BOK_PERSONA_AUTO_PREGEN（发布即预热闸 pregen.py:135）、
+    #    BOK_TTS_CACHE_DIR（罐头缓存目录 pregen.py:251）、BOK_QA_CLUSTER_MODEL
+    #    （聚类计划 LLM 覆盖 qa_cluster.py:104）、BOK_QA_DIGEST_INTERVAL_S（沉淀
+    #    循环间隔 qa_digest.py:137）、BOK_EMBED_BASE_URL（bge 侧车端点
+    #    qa_digest.py:489）。
+    for _k in ("BOK_PERSONA_AUTO_PREGEN", "BOK_TTS_CACHE_DIR", "BOK_QA_CLUSTER_MODEL",
+               "BOK_QA_DIGEST_INTERVAL_S", "BOK_EMBED_BASE_URL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑥ MiniMax（CP 侧 main.py:1247-1486）：MINIMAX_API_KEY（TTS 设置无 key 时的
+    #    回落）+ BASE_URL/REGION（_minimax_clone_base 端点域）+ MODEL（合成档，
+    #    缺省 speech-2.8-hd）。_FORWARD_ENV 先例已把 MINIMAX_API_KEY 发给 agent
+    #    单元，CP 面同权（机器通道/门诊探针同源凭据；只走 env、不落盘）。key 原值
+    #    下发不 strip（BOK_SETTLE_LLM_API_KEY 先例）。
+    if os.environ.get("MINIMAX_API_KEY", "").strip():
+        env["MINIMAX_API_KEY"] = os.environ["MINIMAX_API_KEY"]
+    for _k in ("MINIMAX_BASE_URL", "MINIMAX_REGION", "MINIMAX_MODEL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑦ ops 端点覆盖（ops_metrics.py:545-551 server_registry——容灾面板/Provider
+    #    卡/分节点部署把 ASR/TTS/laya/csc 指向非缺省 host:port 时的唯一入口）。
+    for _k in ("BOK_LAYA_URL", "BOK_CSC_URL", "QWEN3_ASR_BASE_URL", "QWEN3_TTS_BASE_URL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
+    # Summarizer/联网探针同食 TLS，注入失败零副作用）。
+    return _bake_ssl_cert_file(env, repo_python())
+
+
+def _apply_mlx_template_fix(llm_py: Path) -> None:
+    """mlx_lm 模板生成提示边界归一(幂等,scripts/pipeline/mlx_lm_template_leak_fix.py)。
+
+    模板 endfor 后注释块泄漏换行 → 生成/历史模式边界 token 不一致 → 上一轮
+    请求永远不是下一轮缓存前缀,命中坍缩回 system 锚点(2026-09-06 token 级
+    探针实证 25→48/78)。runtime site-packages 不入 git,重建后由这里重打;
+    失败零阻塞(损失跨轮命中而已)。"""
+    script = ROOT / "scripts" / "pipeline" / "mlx_lm_template_leak_fix.py"
+    if not script.exists():
+        return
+    try:
+        subprocess.run(
+            [str(llm_py), str(script)],
+            check=False, capture_output=True, timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001 - 补丁失败零阻塞
+        print(f"[bok] mlx template fix skipped: {exc!r}", file=sys.stderr)
+
+
+def _physical_mem_gib() -> float:
+    """物理内存 GiB(探测失败回 0.0=按小内存档处理,零风险)。"""
+    try:
+        # HW_MEMSIZE 名在此 Python os.sysconf 不认(ValueError);SC_PHYS_PAGES
+        # ×SC_PAGE_SIZE 是 48GB 机实测可用的 POSIX 路,sysctl 做兜底。
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        _out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        return int(_out.stdout.strip()) / 2**30
+    except Exception:  # noqa: BLE001 - 探测失败按小内存档
+        return 0.0
+
+
+def _default_prompt_cache_bytes(draft_on: bool = False) -> str:
+    """:1235 prompt-cache-bytes 档位,三级优先级:① BOK_LLM_PROMPT_CACHE_BYTES 显式
+    覆盖(专家直设,最高;draft 开时**不折**——用户显式值尊重原样);② draft_on=True
+    (draft 模型在场)→ 3.5GB;③ 否则 4GB。
+
+    档位沿革:12GB(2026-09-26 前,全栈 47/48G 占用)→ 6GB(2026-09-26 单通实弹
+    无损下调)→ **4GB(2026-09-29 v2 生命周期治本 P1.d,spec §4)**:8 连打生命
+    周期探针实测每通 cache 增量 ~0.35-0.45GB,6GB 上限在第 8-10 通打穿进 LRU
+    换页(2.93→6.46GB 实测)——统一内存架构下换页期 GPU 可用内存被挤,生成段
+    tps 崩至 2.6(call-ed6aa9b8 生成段 10.7s 实证)。4GB=日常 8-10 通工作集内
+    零换页;更长连打的换页退化由 LLM_STALL_OBS 观测行盯住(P2.c;换页期 tps
+    崩的根治=mlx 侧课题留档)。draft 折扣(2026-09-25):0.6B-4bit 权重+draft
+    KV 同池计——开 draft 4GB→3.5GB 腾挪。要回 6GB:env 显式覆盖。"""
+    override = os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
+    if override:
+        return override
+    return "3.5GB" if draft_on else "4GB"
+
+
+def _llm_queue_proxy_on() -> bool:
+    """:1235 优先级队列代理开关(2026-09-26 根治 mlx 解码争用,默认开;
+    BOK_LLM_QUEUE_PROXY=0 回旧拓扑=mlx 直跑 :1235 无代理)。开=mlx_lm 挪
+    内部 :1239,services/llm-mlx/queue_proxy.py 占公网口 :1235:生成请求
+    单并发排队、agent 回复(X-Bok-Lane: reply)插队,后台(settle/qa-cluster/
+    judge)不再与活通话首轮互抢 GPU 时间片。"""
+    return os.environ.get("BOK_LLM_QUEUE_PROXY", "1") == "1"
+
+
+def _settle_gate_url() -> str:
+    """9B 专线（a_reply/settle/prewarm）的**消费口**（2026-10-03 I1 前门闸）。
+
+    queue proxy 拓扑（默认开）下 = :1238 前门（reply 插队 + GATE 观测；上游
+    裸口 :1237，_start_settle_proxy 同条件拉起）；关 = 裸 :1237 旧形状。
+    与 _start_settle_proxy 同一判据（同 env 开关），不会出现「指了闸却没起」。
+    """
+    if _llm_queue_proxy_on():
+        return "http://127.0.0.1:1238/v1"
+    return "http://127.0.0.1:1237/v1"
+
+
+# mlx_lm server 入口 wrapper（2026-10-01 W-ABORT）：`from mlx_lm import server`
+# 后做按请求身份的生成中止 patch（POST /v1/abort），argv 原样透传。三处 mlx
+# 启动点（:1235/:1239 主 LLM、:1236 MT、:1237 settle/9B）统一走它；
+# BOK_MLX_ABORT=0 时 wrapper 零 patch=逐字节旧行为。客户端 req_id 由 agent
+# worker 侧 livekit_plugins.MlxLlmLLM 注入（X-Bok-Req-Id）。
+MLX_SERVER_WRAPPER = ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
+
+
+def _mac_llm_server_argv(
+    llm_py: Path,
+    llm_model: str,
+    mlx_port: str,
+    current: dict[str, str],
+    log_level: str = "INFO",
+    draft_flags: list[str] | None = None,
+) -> list[str]:
+    """mac mlx_lm server 完整命令行组装(纯函数,离线可单测)。
+
+    入口=同仓 wrapper ``services/llm-mlx/bok_mlx_server.py``（2026-10-01
+    W-ABORT；argv 其余逐字节原样透传给 mlx server）。Windows/Linux 的
+    llama.cpp 分支不涉及。
+
+    draft 旗标(BOK_LLM_DRAFT=1 且模型在盘,见 _llm_draft_flags)**追加在 argv
+    末尾**——关=逐字节同旧命令行(默认档零漂移);开=尾部多
+    ``--draft-model <path> --num-draft-tokens 3``。prompt-cache-bytes 随 draft
+    开关折档(_default_prompt_cache_bytes)。draft_flags 由调用方预算入参可免
+    重复求值(跳过打印打两遍)。"""
+    if draft_flags is None:
+        draft_flags = _llm_draft_flags(current)
+    cache_bytes = _default_prompt_cache_bytes(draft_on=bool(draft_flags))
+    return [
+        str(llm_py), str(MLX_SERVER_WRAPPER),
+        "--model", llm_model, "--host", "127.0.0.1", "--port", mlx_port,
+        "--prompt-cache-size", "128",
+        "--prompt-cache-bytes", cache_bytes,
+        "--prefill-step-size", "512",
+        "--chat-template-args", '{"enable_thinking":false}',
+        "--log-level", log_level,
+        *draft_flags,
+    ]
+
+
+def _warn_llm_not_http_ready(ports: Sequence[int]) -> None:
+    """TCP 健康跳过点的一次性 /v1/models 真话探针（2026-10-02 readiness 真话）：
+    mlx 端口先绑后装权重（或代理活着而上游 mlx 半死）时 TCP 探活全绿，serve
+    会把「绿着坏」的栈当已起跳过 → 下一通首轮全量冷 prefill 甚至哑火。只打
+    警告、**不改跳过语义**（双起风险远大于告警价值；真修复走 down+serve）。"""
+    not_ready = [p for p in ports if not _llm_http_ready(p)]
+    if not_ready:
+        for p in not_ready:
+            print(f"[bok] llm :{p} tcp-up but /v1/models not ready "
+                  "(weights loading or half-dead)", file=sys.stderr)
+
+
+def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
+    # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
+    # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
+    # readiness 真话（2026-10-02）：TCP 跳过前补探一次 /v1/models，不就绪大声
+    # 告警（不改跳过语义，防双起）。
+    if _llm_queue_proxy_on() and is_mac():
+        if healthy(1235) and healthy(1239):
+            _warn_llm_not_http_ready((1235, 1239))
+            return
+    elif healthy(1235):
+        _warn_llm_not_http_ready((1235,))
+        return
+    llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
+    if is_mac():
+        llm_py = sidecar_python("llm-mlx")
+        _apply_mlx_template_fix(llm_py)
+    llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
+    if is_mac():
+        llm_py = sidecar_python("llm-mlx")
+        # prompt-cache-size: 默认 10 槽会被 4-6 路并发会话打穿(每请求插入 system/对话/完成
+        # 多条前缀键,LRU 轮换把共享前缀挤掉)。M4 48GB 下 4k 前缀 KV 仅 ~134MB,调大纯赚,
+        # 让同人设/话术的跨会话前缀缓存命中(实测同前缀重放 1.67s→0.19s)。
+        # 16GB 机型可下调,或用 --prompt-cache-bytes 限制缓存总字节。
+        # prompt-cache-bytes:给 128 槽加总字节上限——长会话(几十轮×8k ctx)
+        # 单槽可涨到几十 MB,不封顶会把统一内存吃穿触发 macOS 压缩/交换,TTFT 抖尖。
+        # 档位见 _default_prompt_cache_bytes(env 覆盖+draft 折扣)。
+        # draft 旗标先算:cache 档位与打印行都要感知它(开=draft=on 尾标)。
+        _draft_flags = _llm_draft_flags(current)
+        _cache_bytes = _default_prompt_cache_bytes(draft_on=bool(_draft_flags))
+        _cache_tier = ("explicit" if os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
+                       else "demo_preset" if os.environ.get("BOK_DEMO_PRESET", "") == "1"
+                       else "mem")
+        if _draft_flags:
+            print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier}, draft=on)")
+        else:
+            print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier})")
+        # prefill-step-size 512(官方默认 2048,2026-09-08 二分实证从 1024 再降):
+        # 暖缓存 TTFT 中位 913/917ms vs 1024 的 1066/1092ms(双轮反向 A/B,增量轮
+        # 尾段一步喂完少等半步),并发交错打平——纯赚。
+        # log-level INFO(旧 WARNING):延迟调试要读 mlx 请求/prompt-cache 命中行
+        # (llm.log);dev/mac serve 路径专用,生产 launchd 单元不从这里起 :1235,
+        # 可用 BOK_LLM_LOG_LEVEL 回 WARNING。
+        llm_log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
+        # 队列代理拓扑（2026-09-26 根治 mlx 解码争用,默认开）：mlx 挪内部 :1239、
+        # queue_proxy 占公网口 :1235（生成单并发+reply 插队;BOK_LLM_QUEUE_PROXY=0
+        # 回旧拓扑 mlx 直跑 :1235）。消费方（agent/CP/judge）env 一律 :1235 不动。
+        # draft 兼容已核实（2026-09-25 读码）：queue_proxy 透传原始 body 仅换
+        # content-type/x-bok-lane 头、不剥任何字段;draft 是 server 启动旗标
+        # （mlx 启动时装载 draft 模型）而非 body 参数——代理零改动。
+        _queue_on = _llm_queue_proxy_on()
+        _mlx_port = "1239" if _queue_on else "1235"
+        _start_proc(
+            _mac_llm_server_argv(llm_py, llm_model, _mlx_port, current,
+                                 log_level=llm_log_level, draft_flags=_draft_flags),
+            run_dir / "llm.pid",
+            log_dir / "llm.log",
+            env=_mlx_hf_offline_env(),
+        )
+        if _queue_on:
+            print("[bok] llm queue proxy :1235 -> mlx :1239 (reply lane priority)")
+            _start_proc(
+                [str(repo_python()), str(ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+                run_dir / "llm-proxy.pid",
+                log_dir / "llm-proxy.log",
+                env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1239",
+                     "BOK_LLM_QUEUE_HOST": "127.0.0.1", "BOK_LLM_QUEUE_PORT": "1235"},
+            )
+        return
+    # 非 mac（Windows/Linux）：llama.cpp 后端（GPU 必选；无 GPU 由 doctor 门禁阻止）。
+    # Linux 档（2026-09-20 Ubuntu 节点）：runtime/llama/llama-server 或 PATH 提供。
+    llama_bin = bundled_llama() or shutil_which("llama-server")
+    if not llama_bin:
+        print("[bok] llama-server 不可用（需 GPU；Windows 打包内嵌 CUDA 版 / "
+              "Linux 需 runtime/llama/llama-server 或 PATH 安装 llama.cpp）", file=sys.stderr)
+        return
+    # 旗标升级（2026-09-24 CUDA 实机标定）：+fa on（4090 实测必需）、+cache-reuse
+    # 256（KV 前缀复用——ContextAwareLLM 严格前缀纪律的 llama.cpp 平移；实测
+    # 后续轮 prefill 只算增量 3400tok/s）、-rea off（Qwen3.5 thinking 模型默认
+    # 思考会把全部 token 烧在 reasoning_content——CUDA 首部署实证）。
+    # **槽上下文铁律（2026-09-25 二轮实弹）**：llama.cpp -np 并发槽均分 -c 总量
+    # ——旧 -c 8192 / -np 6 = 每槽 1365，真实通话第 2 轮即 exceed_context_size
+    # 400→LLM_FALLBACK 直念兜底。改为 -c 30720 / -np 3 = 每槽 10240（补偿类
+    # 长模板第 7 轮 prompt 实测 5131 token；KV q8_0 显存增量 ~GB 级可承受）。
+    _start_proc(
+        [str(llama_bin),
+         "--jinja", "--chat-template-kwargs", '{"enable_thinking":false}',
+         "--n-gpu-layers", "all",
+         "-fa", "on",
+         "--cache-reuse", "256",
+         "-np", "3",
+         "-rea", "off",
+         "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+         "--ctx-size", "30720",
+         "--host", "127.0.0.1", "--port", "1235",
+         "-m", llm_model],
+        run_dir / "llm.pid",
+        log_dir / "llm.log",
+    )
+
+
+def _mlx_hf_offline_env() -> dict[str, str]:
+    """mlx server 全家离线档（2026-10-01 第十三波）：模型恒本地绝对路径，hub 元数据
+    探测纯属浪费——call-231aa92a 窗口 settle-llm.log INFO 实证重启后首请求先去
+    huggingface.co 查 revision（401 匿名限流）再冷缓存，首请求 3.5-3.9s 的直接
+    组分。本地缺件时离线档让它大声失败（INFO 日志可见）而非静默网络等待。
+    `download` 车道不走本 env（bootstrap 照常联网拉模型）。残迹观察位：huihui-9B
+    首请求仍见过一次 revision 查询——transformers 系 tokenizer 装载认
+    TRANSFORMERS_OFFLINE 不认 HF_HUB_OFFLINE,两旗都给;INFO 日志盯下一次。"""
+    return {
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    }
+
+
+def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+    """B 线同传翻译 LLM(:1236,Hy-MT2 小模型):与主 LLM 分进程,prefill 互不挤占。
+
+    可选服务:模型缺失/未下载直接跳过并返回 False(等待方不收 1236,B 线
+    interpret 回退主 LLM :1235);端口已健康(serve 重试/生产档拉起)不重复起。
+    返回 True = 预期 :1236 会就绪。
+    """
+    if healthy(1236):
+        return True
+    mt_model = _mt_llm_model(current)
+    if not mt_model or not Path(mt_model).exists():
+        print(f"[bok] mt model not present, skip :1236 ({mt_model or 'unset'})", file=sys.stderr)
+        return False
+    llm_py = sidecar_python("llm-mlx")
+    _apply_mlx_template_fix(llm_py)
+    # 逐句无状态 MT:请求前缀只有模板头一条,32 槽 prompt cache 足够;Hy-MT2
+    # 自带非思考对话模板,不传 --chat-template-args(主 LLM 的关思考参数不通用)。
+    # 入口=wrapper（W-ABORT；B 线取消/打断流同享 abort）。
+    _start_proc(
+        [str(llm_py), str(MLX_SERVER_WRAPPER),
+         "--model", mt_model, "--host", "127.0.0.1", "--port", "1236",
+         "--prompt-cache-size", "32", "--log-level", "WARNING"],
+        run_dir / "mt-llm.pid",
+        log_dir / "mt-llm.log",
+        env=_mlx_hf_offline_env(),
+    )
+    return True
+
+
+def _start_settle_proxy(run_dir: Path, log_dir: Path) -> bool:
+    """9B 前门闸 :1238→:1237（2026-10-03 I1,与 :1235 代理同码同姿势）。
+
+    queue proxy 拓扑关 → 不起（旧形状裸 :1237）；:1238 已健康 → 幂等跳过
+    （_start_settle_llm 的 healthy 早退路径也要捞一把,防「9B 在跑但闸没起
+    →serve 等 1238 假死」）。返回 True=闸在位（新起或已健康）。
+    """
+    if not _llm_queue_proxy_on():
+        return False
+    if healthy(1238):
+        return True
+    print("[bok] settle queue proxy :1238 -> 9B :1237 (reply lane priority)")
+    _start_proc(
+        [str(repo_python()), str(ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+        run_dir / "settle-proxy.pid",
+        log_dir / "settle-proxy.log",
+        env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1237",
+             "BOK_LLM_QUEUE_HOST": "127.0.0.1", "BOK_LLM_QUEUE_PORT": "1238"},
+    )
+    return True
+
+
+def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+    """后台重活专线 LLM(:1237,9B):settle 纪要/知识蒸馏与 flow judge 指到这颗。
+
+    可选服务(同 _start_mt_llm 契约):模型缺失直接跳过返回 False——Summarizer
+    与 judge 走各自 env 缺席链路回退 :1235;端口已健康不重复起。Qwen3.5 家族
+    与主 LLM 同模板参数(关思考);log WARNING(后台作业,唔刷屏)。
+
+    9B 后端化(2026-09-25):默认不随栈常驻——9B 常驻=夜间崩速主犯之一
+    (reports/latency-soak/LANE-AB-2026-09-25.md 附3:judge 9B 二号驻留与回复
+    4B(:1235) 共挤统一内存,swap 满 + 闲置权重页换出,in-call tps 4-12 vs 隔离
+    43-47)——该前提已被 P1(ASR 迁 CPU,MPS 只剩 LLM)拆除。2026-10-01 P2 翻档:
+    :1237=Huihui-9B **a_reply 专线**(暖态 TTFT 175ms,soak p50 912ms/0
+    fallback),默认随栈(模型在盘);BOK_DEV_9B=0 显式关=旧形状(judge/settle
+    回退 :1235)。
+    """
+    if not _dev_9b_enabled():
+        print("[bok] 9B lane off (BOK_DEV_9B=0) — skip :1237 (a_reply 车道/judge/settle 回退 :1235)", file=sys.stderr)
+        return False
+    if healthy(1237):
+        _start_settle_proxy(run_dir, log_dir)  # 幂等:9B 已跑也要捞闸(serve 会等 1238)
+        return True
+    settle_model = _settle_llm_model(current)
+    if not settle_model or not Path(settle_model).exists():
+        print(f"[bok] settle model not present, skip :1237 ({settle_model or 'unset'})", file=sys.stderr)
+        return False
+    llm_py = sidecar_python("llm-mlx")
+    _apply_mlx_template_fix(llm_py)
+    # log-level INFO(2026-10-01 第十二波,call-231aa92a 取证需求):9B 已是 a_reply
+    # 主脑,槽位占用归因(排队的 35s TTFT 类事故)要读 mlx 请求/prompt-cache 命中行
+    # (settle-llm.log);BOK_LLM_LOG_LEVEL=WARNING 回静默(与 :1235 同一旋钮)。
+    _log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
+    # 入口=wrapper（W-ABORT；被打断/取消的 9B 生成立即放槽=打断级联根治点）。
+    # prompt-cache-size 128(2026-10-02 十八波,P2 角色翻档补课)::1237 已是 a_reply
+    # 主脑,但 cache 槽停留在后台作业年代的 8——soak 实弹 13:00:16 cache 打满
+    # (8 sequences)LRU 逐出回复链,R8 3312 tok 全量重 prefill 10.6s 独占单生成
+    # 线,后续轮 1.1-1.3k tok 连环全量 miss 各 ~4s=PERCEIVED p95 5622 的全部来源
+    # (:1235 同病灶同修,见其注释:每请求插 system/对话/完成 多条前缀键,LRU
+    # 轮换把共享前缀挤掉)。
+    # bytes 2GB→4GB(2026-10-02 实机验证波):FLOW20 连跑两通时 2GB 帽逐出断崖
+    # (Prompt Cache 20 seq/2.70GB→15 seq/1.75GB 实录)——run2 的 R1 前缀被逐,
+    # 2948 tok 全量 prefill 16s(与 28 tok 装配 prewarm 同线程交替)=首 token
+    # 3s 超时→fallback→LATE_ANSWER 坏标记链。与 :1235 同档 4GB;十八波「2GB=
+    # 内存预算真闸门」的判断基于云 TTS 前的全栈 27GB 常驻年代,现云姿态栈
+    # ~12GB+9B 权重 5.3GB,4GB cache 总预算充裕。
+    # BOK_SETTLE_CACHE_BYTES 做实（2026-10-02 审计）：档位=env 覆盖>缺省 4GB
+    # （16GB 机型显式下调；与 :1235 的 BOK_LLM_PROMPT_CACHE_BYTES 独立），
+    # tier 打点镜像 :1235 的 explicit/default 先例。
+    _cache_bytes = _settle_cache_bytes()
+    _cache_tier = ("explicit" if os.environ.get("BOK_SETTLE_CACHE_BYTES", "").strip()
+                   else "default")
+    print(f"[bok] settle prompt-cache {_cache_bytes} (tier={_cache_tier})")
+    _start_proc(
+        [str(llm_py), str(MLX_SERVER_WRAPPER),
+         "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
+         "--prompt-cache-size", "128", "--prompt-cache-bytes", _cache_bytes,
+         "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
+        run_dir / "settle-llm.pid",
+        log_dir / "settle-llm.log",
+        env=_mlx_hf_offline_env(),
+    )
+    _start_settle_proxy(run_dir, log_dir)
+    return True
+
+
+def _start_laya(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+    """Laya 决策 sidecar(:8791,意图/流程判定 10ms 快路):独立 FastAPI sidecar,
+    与 asr/tts/embed 同族(非 agent worker,down 走 run/*.pid 全局收割,prod 单元
+    面不列——照 embed 的可选增强姿势)。
+
+    双闸(2026-09-26,2026-09-27 默认翻启):``BOK_LAYA_JUDGE`` 默认 "1"=随栈拉起
+    (模型在盘才起);显式 ="0" 才关。**2026-09-25 起两把闸任一打开即拉起**
+    (BOK_LAYA_JUDGE=意图判定车道 / BOK_LAYA_QA=QA 验证车道——sidecar 是共享的,
+    两车道独立开关节省一次 690MB 驻留)。sidecar 进程自身闸只拦显式
+    BOK_LAYA_JUDGE=0(未设=开),503 姿势不变;agent 侧两闸各自独立三保险。
+    模型缺失/venv 缺席跳过并留一行明示(agent 走原 9B judge 回落链)。
+    端口注::8789 是 embed sidecar 既定端口,本服务用家族下一空位 8791。
+    """
+    if (
+        os.environ.get("BOK_LAYA_JUDGE", "1") != "1"
+        and os.environ.get("BOK_LAYA_QA", "0") != "1"
+    ):
+        print(
+            "[bok] laya off (BOK_LAYA_JUDGE!=1 and BOK_LAYA_QA!=1) — skip :8791 "
+            "(intent judges fall back to 9B lane; QA lane falls back to QA_SEM)",
+            file=sys.stderr,
+        )
+        return False
+    if healthy(8791):
+        return True
+    laya_py = sidecar_python("laya-sidecar")
+    laya_model = laya_model_path(current)
+    if not laya_py.exists() or not laya_model:
+        print(f"[bok] laya model/sidecar not present, skip :8791 ({laya_model or 'unset'})", file=sys.stderr)
+        return False
+    _start_proc(
+        [str(laya_py), "-m", "uvicorn", "app:app", "--app-dir", "services/laya-sidecar",
+         "--host", "127.0.0.1", "--port", "8791"],
+        run_dir / "laya.pid",
+        log_dir / "laya.log",
+        env={"LAYA_MODEL_DIR": laya_model},
+    )
+    return True
+
+
+def _start_call_plane(py) -> bool:
+    """通话面拉起（LiveKit + 三个 agent worker + 常驻监控），serve/node 全栈共用。
+
+    2026-09-20 Ubuntu 节点补齐：本块原只活在 dev `serve` 内联——node_agent 经
+    cmd_up 拉全栈时 LiveKit/worker 缺位，节点装完打不了电话。提取为单点后
+    serve 与 cmd_up 同源（幂等：health 门保证重复调用不叠进程）。
+    返回 LiveKit 是否就绪；未就绪不拉 worker，由调用方就绪等待如实失败。
+    """
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    livekit_cfg = _livekit_config_path()
+    livekit_bin = (
+        _embedded_livekit()
+        or shutil_which("livekit-server")
+        or (ROOT / "services" / "livekit-server" / "livekit-server")
+    )
+    if not healthy(7880) and livekit_bin and Path(livekit_bin).exists():
+        _start_proc(
+            [str(livekit_bin), "--config", str(livekit_cfg)],
+            run_dir / "livekit.pid",
+            log_dir / "livekit.log",
+        )
+    _lk_respawned = False
+    _lk_deadline = time.monotonic() + 30.0
+    while not healthy(7880):
+        if time.monotonic() >= _lk_deadline:
+            if livekit_bin and Path(livekit_bin).exists() and not _lk_respawned:
+                _start_proc(
+                    [str(livekit_bin), "--config", str(livekit_cfg)],
+                    run_dir / "livekit.pid",
+                    log_dir / "livekit.log",
+                )
+                _lk_respawned = True
+                _lk_deadline = time.monotonic() + 15.0
+                print("[bok] livekit went down during startup — respawned a fresh instance")
+                continue
+            print("[bok] livekit :7880 not ready — agent workers NOT started", file=sys.stderr)
+            return False
+        time.sleep(0.5)
+    for _spec in _worker_specs(py):
+        if not healthy(_spec["port"]):
+            _start_proc(_spec["argv"], _spec["pidfile"], _spec["logfile"], env=_spec["env"])
+        else:
+            print(
+                f"[bok] {_spec['name']} worker already listening :{_spec['port']}"
+                " (run bok.py down first to restart it)"
+            )
+    # 常驻监控环：LiveKit 重启后 worker 注册全丢（历史实证「no worker is available」
+    # 连 4 通 0 轮），serve 一次性起完没人补拉——monitor 做 down→up 全量 respawn。
+    _ensure_monitor(py)
+    return True
+
+
+def cmd_up(models_only: bool = False) -> int:
+    """全栈拉起（node_agent 与 serve 共用）：服务面 + 通话面。
+
+    Ubuntu 节点形态修复（2026-09-20）：旧 cmd_up 只起服务面（sidecar/LLM/b-line），
+    LiveKit 与三个 agent worker 只在 dev `serve` 里起——节点装完打不了电话。
+    通话面现已提取为 _start_call_plane（与 serve 同源）。返回码沿用服务面语义：
+    通话面未齐只打 stderr 不篡改服务面结果（由调用方就绪等待如实失败，健康面
+    doctor 呈现 degrad）。
+
+    ``models_only=True``（`bok up --models-only`，2026-10-02 审计）：只拉模型面
+    （服务面：asr/llm/mt/settle/tts+proxy），跳过通话面（livekit/worker/monitor）
+    ——重启后模型面由可选常驻单元 `bok-model-plane` 补拉（`prod install
+    --with-model-plane`，默认 OFF），通话面归既有单元，人工零介入。
+    """
+    # 缺省档零参调用（既有 stub/调用方逐字节兼容）；仅显式 --models-only 传参。
+    rc = _cmd_up_services(models_only=True) if models_only else _cmd_up_services()
+    if rc:
+        return rc
+    if models_only:
+        print("[bok] models-only: 模型面就绪——通话面（livekit/worker/monitor）跳过")
+        return 0
+    _start_call_plane(repo_python())
+    return 0
+
+
+def _cmd_up_services(models_only: bool = False) -> int:
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print("[bok] ensuring models…")
+    cmd_download()
+    print("[bok] starting services…")
+
+    current = MODELS["mac"] if is_mac() else MODELS["windows"]
+    asr_py = sidecar_python("qwen3-asr-sidecar")
+    tts_py = sidecar_python("qwen3-tts-sidecar")
+    if not asr_py.exists() or not tts_py.exists():
+        print(
+            "[bok] sidecar pythons missing — run setup"
+            " (./scripts/bootstrap.sh; node 节点机=scripts/install-node.sh)",
+            file=sys.stderr,
+        )
+        return 2
+
+    asr_model = model_path(current, "asr")
+    tts_preset = model_path(current, "tts_preset")
+    tts_clone = model_path(current, "tts_clone")
+    asr_backend = "mlx" if is_mac() else "transformers"
+    tts_backend = "mlx" if is_mac() else "transformers"
+
+    asr_env = {"QWEN3_ASR_MODEL": asr_model, "QWEN3_ASR_BACKEND": asr_backend}
+    if not is_mac():
+        # Windows/transformers 后端才需要 device 指定;mac mlx 分支不读该 env(MLX 默认走 Metal)。
+        asr_env["QWEN3_ASR_DEVICE"] = "cuda" if _cuda() else "cpu"
+    # ASR 并发竞态让位(2026-10-01 双通实弹):重活在别人在飞时降档——sidecar
+    # 进程不吃全 env 面,prod 封闭面显式透传;缺省=sidecar 内默认开。
+    # P1 SV 车道键同路透传(SV_LANGUAGE/SV_THREADS 调参口)。
+    for _k in ("QWEN3_ASR_CONTENTION_YIELD", "QWEN3_ASR_SV_LANGUAGE", "QWEN3_ASR_SV_THREADS"):
+        _v = os.environ.get(_k)
+        if _v is not None:
+            asr_env[_k] = _v
+    # P1 引擎档进 sidecar（2026-10-01 任务 B）：sidecar 据此决定启动是否 eager
+    # 加载 Qwen3-1.7B GPU 权重——sensevoice 档（含缺省/未设，与 agent
+    # `_asr_engine_from_cfg` 缺省对齐）纯 CPU 车道不加载 GPU 权重（~1.9GB 纯占
+    # 卡）；显式 BOK_ASR_ENGINE=qwen3 回滚档照旧 eager，sidecar 行为零变化。
+    _asr_engine = os.environ.get("BOK_ASR_ENGINE", "").strip()
+    if _asr_engine:
+        asr_env["BOK_ASR_ENGINE"] = _asr_engine
+    # P1 SV-CPU 引擎:模型目录下发。ONNX 布局无 config.json(model_path 判据
+    # 不适用),专用解析:download 落位(app-data/models/<repo-->)有
+    # model.int8.onnx+tokens.txt 即用;缺席不下发=sidecar 用自身缺省/fail-open。
+    _sv_repo = current.get("sensevoice", "")
+    if _sv_repo:
+        _sv_dir = model_dir(_sv_repo)
+        if (_sv_dir / "model.int8.onnx").is_file() and (_sv_dir / "tokens.txt").is_file():
+            asr_env["QWEN3_ASR_SV_MODEL_DIR"] = str(_sv_dir)
+    if not healthy(8787):
+        _start_proc(
+            [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
+             "--host", "127.0.0.1", "--port", "8787"],
+            run_dir / "asr.pid", log_dir / "asr.log",
+            # 前缀整族透传（2026-10-02）：sidecar 专属调参键 prod 封闭 env 可达
+            # （TTS `_qwen3_tts_sidecar_env` 先例；BOK_ASR_ENGINE/DEVICE 已在上
+            # 方显式进 asr_env）。
+            env=_qwen3_asr_sidecar_env(asr_env),
+        )
+    tts_needed, tts_why = _local_tts_needed()
+    if tts_needed and not healthy(8788):
+        # 清残留：serve 重试可能叠加多个卡死的 TTS 进程，先按 pidfile 收掉。
+        _stop_pidfile(run_dir / "tts.pid")
+        _start_proc(
+            [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",
+             "--host", "127.0.0.1", "--port", "8788"],
+            run_dir / "tts.pid", log_dir / "tts.log",
+            env=_qwen3_tts_sidecar_env({
+                "QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
+                "QWEN3_TTS_BACKEND": tts_backend,
+                # 语音克隆注册数据（voice_registry + 参考音频）落 app-data，bundle 只读/可升级。
+                "QWEN3_TTS_DATA_DIR": str(app_data_dir() / "tts-data"),
+                # 打包模式跳过 warmup：首启偶发卡死在参考音频读取/冷编译，
+                # 跳过只损失首包 1-2s，换取启动不被阻塞（开发模式保留 warmup）。
+                "QWEN3_TTS_WARMUP": "0" if is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
+        )
+    elif not tts_needed:
+        print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
+
+    _start_llm(current, run_dir, log_dir)
+    want_mt = _start_mt_llm(current, run_dir, log_dir)
+    want_settle = _start_settle_llm(current, run_dir, log_dir)
+    # W1b embedding sidecar(:8789,bge-m3 MLX):意图语义车道可选增强——镜像
+    # mt/settle 的「模型在盘才起」姿势;venv/模型/端口三缺一即跳过,agent 装配
+    # 面降级闩自动关语义车道。W1b 只做 mac-mlx 形态,windows 表无 embedding 键。
+    want_embed = False
+    if is_mac() and current.get("embedding"):
+        embed_py = sidecar_python("bge-embed-sidecar")
+        embed_model = model_path(current, "embedding")
+        if embed_py.exists() and _usable_model_dir(Path(embed_model)):
+            if not healthy(8789):
+                _start_proc(
+                    [str(embed_py), "-m", "uvicorn", "app:app", "--app-dir", "services/bge-embed-sidecar",
+                     "--host", "127.0.0.1", "--port", "8789"],
+                    run_dir / "embed.pid", log_dir / "embed.log",
+                    env={
+                        "BGE_EMBED_MODEL": embed_model,
+                        # 打包模式跳过暖机(TTS 同款):启动不被阻塞,代价=首个
+                        # 请求 1-2s 冷加载;dev 保留暖机让 /health 就绪=真就绪。
+                        "BGE_EMBED_WARMUP": "0" if is_packaged() else os.environ.get("BGE_EMBED_WARMUP", "1"),
+                    },
+                )
+            want_embed = True
+        else:
+            print(f"[bok] embed model/sidecar not present, skip :8789 ({embed_model or 'unset'})", file=sys.stderr)
+
+    # Laya 决策 sidecar(:8791,2026-09-26;2026-09-27 默认翻启):BOK_LAYA_JUDGE
+    # 默认 "1"、模型+venv 在盘才起(缺席一行明示跳过;=0 显式关;agent 侧
+    # fail-open=缺 sidecar 走原 9B judge 回落链,行为零退化)。
+    want_laya = _start_laya(current, run_dir, log_dir)
+
+    # B-line v1 Node worker (:8790) 已退役（2026-10-02，B 线 v2 双 Python worker 为唯一翻译链）。
+
+    print("[bok] waiting for services…")
+    # mt(:1236)/settle(:1237)/embed(:8789)/laya(:8791)仅在确实拉起时纳入等待;主栈端口照旧。
+    # :8788 同理（2026-09-27 全云端门控）——跳过时不等待也不进重启兜底。
+    core_ports = (8787, 1235) + ((8788,) if tts_needed else ())
+    tts_ready = "tts=8788" if tts_needed else "tts=skipped(cloud-only)"
+    targets = (
+        core_ports
+        + ((1236,) if want_mt else ())
+        + ((1237,) if want_settle else ())
+        + ((1238,) if want_settle and _llm_queue_proxy_on() else ())
+        + ((8789,) if want_embed else ())
+        + ((8791,) if want_laya else ())
+    )
+    mt_ready_suffix = " mt=1236" if want_mt else ""
+    mo_suffix = " (models-only)" if models_only else ""
+    for _ in range(180):
+        if all(healthy(p) for p in targets):
+            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235{mt_ready_suffix}{mo_suffix}")
+            return 0
+        time.sleep(1)
+    # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
+    # 单独重启几乎必然成功）。兜底：停掉后单独再拉起一次，再等 120s。
+    if tts_needed and not healthy(8788):
+        print("[bok] tts not healthy — restarting once (alone)", flush=True)
+        _stop_pidfile(run_dir / "tts.pid")
+        tts_py = sidecar_python("qwen3-tts-sidecar")
+        tts_preset = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "tts_preset")
+        tts_clone = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "tts_clone")
+        tts_backend = "mlx" if is_mac() else "transformers"
+        _start_proc(
+            [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",
+             "--host", "127.0.0.1", "--port", "8788"],
+            run_dir / "tts.pid", log_dir / "tts.log",
+            env=_qwen3_tts_sidecar_env({
+                "QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
+                "QWEN3_TTS_BACKEND": tts_backend,
+                "QWEN3_TTS_DATA_DIR": str(app_data_dir() / "tts-data"),
+                "QWEN3_TTS_WARMUP": "0" if is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
+        )
+        for _ in range(120):
+            if healthy(8788):
+                break
+            time.sleep(1)
+    if all(healthy(p) for p in targets):
+        print(f"[bok] ready (after tts restart): asr=8787 {tts_ready} llm=1235{mt_ready_suffix}")
+        return 0
+    if want_mt and all(healthy(p) for p in core_ports) and not healthy(1236):
+        # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
+        print("[bok] mt llm :1236 not ready — continue (B-line falls back to :1235)", file=sys.stderr)
+        return 0
+    # 宽松终检（2026-09-19 互杀事故收编）：宿主 CPU 风暴下 1s TCP 探测可整轮
+    # 假死，180s 走完≠服务真死——宣判超时前逐口 5s 复检，全绿即 ready；仍有
+    # 真死端口才退出并列出缺口（便于排障）。退出会留下加载中的子代给下一轮
+    # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
+    still_down = _ports_down_after_grace(targets)
+    if not still_down:
+        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235{mt_ready_suffix}")
+        return 0
+    if _only_optional_ports(still_down):
+        # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行
+        # (B 线回退主 LLM/settle 回退 :1235),唔令 serve 在 agent worker 拉起前
+        # 退出——评审:宽松路径原先漏掉这层豁免,会假超时退出留下加载中子代。
+        print(f"[bok] optional llm ports still down: {still_down} — continue (falls back)", file=sys.stderr)
+        return 0
+    print(f"[bok] timeout waiting for services — still down: {still_down} (see app-data/logs)", file=sys.stderr)
+    return 1
+
+
+def _repo_web_modules() -> Path:
+    return ROOT / "apps" / "web" / "node_modules"
+
+
+def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
+    """flow judge 专线 env(:1237 9B):模糊轮判定係后台重活(fire-and-forget),
+    大模型判定质量↑且与活通话回复的 :1235 完全隔离;模型缺失(不在盘)不下发,
+    judge 走原链路 :1235(agent.py 的 FLOW_JUDGE_* 优先级空头自动回退)。
+    存在性检查必须有——注了 env 而 :1237 没起,judge 请求会打上死端口。
+
+    9B 后端化(2026-09-25,LANE-AB-2026-09-25.md 附3):9B 常驻=夜间崩速主犯之一
+    ——judge 9B 二号驻留与回复车道共挤统一内存,swap 颠簸下 in-call tps 4-12。
+    默认(:1237 不拉)不注入该键,judge 回退链落 MLX :1235(agent.py
+    ``FLOW_JUDGE_LLM_BASE_URL or MLX_LLM_BASE_URL`` 已核实);外部显式设了照传
+    (云端 judge 钩子不受开关误伤)。BOK_DEV_9B=1 时行为与改造前逐字节相同。"""
+    if not _dev_9b_enabled():
+        _ext_judge_url = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
+        if _ext_judge_url:
+            env["FLOW_JUDGE_LLM_BASE_URL"] = _ext_judge_url
+            _ext_judge_model = os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
+            if _ext_judge_model:
+                env["FLOW_JUDGE_LLM_MODEL"] = _ext_judge_model
+        return
+    _settle = _settle_llm_model(_cur)
+    if _settle and Path(_settle).exists():
+        env["FLOW_JUDGE_LLM_BASE_URL"] = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
+        # 外部显式 model 照传(docstring「外部显式设了照传」全分支一致化,2026-10-01
+        # 翻档后此分支成为缺省路径;云端 judge 钩子不受开关误伤)。
+        env["FLOW_JUDGE_LLM_MODEL"] = os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip() or _settle
+
+
+# ---------------------------------------------------------------------------
+# _FORWARD_ENV 立法（2026-09-19，spec §5 卫生项）：agent/interp worker 运行时
+# 读的**运营可调 env** 全集单点表。此前 agent 实读 87 键只有 5 键进表——dev
+# 靠 `_start_proc` merge `os.environ` 全活着，prod（launchd/schtasks 封闭白名单）
+# 69 键全死（BOK_FLOW_GRAPH prod kill-switch、BOK_CP_TOKEN auth-on worker 上报
+# 两次实弹同病）。**新增 env 开关的立法动作 = 在此表加一行**：
+# `tests/test_forward_env.py` 扫 agent_runtime 全部 `os.environ` 读取面，未登记
+# （本表/bok 既有注入/豁免清单）即测试失败——死门在 CI 层根治，唔靠人记。
+# 豁免（测试侧 `_EXEMPT`）：SCRIPTED_LLM*/USE_FAKE_MEDIA/FAKE_STT_TEXT（E2E 测试腿
+# 专用）、LOCALAPPDATA（Windows OS 变量，tts_cache 有 home 回退）。
+_FORWARD_ENV = (
+    # —— 话术图引擎 + QA 命中语义 ——
+    "BOK_FLOW_GRAPH",
+    "BOK_FLOW_GRAPH_JUDGE",
+    # —— W1b 意图语义车道(2026-09-23:关键词/judge 之外第三条命中路,本地
+    #    embedding 检索同步补位;总闸默认开,端点缺席时装配面自动降级) ——
+    "BOK_INTENT_SEMANTIC",
+    "BOK_INTENT_SEM_THRESHOLD",
+    "BOK_INTENT_SEM_BASE_URL",
+    "BOK_INTENT_SEM_TIMEOUT_MS",
+    "BOK_INTENT_SEM_COS_W",
+    "BOK_INTENT_SEM_SUB_W",
+    # W3b 解锁·快答库语义补位(2026-09-24):词面 0.90 未中轮的释义档,端点同
+    # :8789 本机 embedding(键独立,预算同 400ms)。
+    "BOK_QA_SEMANTIC",
+    "BOK_QA_SEM_THRESHOLD",
+    "BOK_QA_SEM_BASE_URL",
+    "BOK_QA_SEM_TIMEOUT_MS",
+    # 匹配端根治（2026-09-25 三刀）：召回通道（双向子串+拼音）与 Laya QA 验证车道。
+    # 全部默认保守：PINYIN=1 只影响召回排序（词面 0.90 快道字节不变）；LAYA_QA 默认 0
+    # =整条车道零调用零变化。
+    "BOK_QA_PINYIN",
+    "BOK_QA_RECALL_K",
+    "BOK_QA_RECALL_FLOOR",
+    "BOK_LAYA_QA",
+    "BOK_LAYA_QA_TIMEOUT_MS",
+    "BOK_LAYA_QA_P",
+    # 沉淀引擎 v1（2026-09-25）：闲时自动消化（挖→聚→分档采纳→退休→学同音→
+    # pregen）。AUTO_DIGEST 默认 0（CP 读；自主写库行为先 opt-in 实弹再谈默认）；
+    # HOMOPHONE 默认 1（表空=行为逐字节同旧，学到对子才生效，golden 负样本守门）。
+    # AUTO_DIGEST 消费者是 CP 不是 agent worker——但 dev serve 靠 _start_proc
+    # merge os.environ 活着、prod launchd CP 封闭 env 面走 _control_plane_env
+    # （那里另有同名透传，2026-09-28 env 面审计归位；此处保留无害冗余）。
+    "BOK_QA_AUTO_DIGEST",
+    "BOK_QA_HOMOPHONE",
+    # 匹配端闸松绑+死区填补（2026-09-25 四路并行轮预埋）：WA 步放行 question 类
+    # （真实数据 wa_step_locked 431 次 bypass 的半数是错杀——答赔法与收号不冲突）；
+    # 垫话按需第二发（治载荷轮 2.3s 后裸静默，仅真慢轮触发非固定双发）。
+    "BOK_QA_WA_STEP_QUESTION",
+    "BOK_FILLER_RESHOT",
+    # —— Laya 决策 sidecar(:8791,2026-09-26):意图/流程判定 10ms 快路。总闸
+    #    BOK_LAYA_JUDGE(serve 默认 "1" 随栈拉起,模型在盘才起;="0" 显式关;
+    #    sidecar 侧同闸双保险,"0" 时 /v1/decide 一律 503)与端点覆盖(缺省
+    #    127.0.0.1:8791;8789 是 embed sidecar 既定端口,勿混)。
+    "BOK_LAYA_JUDGE",
+    "BOK_LAYA_SIDECAR_URL",
+    # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
+    "BOK_INTENT_RULES",
+    # —— 意图喂下游(P2.4,2026-09-21:0=关;默认 1——当轮意图进 LLM 尾部
+    #    【客户意图】行 + 垫话类别提示;0=set no-op/行消失,字节同旧) ——
+    "BOK_INTENT_CONTEXT",
+    "BOK_QA_ROTATION",
+    "BOK_QA_PRIORITY",
+    "BOK_QA_FASTPATH",
+    # —— 粤语音系补位层(2026-09-22:字面 miss 后粤拼槽位对齐;zh 线无此档) ——
+    "BOK_QA_PHONETIC",
+    "BOK_QA_PHONETIC_THRESHOLD",
+    # —— 分支罐头快路+分支动作(2026-09-20 路线 A-①/A-②:分支命中→物化录音跳
+    #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
+    "BOK_BRANCH_ACTION",
+    "BOK_BRANCH_CANNED",
+    # —— F4 破坏性动作双护栏(2026-09-20:refuse 派发前条件核心词须字面命中;
+    #    整轮/末子句剥词表词后过短=ASR 抄词表不收线) ——
+    "BOK_BRANCH_REFUSE_CONFIRM",
+    "BOK_BRANCH_REFUSE_HOTWORD_GUARD",
+    # —— F2 迟到 FINAL 尾巴护栏(2026-09-20:AI 生成/播报中相对已提交文本的
+    #    极短追加 finish 尾巴=重解幻听,不成轮不打断快路/直念回复) ——
+    "BOK_LATE_FINAL_GUARD",
+    "BOK_LATE_FINAL_MAX_TAIL_CHARS",
+    # —— hotword_only 否决层(2026-09-25:AI 忙时停嘴整窗重解把词表热词抄成独立
+    #    迟到 FINAL 掐断在播罐头;按词表贪心剥离后严格为空才否决;0=整层不评估,
+    #    行为回 F2 现状) ——
+    "BOK_LATE_FINAL_HOTWORD_GUARD",
+    "BOK_QA_MATCH_THRESHOLD",
+    # —— 垫话/罐头/TTS 缓存 ——
+    "BOK_FILLER",
+    "BOK_FILLER_DELAY_MS",
+    # 垫话连发冷却时间窗(2026-09-29):上次真垫话 Ns 内跳过本发(0=关窗)。
+    # 旧「相邻轮歇一轮」seq 冷却把慢轮覆盖打穿,改时间窗后真实通话轮间隔
+    # (>10s)普遍出窗=慢轮全覆盖,急连发段仍有阻尼。
+    "BOK_FILLER_COOLDOWN_S",
+    # 垫话让路(第十七波 2026-10-02,call-4e8d58c1):真答案首音频就绪即停在播
+    # 垫话+hold 归零+reshot 查 reply 在途;="0" 一键回 09-10「垫话必须播完」。
+    "BOK_FILLER_YIELD",
+    # 晚到补答去重(第十七波):交付前与已交付文本比相似度(阈值沿用
+    # BOK_REPEAT_CROSS_TURN_SIM);="0" 跳过比对回旧行为。
+    "BOK_LATE_ANSWER_DEDUP",
+    # worker 容量阈值(第十七波 FLOW20 全哑根修):livekit load=整机 psutil
+    # cpu_percent,共享机桌面噪音过 0.7 线=拒派空房全哑;钉 0.99 仅近全饱和才拒,
+    # 生产专用节点想保守可设回 0.7。
+    "BOK_WORKER_LOAD_THRESHOLD",
+    # SIP 拨号模式覆盖（dialer.py:51 resolve_dial_mode：有值即显式覆盖 settings
+    # sip.mode，合法 mock/real、非法回落 mock）；CP 面同键另走 _control_plane_env
+    # （campaign.py:61 消费），本行补 agent worker 面——不登记则 prod 封闭 env 面
+    # agent 侧恒读空串，env 覆盖结构性死门（2026-10-03 C2）。
+    "BOK_SIP_MODE",
+    # Sentry 接线（R3 2026-10-04）：worker 面 init_sentry("agent-worker") +
+    # 看门狗真火/背景 judge 失败关键路径上报；DSN 缺席=完整 no-op。
+    # CP 面同键另走 _control_plane_env（main.py init_sentry）。
+    # SENTRY_SEND_PII（2026-10-04 Ethan 拍板 dev 档开）:1=请求头/IP 进事件。
+    "SENTRY_DSN",
+    "SENTRY_ENVIRONMENT",
+    "SENTRY_SEND_PII",
+    "BOK_FILLER_GAP_MS",
+    "BOK_FILLER_CHAIN",
+    "BOK_FILLER_MAX",
+    "BOK_FILLER_MAX_DUR_S",
+    "BOK_FILLER_CUT_AFTER_S",
+    "BOK_CONTEXT_MEM_LEGACY",
+    "BOK_FILLER_MATCH",
+    # W2a 犹豫混入专用闸(2026-09-24):0 只关犹豫池混入,罐头五类与上游门不动。
+    "BOK_FILLER_HESITATION",
+    # W2c 语境化过渡承诺(2026-09-24):垫话语境桶 promise_* 池优先,0=回现行阶梯。
+    "BOK_FILLER_CONTEXT",
+    # W2b 思考态键盘环境音(2026-09-24):官方 thinking_sound 抽签 burst,关=构造不带。
+    "BOK_AMBIENT_KEYBOARD",
+    "BOK_AMBIENT_KEYBOARD_VOL",
+    "BOK_FILLER_MATCH_THRESHOLD",
+    "BOK_FILLER_BACKFILL",
+    "BOK_TTS_FALLBACK",
+    # W8 首子句起播(2026-09-24):TTS 首送快车道——首个 task_continue/首段 POST
+    # ≥N 字即送(默认 6,旧 overlap 档 12 字在慢生成轮把首送推后 ~0.7-0.9s)。
+    "BOK_TTS_FIRST_CLAUSE",
+    "BOK_TTS_FIRST_CLAUSE_CHARS",
+    # W-TTS bidi 首 chunk 提前切(2026-09-28):首个 task_continue 句内 ≥N 字即发
+    # (默认 10,切点避数字/拉丁 run),后续 continue 仍按句界;0=旧行为逐字节同。
+    "BOK_TTS_FIRST_CHUNK_CHARS",
+    # bidi 头段催产(2026-09-29):早切头段后立刻 task_flush——服务端对无句末标点
+    # 缓冲不起合成(兜底窗 2.4s),不催=早发空转;台架首声 918-962→210-343ms。
+    "MINIMAX_BIDI_HEAD_FLUSH",
+    # —— LLM 生成链（兜底/投机/预热/超时预算） ——
+    "BOK_LLM_FALLBACK",
+    # mlx 生成中止（W-ABORT，2026-10-01）：agent worker 侧 MlxLlmLLM 读；="0"
+    # 时不带 X-Bok-Req-Id、不发 POST /v1/abort（字节面同旧）。服务端 wrapper
+    # 同键（dev serve 走 _start_proc merge；prod 侧 wrapper 由 bok 拉起时继承）。
+    "BOK_MLX_ABORT",
+    "BOK_PREFILL_SPEC",
+    "BOK_PREFILL_SPEC_DEBUG",
+    "BOK_PREFILL_SPEC_FINAL_QUIET_MS",
+    "BOK_PREEMPTIVE_DEBUG",
+    "LLM_PREFIX_PREWARM",
+    "PREEMPTIVE_GENERATION",
+    "PREEMPTIVE_TTS",
+    "PREEMPTIVE_MAX_RETRIES",
+    "PREEMPTIVE_DISABLE_ON_MARKER",
+    "FLOW_JUDGE_DELAY",
+    "FLOW_JUDGE_IDLE_CAP",
+    "BOK_JUDGE_CAPPED_SKIP",
+    "FLOW_JUDGE_LLM_API_KEY",
+    # —— 模型路由统一 kill-switch（2026-09-25 阶段 0：packages/core/model_routes.py
+    #    契约在读，="0" 忽略路由表字节同旧；进表=dev/prod 双面都可达） ——
+    "BOK_MODEL_ROUTING",
+    # —— 云端 Realtime S2S 演示档（2026-09-25 阶段 B：realtime_demo.py +
+    #    providers/qwen_realtime.py 适配器读面。BOK_QWEN_REALTIME="1" 才随栈
+    #    拉起 bok-realtime worker（:8084，opt-in 不动默认栈）；="0" worker 拒接
+    #    一切 job 且适配器构造即 raise；QWEN_REALTIME_KEY=云端凭据（worker 端
+    #    读好后**构造参数**传入，适配器自身零 key env 读取）；BOK_REALTIME_DEMO_
+    #    MAX_S=会话时长熔断秒数（缺省 300）；QWEN_REALTIME_BASE_URL=WS 端点
+    #    覆盖（缺省=适配器模块常量 QWEN_REALTIME_WS_BASE） ——
+    "BOK_QWEN_REALTIME",
+    "BOK_REALTIME_DEMO_MAX_S",
+    "QWEN_REALTIME_KEY",
+    # WS 端点覆盖：适配器现读 QWEN_REALTIME_WS_BASE（缺省=同名模块常量）；
+    # QWEN_REALTIME_BASE_URL 是该槽的历史/别名登记，防适配器改名时门禁闪红。
+    "QWEN_REALTIME_WS_BASE",
+    "QWEN_REALTIME_BASE_URL",
+    "FLOW_LLM_ADVANCE",
+    "BOK_PERCEIVED_BUDGET_MS",
+    "BOK_MAX_CALL_DURATION_S",
+    # 结算 gather 等待窗(D7):0/缺省=自适应档(无慢任务 10s/有意图判据 25s)。
+    "BOK_SETTLE_WAIT_S",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL",
+    "DEEPSEEK_API_KEY",
+    # DeepSeek 思考档位：官方默认 enabled，而我们的 max_tokens 都很小（对话 160 /
+    # 判据 8-32）——思考会把预算烧光、正文出空串（通话侧=静默哑火）。故 DeepSeek
+    # 端点缺省关思考（契约见 bok_voice_core.deepseek_llm），这两枚是显式开/覆盖口。
+    "DEEPSEEK_THINKING",
+    "FLOW_JUDGE_LLM_THINKING",
+    # —— 轮次/打断/心跳 ——
+    "TURN_DETECTION",
+    "BOK_TURN_DETECTOR_THRESHOLD",
+    "BOK_TURN_DETECTOR_THRESHOLDS",
+    # smart-turn 语义闸（V1，2026-09-26：VAD 停嘴处 ONNX 判「说完没」，p<0.5 复用
+    # join-hold 等续段；providers/smart_turn.py。默认 "0"=关——未验收特性不默认开）
+    "BOK_SMART_TURN",
+    # —— FireRedVAD 试点适配层（2026-09-28：providers/firered_vad.py，0.6M DFSMN
+    #    流式 ONNX 包成 livekit vad.VAD。BOK_VAD_PROVIDER 默认 "silero"=零变化，
+    #    "firered" 才替换且缺依赖/缺模型回退 silero；MODEL_DIR 指模型目录覆盖资产；
+    #    THRESHOLD/SMOOTH 为 FireRed 独立档默认 0.5/5，不照抄 silero 0.75） ——
+    "BOK_VAD_PROVIDER",
+    "BOK_FIRERED_MODEL_DIR",
+    "BOK_FIRERED_THRESHOLD",
+    "BOK_FIRERED_SMOOTH",
+    "ENDPOINT_MIN_DELAY",
+    "ENDPOINT_MAX_DELAY",
+    "INTERRUPT_MIN_DURATION",
+    "RESUME_FALSE_INTERRUPTION",
+    "FALSE_INTERRUPTION_TIMEOUT",
+    # —— M-30 turns 断窗重放(2026-09-23 修复波#2:CP 断窗轮次本地暂存 CP 恢复补交;
+    #    0=回旧行为失败即弃——task-9 腿 9.6 实证 ~14 轮永久丢) ——
+    "BOK_TURNS_REPLAY",
+    "BOK_INTERRUPT_STORM_BACKOFF",
+    "BOK_INTERRUPT_STORM_WINDOW_S",
+    "BOK_INTERRUPT_STORM_THRESHOLD",
+    "BOK_INTERRUPT_STORM_QUIET_S",
+    "BOK_INTERRUPT_STORM_MAX_ROUNDS",
+    "BOK_INTERRUPT_LEDGER",
+    "BOK_INTERRUPT_REAP",
+    "BOK_REPEAT_HEAD_MAX_HOLD",
+    "BOK_PREFIX_PREWARM_YIELD",
+    "BOK_ACTIVE_CALLS_DIR",
+    "BOK_ASR_ENGINE",
+    "BOK_FACT_CORRECTION",
+    "SILENCE_NUDGE_SECONDS",
+    "SILENCE_NUDGE_MAX",
+    "BOK_E2E_NUDGE_IMMUNE",
+    "BOK_STARVE_ACK",
+    "BOK_PAUSE_ACK",
+    "BOK_DEFER_ACK",
+    "BOK_SAY_STEP_LIMIT",
+    # —— 看门狗/流程守卫 ——
+    "BOK_RESPONSE_WATCHDOG_S",
+    "BOK_RESPONSE_WATCHDOG_FILLER_EXT_S",
+    "BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S",
+    "BOK_DIGIT_ACCUMULATE",
+    "BOK_WA_ACCUMULATE",
+    "BOK_WA_ACCUM_TIMEOUT_S",
+    "BOK_WA_LEN_CHECK",
+    # —— M-23 首位数字回声剥离(2026-09-23 修复波#4:AI 复述/last_reply 回声混进
+    #    客户报号首位 → 错号被确认;0=关) ——
+    "BOK_WA_ECHO_STRIP",
+    # —— M-22① 罐头/分支出声前内部指令守卫(2026-09-23 修复波#4:教练文案被
+    #    罐头车道逐字念给客户;命中拒出声落 LLM;0=关) ——
+    "BOK_CANNED_TEXT_GUARD",
+    "BOK_WORKER_PORT_GUARD",
+    # 单机多栈并存（并行会话/多 worktree 验收）错开 A 线 worker 端口，默认 8081 零漂移。
+    "BOK_WORKER_PORT",
+    # —— 漏斗 v2（stall 升级阶梯/judge route 路由/跟进工单；合入默认全开，0=回退） ——
+    "BOK_STALL_LADDER",
+    "BOK_UNCLEAR_ADVANCE",
+    "BOK_UNCLEAR_ADVANCE_N",
+    "BOK_LLM_STALL_OBS_TPS",
+    "BOK_QA_CANNED_COOLDOWN_S",
+    "BOK_ROUTE_JUDGE",
+    "BOK_TOOLS_FOLLOWUP",
+    # —— 双派发守卫（2026-09-28 call-0105a539 实证：同房双 job 并跑整通=双开场
+    #    白+双份回答+fallback 道歉风暴；flock 同房互斥，后到 job 让位；0=关，
+    #    DIR=锁目录覆盖供测试/多栈隔离） ——
+    "BOK_ROOM_CLAIM",
+    "BOK_ROOM_CLAIM_DIR",
+    # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
+    # 云 ASR 装线波(2026-10-03):豆包 SAUC 总闸,=0 装配点回退本地 Qwen3-ASR
+    # (A/B 线共用;凭据走设置面 asr 段,不经 env)。
+    "BOK_DOUBAO_ASR",
+    "BOK_ASR_HOTWORDS",
+    "BOK_ASR_PARTIAL_SLOW_MS",
+    # B 线正压臂波(2026-10-02):ASR 帧级调试观测(掉帧/水位打点)——
+    # 运维键,prod 不透传=死门(test_forward_env 钉)。
+    "BOK_ASR_FRAME_DEBUG",
+    # 开采热词(第四来源,2026-09-28):agent 装配期 GET /api/asr/hotwords 一次;
+    # 默认 "1"(端点缺席 fail-open 空串),="0" 跳过零 HTTP 调用。
+    "BOK_MINED_HOTWORDS",
+    # chunk POST 失败保留(D4):0=回退旧「先清后发」档。
+    "QWEN3_ASR_CHUNK_KEEP",
+    "QWEN3_ASR_STREAM",
+    "QWEN3_ECHO_GUARD",
+    "QWEN3_HOTWORD_ECHO_GUARD",
+    # —— ASR 终稿后置轨(2026-09-21 E1/E2 接线:先热词泄漏清洗、后 snippet 词级
+    #    替换;两枚 kill-switch 默认 "1",=0 各自回退零变化) ——
+    "BOK_HOTWORD_LEAK_SANITIZE",
+    "BOK_SNIPPETS",
+    # —— 知识/检索/TTS 语言 ——
+    "CONTEXT_RAG",
+    "WEB_SEARCH",
+    "MINIMAX_LANGUAGE_BOOST",
+    "EMOTION_TAG_PILOT",
+    # —— 机器通道凭据（auth-on 部署 worker 上报 turns/QA/设置全靠它） ——
+    "BOK_CP_TOKEN",
+    # —— 日志面 ——
+    "BOK_LOG_LEVEL",
+    # —— providers/ 子包收编（2026-09-20 D14：test_forward_env 扫描改 rglob 递归，
+    #    providers/livekit_plugins.py 61 键此前整包漏扫——60 运营键进表，
+    #    FAKE_STT_TEXT 测试腿 shim 进豁免）。未设不注入，默认档零变化。 ——
+    # LLM 生成链调参/诊断（livekit_plugins.py MlxLlmLLM/ContextAwareLLM 读面）：
+    "BOK_LLM_MSG_DEBUG",
+    "BOK_LLM_REGEN",
+    "BOK_A_LINE_VOICE_TAGS",
+    # 换气注入（voice_style.py transform 长句句界补 (breath)，2026-09-27）：
+    # 总闸默认开、阈值默认 20 字。同上未设不注入、默认档零变化。 ——
+    "BOK_BREATH_INJECT",
+    "BOK_BREATH_SENT_CHARS",
+    # ASR 受限润色层（agent_runtime/asr_polish_runtime.py，2026-09-27）：
+    # 确定性音近吸附默认开 + CSC 小模型二道 opt-in（zh-only，:8792）。
+    "BOK_ASR_POLISH",
+    "BOK_CSC_SIDECAR",
+    "BOK_CSC_URL",
+    "BOK_CSC_CONF_GATE",
+    "BOK_REPEAT_GUARD",
+    "BOK_REPEAT_CROSS_TURN",
+    "BOK_REPEAT_CROSS_TURN_SIM",
+    # 编造号码输出守卫（2026-10-01，call-231aa92a）：LLM 流出口逐句校验号码
+    # 确认句——数字须来自 {捕获账本, 本轮客户原话}，编造者改写/替换（默认 "1"，
+    # "0"=关=恒等返回；实现 packages/core/bok_voice_core/output_guard.py）。
+    "BOK_NUMBER_GUARD",
+    "BOK_TAIL_SLIM",
+    "BOK_MEMORY_CHARS",
+    # 尾部节食（第十一波 2026-09-29）：slim 轮记忆块降频——距上次带过 ≥N 条
+    # 账本项才带（=1 旧行为每轮带）。尾部骑在新 user 消息后=每轮全新 uncached，
+    # 记忆块(~250 字≈170 tok)是 slim 轮尾部最大件。STABLE_SPAN=稳定段重发回看
+    # 窗口条数（默认 max(2, LLM_HISTORY_TURNS-2)；修隔轮意外重发 uncached 交替）。
+    "BOK_TAIL_MEMORY_EVERY",
+    "BOK_TAIL_STABLE_SPAN",
+    # D1 槽位化 actor（2026-10-01,第一性原理重构）：A 线回复 LLM 从「整本剧本+
+    # 全规则」切「角色卡+任务块」（默认 "0"=旧路径逐字节不变；B 线不接）。
+    "BOK_SLOT_ACTOR",
+    "EMOTION_TAG_PROMPT",
+    "LLM_FIRST_TOKEN_TIMEOUT_S",
+    # LLM 饥荒自适应（第十五波 2026-10-01,call-dc54f542）：机器级首 token 慢
+    # （swap/GPU 争用）时拉长首 token 超时与 drain、禁 regen——等原流优于重来。
+    "BOK_LLM_FAMINE",
+    "BOK_LLM_FAMINE_TTFT_S",
+    "BOK_LLM_FAMINE_FIRST_S",
+    "BOK_LLM_FAMINE_DRAIN_S",
+    "LLM_HISTORY_TURNS",
+    "LLM_LATE_ANSWER_DEADLINE_S",
+    "LLM_MAX_TOKENS",
+    "LLM_REQUEST_RETRIES",
+    "LLM_REQUEST_TIMEOUT_S",
+    "LLM_TEMPERATURE",
+    "LLM_WARMUP",
+    "REPLY_MEMORY_LINES",
+    # MiniMax TTS：凭据/端点 + bidi 自愈 + 语速/音调/音量 + 叠句增量（运营键全集）：
+    "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_WS_URL",
+    "MINIMAX_REGION",
+    # —— F10 bidi 限流守卫(2026-09-23:限流族 task_failed 关连接+退避重试+回落
+    #    HTTP+同通连续 3 轮熔断;0=回旧行为) ——
+    "BOK_MINIMAX_BIDI_GUARD",
+    "MINIMAX_BIDI_AUTO_REWARM",
+    "MINIMAX_BIDI_CANCEL_WAIT_S",
+    "MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S",
+    "MINIMAX_BIDI_PING_MAX_MISS",
+    "MINIMAX_BIDI_PING_S",
+    "MINIMAX_BIDI_PREWARM_RETRY",
+    "MINIMAX_BIDI_STALL_MAX_HEALS",
+    "MINIMAX_BIDI_SYNTH_WARMUP",
+    "MINIMAX_CONTINUOUS_SOUND",
+    "MINIMAX_EMOTION",
+    "MINIMAX_FIRST_AUDIO_TIMEOUT_S",
+    "MINIMAX_PAUSE",
+    "MINIMAX_PAUSE_SECS",
+    "MINIMAX_PITCH",
+    "MINIMAX_SPEED",
+    "MINIMAX_TTS_OVERLAP",
+    "MINIMAX_TTS_OVERLAP_CHARS",
+    "MINIMAX_TTS_OVERLAP_MS",
+    "MINIMAX_VOL",
+    "MINIMAX_WS",
+    "MINIMAX_WS_MODE",
+    "MINIMAX_WS_POOL",
+    "BOK_TTS_PREWARM",
+    # Qwen3-ASR：agent 侧插件读面（sidecar 进程专属键另走 asr_env，不在此表）：
+    "QWEN3_ASR_CHUNK_MS",
+    "QWEN3_ASR_HESITATION_GATE",
+    "QWEN3_ASR_JOIN_HOLD_MS",
+    "QWEN3_ASR_JOIN_HOLD_VOCAB",
+    "QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS",
+    "QWEN3_ASR_PREFLIGHT_LANG_GATE",
+    "QWEN3_ASR_SENTENCE_PAUSE_TRIGGER",
+    # Qwen3-TTS sidecar 客户端（插件侧）调参：
+    "QWEN3_TTS_MAX_TASK_AUDIO_SEC",
+    "QWEN3_TTS_OVERLAP",
+    "QWEN3_TTS_OVERLAP_CHARS",
+    "QWEN3_TTS_OVERLAP_MS",
+    # Volcano TTS：凭据/端点/voice 调参：
+    "VOLC_ACCESS_TOKEN",
+    "VOLC_APP_ID",
+    "VOLC_DIALECT",
+    "VOLC_LANGUAGE",
+    "VOLC_LOUDNESS_RATE",
+    "VOLC_RESOURCE_ID",
+    "VOLC_SPEAKER",
+    "VOLC_SPEECH_RATE",
+    "VOLC_TTS_ENDPOINT",
+    # —— 碎片轮重问车道（EX-2，2026-09-28）：碎裂/碎片转写 canned 重问（零 TTFT
+    #    替掉 LLM 轮）总闸与四闸；默认开/0.45/0.5/2/2，未设不注入=默认档零变化 ——
+    "BOK_GARBLED_REASK",
+    "BOK_REASK_CONF_MEAN",
+    "BOK_REASK_LOW_RATIO",
+    "BOK_REASK_MIN_CONTENT_CHARS",
+    "BOK_REASK_MAX_CONSEC",
+    # —— B 线第一性原理波（2026-10-02）：装配期 MT 探活 kill-switch（缺省开） ——
+    "BOK_INTERP_MT_PROBE",
+    # —— 编排审计第二波 PR-B（2026-10-02）：A 线 a_reply 车道装配期探活 kill-switch
+    #    （缺省开；agent.py 读注入 env Mapping 故静态扫描不强制，prod 转发靠此登记——
+    #    BOK_INTERP_MT_PROBE 同款判例；tests/test_a_reply_probe.py 钉 membership） ——
+    "BOK_A_REPLY_PROBE",
+)
+# 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
+_BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
+
+
+def _apply_bok_passthrough_env(env: dict[str, str]) -> None:
+    """运营 env 透传（2026-09-18 实弹发现；2026-09-19 `_FORWARD_ENV` 立法收编全集）。
+
+    `_agent_worker_env`/`_agent_prod_env` 都是**白名单 env**（dict 里没写的键一律
+    不带 `os.environ`）——`BOK_FLOW_GRAPH=0 python tools/bok.py serve` 写在命令行上
+    **到不了 agent worker**，worker 按默认 `"1"` 跑：kill 腿「全程零 FLOW_GRAPH」
+    结构性测不出（实弹：worker pid env 只有 2 枚 BOK_ 键、无 BOK_FLOW_GRAPH，
+    jump/play 照发，探针如实报 FAIL）。dev 靠 `_start_proc` merge `os.environ` 一直
+    全活、prod 封闭白名单全死——表见 `_FORWARD_ENV`；未设/空串不注入（默认档
+    逐字节不变）。"""
+    for key in _BOK_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+
+
+def _apply_flow_graph_env(env: dict[str, str]) -> None:
+    """历史名（单测/旧调用面）：passthrough 透传的薄别名。"""
+    _apply_bok_passthrough_env(env)
+
+
+
+def _agent_worker_env(py) -> dict[str, str]:
+    """A 线 main worker 的 env(serve 与 monitor 同源单点)。"""
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    env: dict[str, str] = {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "agent",
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
+    }
+    _apply_judge_env(env, _cur)
+    _apply_bok_passthrough_env(env)
+    # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸;固化 SSL_CERT_FILE。
+    _bake_ssl_cert_file(env, py)
+    return env
+
+
+def _apply_interp_direction_env(env: dict, direction: str) -> dict:
+    """方向级服务覆盖钩子（全双工分 GPU / 云端混合的接线点，2026-09-16）。
+
+    B 线 fwd/rev 两个 worker 共享 _interp_env，两路同时说话时 ASR/MT 请求在
+    同一块 GPU 上排队。REV 方向可用 `*_REV` env 把 ASR/MT 指到第二套端点
+    （第二实例/第二台机/云端适配器），fwd 保持默认——排队问题的第一指定解。
+    只认 REV 方向的覆盖；fwd 恒走默认（单向说话是主场景，零配置零变化）。"""
+    if direction != "rev":
+        return env
+    for base in (
+        "QWEN3_ASR_BASE_URL",
+        "QWEN3_ASR_MODEL",
+        "MT_LLM_BASE_URL",
+        "MT_LLM_MODEL",
+    ):
+        v = os.environ.get(f"{base}_REV")
+        if v:
+            env[base] = v
+    return env
+
+
+def _realtime_demo_enabled() -> bool:
+    """演示档 worker 随栈开关（opt-in）：BOK_QWEN_REALTIME="1" 才拉起 :8084。
+
+    默认关——演示档整通走云端 S2S（按分钟真金计费），不是每套栈都该常驻一个
+    空转 worker；要试演示在启动环境设 BOK_QWEN_REALTIME=1（凭据 QWEN_REALTIME_KEY
+    经 _FORWARD_ENV 透传）。worker 手工直起不受此门（realtime_demo.py 自身只在
+    ="0" 时拒接 job）。"""
+    return os.environ.get("BOK_QWEN_REALTIME", "") == "1"
+
+
+def _worker_specs(py) -> list[dict]:
+    """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
+    + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
+    agent_env = _agent_worker_env(py)
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    specs = [
+        {
+            "name": "agent",
+            # BOK_WORKER_PORT 动态口（2026-10-02 审计）：spec 口必须与 worker
+            # 进程实际 bind 的口一致（env 经 _FORWARD_ENV 透传），否则健康面
+            # 探活/跳过判定全打缺省口。缺省 8081 零漂移。
+            "port": _agent_worker_port(),
+            "pidfile": run_dir / "agent.pid",
+            "logfile": log_dir / "agent.log",
+            "argv": [str(py), "-m", "agent_runtime.main"],
+            "env": agent_env,
+        }
+    ]
+    for _dir, _port in (("fwd", 8082), ("rev", 8083)):
+        interp_env = _interp_env(agent_env)
+        interp_env["BOK_SERVICE"] = f"interp-{_dir}"
+        interp_env["INTERP_DIRECTION"] = _dir
+        _apply_interp_direction_env(interp_env, _dir)
+        specs.append(
+            {
+                "name": f"interp-{_dir}",
+                "port": _port,
+                "pidfile": run_dir / f"interp-{_dir}.pid",
+                "logfile": log_dir / f"interp-{_dir}.log",
+                "argv": [str(py), "-m", "agent_runtime.interpret"],
+                "env": interp_env,
+            }
+        )
+    if _realtime_demo_enabled():
+        # 演示档 worker（云端 Realtime S2S）：env 基于 _agent_worker_env 全集
+        # （BOK_CP_TOKEN/QWEN_REALTIME_KEY 等 _FORWARD_ENV 键经 passthrough 在内）。
+        rt_env = dict(agent_env)
+        rt_env["BOK_SERVICE"] = "realtime-demo"
+        specs.append(
+            {
+                "name": "realtime-demo",
+                "port": 8084,
+                "pidfile": run_dir / "realtime-demo.pid",
+                "logfile": log_dir / "realtime-demo.log",
+                "argv": [str(py), "-m", "agent_runtime.realtime_demo"],
+                "env": rt_env,
+            }
+        )
+    return specs
+
+
+def _pid_alive(pidfile: Path) -> bool:
+    """pidfile 指向的进程还活着吗（_ensure_monitor 单例判定的唯一探针）。
+
+    Windows（M2-fix）：绝不能用 os.kill(pid, 0)——CPython 的 os.kill 在 nt 上
+    对非 CTRL_C_EVENT/CTRL_BREAK_EVENT 的 sig 一律调 TerminateProcess，探活即
+    击杀（活的 monitor 被探死、仍返回 True、_ensure_monitor 误判单例存活跳过
+    respawn → 栈从此无人看护）。改用 tasklist 按 PID 查询
+    （scripts/probes/probe_windows_lifecycle.py `_win_pid_alive` 同款；冷路径不缓存；
+    查询失败保守当存活——宁可不重拉也不误判）。POSIX 分支与旧代码逐字节同款
+    （sig 0 在 POSIX 是纯探活）。"""
+    try:
+        pid = int(pidfile.read_text().strip())
+    except Exception:
+        return False
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            return True  # 查询失败保守当存活（勿误判单例已死而重复拉起）
+        return f'"{pid}"' in (r.stdout or "")
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _pidfile_alive_stamped(pidfile: Path) -> bool:
+    """_ensure_monitor 单例判定的 lstart 加强版（2026-09-22 monitor 盲斑 2）。
+
+    _pid_alive 是纯 pid 探活——pidfile 残留死 pid 被无关进程复用时误判存活，
+    _ensure_monitor 跳过重拉 = 栈从此无 monitor。本函数在 pid 活之上追加
+    来源戳比对：proc-<pid>.root 记的 lstart 与 ps 现值不一致 = pid 已被
+    复用，判死（stale pidfile，该重拉）。戳缺失/lstart 读不出时保守当存活
+    （fail-open 旧语义）——外部旧式启动的 monitor 没有戳，不能误杀单例。"""
+    if not _pid_alive(pidfile):
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+        marker = pidfile.parent / f"proc-{pid}.root"
+        parts = marker.read_text().strip().split("\t")
+    except Exception:
+        return True  # pid 活但戳读不出：fail-open 当存活（与 _process_serve_root 同纪律）
+    if not (len(parts) == 2 and parts[1]):
+        return True  # 无戳/坏戳：外部旧式启动，保守当活
+    cur = _ps_field(pid, "lstart=")
+    if not cur:
+        return True  # ps 读不出（如 Windows 无 ps）：保守当活
+    return cur == parts[1]
+
+
+def _pid_reused_stale(pidfile: Path, pid: int) -> bool:
+    """pidfile 指向的 pid 是否已被无关进程复用（down 清杀前置闸，2026-10-02）。
+
+    判据=来源戳 ``proc-<pid>.root`` 记的 lstart 与 live 进程 ``ps -o lstart=``
+    现值不一致（与 ``_pidfile_alive_stamped`` 同款比对——该判据此前只接
+    monitor 单例判定，清杀路径缺失 = stale pidfile 的 pid 被复用时来源「未知」
+    fail-open 照杀，误杀无辜进程）。戳搜索面=pidfile 同目录 + app-data ``run/``
+    （legacy ``data/sidecar-*.pid`` 的戳落在 run 面）。无戳（旧式启动）/坏戳/
+    ps 读不出 → False（fail-open 旧语义：无戳遗留照杀，未知绝不挡杀——与
+    ``_pid_origin_foreign`` 同纪律）。"""
+    recorded = ""
+    for base in (pidfile.parent, app_data_dir() / "run"):
+        try:
+            parts = (base / f"proc-{pid}.root").read_text().strip().split("\t")
+        except Exception:
+            continue
+        if len(parts) == 2 and parts[1]:
+            recorded = parts[1]
+            break
+    if not recorded:
+        return False
+    cur = _ps_field(pid, "lstart=")
+    if not cur:
+        return False
+    return cur != recorded
+
+
+class _KillTreeError(RuntimeError):
+    """Windows taskkill 停树失败（带 rc/输出尾）——必须浮出，不得静默吞
+    （旧版 os.killpg 在 nt 抛 AttributeError 被外层 except 吞掉 = down 静默失效）。"""
+
+
+def _kill_proc_tree(pid: int) -> None:
+    """按 _start_proc 的会话/进程组语义终止整棵进程树。
+
+    POSIX：与旧代码逐字节同款——killpg(SIGTERM)，(ProcessLookupError,
+    PermissionError, OSError) 时回退单杀；异常照旧上抛给调用方。
+    Windows：taskkill /T /F 沿父子树收割（_start_proc 用 CREATE_NEW_PROCESS_GROUP
+    建组，见 _spawn_kwargs）。rc=128（进程已不在）等价 ProcessLookupError，静默
+    放行；其余失败抛 _KillTreeError——真失败必须浮出，绝不重演静默吞。
+    """
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 - taskkill 缺失/超时都要浮出
+            raise _KillTreeError(f"taskkill /PID {pid} /T /F error: {exc!r}") from exc
+        if r.returncode == 128:  # process not found = 已死，对齐 POSIX 静默放行
+            return
+        if r.returncode != 0:
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            raise _KillTreeError(
+                f"taskkill /PID {pid} /T /F rc={r.returncode} {detail}")
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        os.kill(pid, signal.SIGTERM)
+
+
+def _kill_pidfile(pidfile: Path) -> None:
+    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。
+
+    他树戳守卫（2026-09-22）：monitor respawn 路径读到被他树覆写的共享
+    pidfile 时拒绝杀——不挡「本树/无戳」，与 down 纪律同款 fail-open。"""
+    try:
+        pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[kill] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            return
+        _kill_proc_tree(pid)
+    except _KillTreeError as exc:
+        # monitor respawn 路径的 best-effort 停止：Windows 真失败留痕不炸环。
+        print(f"[kill] {pidfile.name}: {exc}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _ensure_monitor(py) -> None:
+    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。
+
+    2026-09-22 盲斑修复：①存活判定升级为 lstart 比对（_pidfile_alive_stamped，
+    pidfile 残留 pid 被复用不再误判活 = 栈无 monitor）；②跨树可观测——monitor
+    属他树时打日志跳过（共享栈模型既定行为，从静默变有声，不改变动作）。"""
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    pidfile = run_dir / "monitor.pid"
+    if _pidfile_alive_stamped(pidfile):
+        try:
+            pid = int(pidfile.read_text().strip())
+            foreign, root = _pid_origin_foreign(pid)
+            if foreign:
+                print(f"[bok] monitor 已在运行且属另一代码树（{root}）——跳过拉起"
+                      "（共享栈模型；要换装先去对方树 down）")
+        except Exception:
+            pass
+        return
+    _start_proc(
+        [str(py), str(ROOT / "tools" / "bok.py"), "monitor"],  # G2 W①:re-exec 走门面 launcher
+        pidfile,
+        log_dir / "monitor.log",
+        env={"BOK_MONITOR": "1"},
+    )
+    print("[bok] worker monitor started (livekit restart → respawn all workers)")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """monitor 探测禁跟随重定向:URL 是钉死的环回常量(无用户输入,SSRF 前提
+    不存在),唯一要防的係 CP 被攻破后借 302 把带 BOK_CP_TOKEN 的探测引去外部
+    主机——重定向一律升 HTTPError,token 永不出环回。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+def _cp_active_calls() -> int | None:
+    """CP 在途通话数(None=CP 不可达,monitor 退回纯连续失败口径)。
+
+    respawn 前置闸的数据源(2026-09-17 call-54cab865 通话第 63s 被 monitor
+    强杀实证):healthy() 係 1s TCP 探测,GPU 满载整机卡顿一瞬三个 worker 可以
+    同时探不上——旧逻辑即刻 kill+respawn=在途通话陪葬。有通话在途时把门槛
+    从 2 轮(≥10s)抬到 12 轮(≥60s):活 worker 卡顿永不连吃 60s,真死 worker
+    一分钟内照样补拉。"""
+    try:
+        req = urllib.request.Request(_MONITOR_CP_ACTIVE_URL)
+        token = (os.environ.get("BOK_CP_TOKEN") or "").strip()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        _opener = urllib.request.build_opener(_NoRedirect)
+        with _opener.open(req, timeout=2.0) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        rows = data if isinstance(data, list) else (data.get("calls") or [])
+        return len(rows)
+    except Exception:  # noqa: BLE001 - CP 不可达=口径降级,唔阻监控环
+        return None
+
+
+# monitor→CP 探测端点:编译期钉死的环回常量(安全复查 SSRF 判定的锚——无任何
+# 动态输入参与主机构造,重定向经 _NoRedirect 禁跟随)。
+_MONITOR_CP_ACTIVE_URL = "http://127.0.0.1:8000/api/calls?status=active"
+
+_DOWN_STREAK_NEED_IDLE = 2  # 连续 ≥2 轮(≥10s)探不上才判 down(无通话在途)
+# G3 硬 veto(2026-09-25)取代旧「有通话在途门槛抬到 12 轮(≥60s)」：在途通话
+# >0 时**任何探活失败都不杀**——12 轮抬门槛仍有误杀窗（LANE-AB-2026-09-25.md
+# 附3：swap 颠簸下 offscript 窗 worker 被误杀 ×7，respawn 244 行）。该常量仅
+# 剩 veto 打点节奏用途（长 veto 窗每 12 轮≈60s 提醒一次，防静默）。
+_DOWN_STREAK_NEED_ACTIVE = 12
+
+
+def _monitor_kill_round(streak: int, active_calls: int | None) -> tuple[bool, bool]:
+    """单 worker 连续探活失败的处置判定（纯函数，monitor 环与单测共用）。
+
+    返回 ``(kill, veto_log)``：
+    - ``kill``：本轮该补拉。``active_calls>0`` 时恒 False——硬 veto 关死误杀窗
+      （活 worker 卡顿多惨都唔杀，真死 worker 等场景间隙 active 归零立刻补拉，
+      连续计数在 veto 窗内照涨所以不丢窗口）；**``active_calls is None``（CP
+      不可达，在途通话状态未知）同样恒 False=保守不杀**（2026-09-27 修：旧
+      ``if not active_calls`` 把 None 当 0 → idle 门槛 2 轮即杀，veto 静默失效）；
+      active 为 0 时按 idle 门槛。
+    - ``veto_log``：该打 veto 打点——streak 首过 idle 门槛时一次，此后每
+      ``_DOWN_STREAK_NEED_ACTIVE`` 轮提醒一次（长 veto 窗不静默也不刷屏）。
+    """
+    if active_calls is None:
+        # 状态未知 → 保守不杀，按 veto 节奏打点（streak 越高越罕见，防刷屏）。
+        veto_log = streak == _DOWN_STREAK_NEED_IDLE or (
+            streak > _DOWN_STREAK_NEED_IDLE and streak % _DOWN_STREAK_NEED_ACTIVE == 0
+        )
+        return False, veto_log
+    if not active_calls:
+        return streak >= _DOWN_STREAK_NEED_IDLE, False
+    veto_log = streak == _DOWN_STREAK_NEED_IDLE or (
+        streak > _DOWN_STREAK_NEED_IDLE and streak % _DOWN_STREAK_NEED_ACTIVE == 0
+    )
+    return False, veto_log
+
+
+def cmd_monitor() -> int:
+    """C6-1 常驻监控环:LiveKit 重启→A+B 全 worker respawn(重注册);单 worker
+    掉线→补拉。9/12 11:52-12:05 实证:livekit 重启后 worker 注册全丢,
+    「no worker is available」连 4 通 0 轮、无人补拉;serve 一次性返回管唔到。
+    2026-09-17 重排:探不上→respawn 改连续失败计数(单轮 1s TCP 探测在 GPU
+    满载下係常态误报)。
+    2026-09-25 G3 重排(LANE-AB-2026-09-25.md 附3):①探活从 1s TCP 换成真
+    GET :port/worker 端点(_probe_worker 与 prod status 同源单点)——TCP UP 对
+    「进程在、没 register/假活」不可见,1s 窗在 swap 颠簸下还假死(offscript
+    窗误杀 ×7 根因);②active_calls>0 时**任何探活失败都不杀**(硬 veto,取代
+    12 轮/60s 抬门槛——swap 颠簸可连吃 60s,门槛抬得再高也有窗,veto 先生才
+    关死);CP 不可达退回无通话口径。
+    """
+    py = repo_python()
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # 盲斑 1 修复（2026-09-22）：外部手跑 monitor 也落 pidfile+来源戳——旧版只
+    # 有 _start_proc 拉起的 monitor 才有痕迹，外部启动令 _ensure_monitor 探不到
+    # 单例（双监控环）、跨树杀守卫对无戳进程不保护。经 _start_proc 拉起时同
+    # 内容写两次，幂等无害。
+    _write_proc_stamps(run_dir / "monitor.pid", os.getpid())
+    print(f"[monitor] started — watching :7880 + workers {_agent_worker_port()}/8082/8083")
+    lk_up = healthy(7880)
+    last_action = 0.0
+    down_streak: dict[str, int] = {}
+
+    def _respawn(specs: list[dict], why: str) -> None:
+        nonlocal last_action
+        # 限频:转换风暴(重启抖动)下 30s 内只动作一次。
+        if time.monotonic() - last_action < 30.0:
+            return
+        last_action = time.monotonic()
+        print(f"[monitor] {why} — respawning workers")
+        for spec in specs:
+            _kill_pidfile(spec["pidfile"])
+        # 等端口释放(优雅关停最长 ~10s;拿不到就交给端口单例守卫兜底)。
+        _deadline = time.monotonic() + 10.0
+        while time.monotonic() < _deadline:
+            if not any(healthy(s["port"]) for s in specs):
+                break
+            time.sleep(0.5)
+        for spec in specs:
+            # 他树/复用守卫（2026-09-22）：上一轮 kill 被他树戳挡下时，端口仍被
+            # 对方的健康 worker 持有——硬起只会 bind 失败退出刷噪声。已有健康
+            # 监听的端口跳过重拉（自己刚被杀掉的 worker 端口是空的，不受影响）。
+            if healthy(spec["port"]):
+                print(f"[monitor] :{spec['port']} 已有健康监听，跳过重拉"
+                      "（他树持有则去对方树 down）")
+                continue
+            _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+            print(f"[monitor] respawned {spec['name']} :{spec['port']}")
+
+    while True:
+        try:
+            specs = _worker_specs(py)
+            now_up = healthy(7880)
+            skip_lk_mark = False
+            if not lk_up and now_up:
+                # LiveKit 回来了(重启)——注册在新进程,worker 必须重注册。但若有在途
+                # 通话（或 CP 不可达=状态未知），respawn 的集体 kill 会陪葬活通话
+                # （2026-09-27 修：旧版无条件 kill）：保守不杀，且**不更新 lk_up**
+                # → 5s 后本轮重试，通话归零即刻补拉（重启注册丢的修复只是延后不丢）。
+                _active = _cp_active_calls()
+                if _active is None or _active > 0:
+                    skip_lk_mark = True
+                    print(
+                        f"[monitor] livekit back up but active_calls="
+                        f"{'unknown(CP unreachable)' if _active is None else _active} "
+                        "— veto respawn (retry after calls drain)"
+                    )
+                else:
+                    _respawn(specs, "livekit back up (restart detected)")
+                    down_streak = {}
+            elif now_up:
+                active = _cp_active_calls()
+                need = _DOWN_STREAK_NEED_ACTIVE if active else _DOWN_STREAK_NEED_IDLE
+                down: list[dict] = []
+                for spec in specs:
+                    # 真端点探针:与 prod status/_probe_worker 同源单点(见 docstring G3①)。
+                    ok, _detail = _probe_worker(spec["port"])
+                    if ok:
+                        down_streak[spec["name"]] = 0
+                        continue
+                    streak = down_streak.get(spec["name"], 0) + 1
+                    down_streak[spec["name"]] = streak
+                    kill, veto_log = _monitor_kill_round(streak, active)
+                    if veto_log:
+                        _desc = "unknown(CP unreachable)" if active is None else active
+                        print(
+                            f"[monitor] worker {spec['name']} probe failed x{streak} "
+                            f"but active_calls={_desc}, veto kill"
+                        )
+                    if kill:
+                        down.append(spec)
+                if down and time.monotonic() - last_action >= 30.0:
+                    # 单 worker 真 down 补拉;全 down 逐个 kill+start(端口已死,
+                    # 无需 _respawn 的集体 kill-then-wait)。有通话在途时硬 veto
+                    # (G3②):kill 恒 False、streak 照涨——通话一结束(active 归零)
+                    # 真死 worker 立刻补拉,活 worker 的瞬态卡顿永不触发。
+                    last_action = time.monotonic()
+                    for spec in down:
+                        down_streak[spec["name"]] = 0
+                        _kill_pidfile(spec["pidfile"])
+                        _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+                        print(
+                            f"[monitor] worker {spec['name']} down x{need} "
+                            f"(active_calls={active}) — respawned :{spec['port']}"
+                        )
+            if not skip_lk_mark:
+                lk_up = now_up
+        except Exception as exc:  # noqa: BLE001 - 监控环任何异常都唔准退出
+            print(f"[monitor] loop error: {exc!r} — keep watching")
+        time.sleep(5.0)
+
+
+def _cp_bind_host() -> str:
+    """CP 监听地址（site-delivery fixwave，补 M2.3 计划项「bind 0.0.0.0 env 开关」）：
+    BOK_BIND_HOST 显式 opt-in（如 0.0.0.0）才对外监听，缺省恒 127.0.0.1——本机
+    单用户形态行为零变化。serve 与 prod install（launchd/schtasks 单元定义）共用
+    同一份解析：--open-firewall 的 :8000 放行规则只有 bind 0.0.0.0 时才有意义。"""
+    return (os.environ.get("BOK_BIND_HOST") or "").strip() or "127.0.0.1"
+
+
+def cmd_serve() -> int:
+    """Bring up the full no-Docker desktop stack and wait until ready.
+
+    Packaged mode (BOK_PACKAGED=1) serves the UI from the Tauri static bundle,
+    so the Next server on :3000 is NOT started. All local services bind
+    127.0.0.1 (CP honors BOK_BIND_HOST, default 127.0.0.1). Business data goes
+    to SQLite and the knowledge vault lives in app-data (never the read-only
+    bundle).
+    """
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸+来源鉴定）：身份
+    # 复核不过的一律不动；他树 stamp 的 bok 栈永不收割（跨树互杀/多会话纪律）；
+    # 本树与无戳的再过健康闸——「健康」放行（防 CPU 风暴把加载中子代当孤儿误
+    # 杀的互杀循环）。残留面：同树「健康但旧代码」的进程无法从外部判定所载代
+    # 码版本，会被 spawn 门复用（A/B 污染面）——清扫日志逐口提示 left alone，
+    # 改完代码要吃新代码先 down 再起。
+    stale = _sweep_orphan_listeners()
+    for port, cmd, pid in stale:
+        print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
+
+    py = repo_python()
+    # Dev 模式用系统 node 起 Next dev（打包模式 BOK_PACKAGED=1 跳过 web:3000）。
+    node = bundled_node() or "node"
+    # control-plane
+    # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
+    db = (app_data_dir() / "bok_voice.db").as_posix()
+    cp_env: dict[str, str] = _control_plane_env(db)
+    if not healthy(8000):
+        _start_proc(
+            [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"],
+            run_dir / "control-plane.pid",
+            log_dir / "control-plane.log",
+            env=cp_env,
+        )
+    # Dev mode: Next dev server on :3000 (packaged serves static UI from Tauri).
+    # next.config.mjs 是 output:"export"，`next start` 无法服务 export 产物，
+    # 必须用 `next dev`（export 只在 build 阶段生效）。
+    if not is_packaged() and not healthy(3000):
+        _start_proc(
+            [
+                str(node),
+                str(_repo_web_modules() / "next" / "dist" / "bin" / "next"),
+                "dev",
+                "-H",
+                "127.0.0.1",
+                "-p",
+                "3000",
+            ],
+            run_dir / "web.pid",
+            log_dir / "web.log",
+            env={"NEXT_PUBLIC_CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")},
+            cwd=str(ROOT / "apps" / "web"),
+        )
+
+    # 通话面（LiveKit + agent worker + 常驻监控）由 cmd_up→_start_call_plane 单点
+    # 拉起（2026-09-20 提取，serve 与 node_agent 全栈同源）；本函数只做就绪等待。
+    rc = cmd_up()
+    if rc:
+        return rc
+
+    print("[bok] waiting for desktop stack…")
+    desktop_tts_needed = _local_tts_needed()[0]
+    # 基础口表吃 _desktop_stack_targets()（agent worker 口=BOK_WORKER_PORT 动态；
+    # 2026-10-02 审计——旧版硬编码 8081，错开档就绪等待永远打缺省口）。
+    targets = _desktop_stack_targets()
+    if desktop_tts_needed:
+        targets.insert(2, 8788)
+    if _realtime_demo_enabled():
+        # 演示档 worker 随栈拉起时纳入就绪等待（opt-in，:8084）。
+        targets.append(8084)
+    if healthy(1236):
+        # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
+        targets.append(1236)
+    if not is_packaged():
+        targets.append(3000)
+    # 就绪判据（2026-10-02 readiness 真话）：1235（/v1/models）/8787/8788
+    # （/health）必须 HTTP 200——mlx 先绑端口后装权重、sidecar 模型装载中
+    # 503，TCP 通≠能干活；这些口的宽松终检同款（见 _serve_ready_probe*）。
+    if _wait_desktop_ready(targets):
+        _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
+        ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
+        if 1236 in targets:
+            ready += " mt=1236"
+        print(ready)
+        # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
+        if not is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
+            try:
+                import webbrowser
+                webbrowser.open("http://127.0.0.1:3000")
+            except Exception:  # pragma: no cover - 打开浏览器失败不影响启动
+                pass
+        return 0
+    # 宽松终检（2026-09-19 互杀事故收编）：CPU 风暴下 1s 探测可整轮假死，
+    # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
+    # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
+    # 严格口（1235/8787/8788）的复检维持 HTTP-200 真话（still_down 点名如实）。
+    still_down = _ports_down_after_grace(targets, probe=_serve_ready_probe_relaxed)
+    if not still_down:
+        _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
+        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")
+        return 0
+    print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
+    return 1
+
+
+def cmd_down() -> int:
+    run_dir = app_data_dir() / "run"
+    stop_failures = 0
+    for pidfile in run_dir.glob("*.pid"):
+        try:
+            pid = int(pidfile.read_text().strip())
+        except Exception:
+            continue
+        # 他树戳守卫（2026-09-22）：run/*.pid 是 HOME 作用域单槽共享文件，
+        # 多会话/worker 换装会互相覆写——down 只停「本树 + 无戳遗留」（_sweep_
+        # orphan_listeners 已立法的同款纪律在 pidfile 路径落地；旧版此处对
+        # pidfile 内容无脑收割，2026-09-22 实弹把我们树的 worker 杀掉的正是
+        # 这个缺口）。
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[down] skip {pidfile.stem}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            continue
+        # pid 复用闸（2026-10-02 审计）：来源戳 lstart 与 live 进程对不上 =
+        # stale pidfile 的 pid 已被无关进程复用——来源判「未知」会 fail-open
+        # 照杀（误杀无辜）；此处按铁证跳过。无戳遗留照旧语义杀。
+        if _pid_reused_stale(pidfile, pid):
+            print(f"[bok] stale pidfile {pidfile.stem} pid={pid} reused — skip kill")
+            continue
+        # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
+        # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
+        # 避免子进程残留占用 8081 导致下次 agent 启动失败。
+        # Windows(M2)：taskkill /T /F 沿父子树收割；真失败必须浮出——旧代码
+        # os.killpg 在 nt 不存在，AttributeError 被外层 except 整个吞掉，down
+        # 全程静默失效（probe_windows_lifecycle.py 记录的 M1 断层）。
+        try:
+            _kill_proc_tree(pid)
+        except _KillTreeError as exc:
+            print(f"[down] FAILED to stop {pidfile.stem}: {exc}", file=sys.stderr)
+            stop_failures += 1
+            continue
+        except Exception:
+            # 死 pid / 权限缺失：与旧 POSIX 行为一致，静默跳过。
+            continue
+        print(f"[down] stopped {pidfile.stem} (pid {pid})")
+    # Legacy dev sidecars managed by old start_sidecars.sh (host pids in data/).
+    data_dir = ROOT / "data"
+    for pidfile in data_dir.glob("sidecar-*.pid"):
+        try:
+            pid = int(pidfile.read_text().strip())
+            # pid 复用闸同款（2026-10-02 审计）：legacy 扫描面同样只杀真本树 pid。
+            if _pid_reused_stale(pidfile, pid):
+                print(f"[bok] stale pidfile {pidfile.stem} pid={pid} reused — skip kill")
+                continue
+            os.kill(pid, signal.SIGTERM)
+            print(f"[down] stopped {pidfile.stem} (pid {pid})")
+        except Exception:
+            continue
+    # 孤儿 worker 兜底清扫（2026-09-07 QA 实证）:serve 异常退出后 start_new_session
+    # 的 worker 存活,而 pidfile 可能已被覆写成死 pid——down 按 pidfile 清不到,
+    # 旧代码 worker 会继续注册 livekit 抢 job。按进程特征+监听端口兜底清扫一遍。
+    orphans = _sweep_orphan_workers()
+    for pid, label in orphans:
+        print(f"[down] swept orphan worker (pid {pid}, {label})")
+    # 端口级兜底（2026-09-17 殭尸专项）:spawn 子代/sidecar/livekit/uvicorn 殘留
+    # 是命令行特征清扫的盲区,按 bok 端口表+身份复核双条件收割。
+    # healthy_ok=False:down 是拆除语义,pidfile SIGTERM 已先送达,「健康残留」
+    # 也必须收走——否则 pidfile 覆写成死 pid 时 down 返回 0 但栈仍在跑
+    # （旧代码被静默采纳=A/B 污染复活,评审 P1-1）。
+    for port, cmd, pid in _sweep_orphan_listeners(healthy_ok=False):
+        print(f"[down] swept orphan listener :{port} (pid {pid}, {cmd})")
+    return 1 if stop_failures else 0
+
+
+def _sweep_orphan_workers() -> list[tuple[int, str]]:
+    """清扫 pidfile 体系漏掉的 agent worker/解释器/mock 客户进程（返回 [(pid, 标签)]）。
+
+    判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
+    scripts/runtime/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
+    同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
+    只清本项目特征进程,唔会误伤无关服务。他树戳守卫（2026-09-22）：读得出
+    「拉起树」且 ≠ 本树 → 跳过不进 swept（与 _sweep_orphan_listeners 同款
+    纪律——命令行特征只证明「bok 家」，来源戳才证明「谁家的」）。
+    Windows（M2 定案）：**明跳**（返回空表,不清扫）。tasklist 不回命令行
+    （image 只有 python.exe,无法安全区分本项目 worker——宁可少清不可误杀）；
+    wmic 已弃用；PowerShell CIM 查询未在本仓 Windows 实机验证过。无头形态下
+    Windows 栈整体活在单一 node_agent 任务树里（taskkill /T /F / schtasks /end
+    一把清,见 _kill_proc_tree）,孤儿面远小于 mac 多单元拓扑;实装 CIM 清扫前
+    诚实跳过,不假装扫过。"""
+    swept: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    if os.name == "nt":
+        return swept
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid,command"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return swept
+    for line in ps.splitlines()[1:]:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        for marker in ("agent_runtime.main", "agent_runtime.interpret", "scripts/runtime/mock_callee.py"):
+            if marker in parts[1]:
+                if pid not in seen:
+                    seen.add(pid)
+                    foreign, root = _pid_origin_foreign(pid)
+                    if foreign:
+                        print(f"[sweep] orphan pid {pid} 属另一代码树（{root}）——不动"
+                              "（他树进程永不收割；要切换先在对方 down）", file=sys.stderr)
+                    else:
+                        swept.append((pid, marker))
+                break
+    for pid, label in swept:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                continue
+    return swept
+
+
+def _ps_field(pid: int, field: str) -> str:
+    """ps 单字段取值（lstart 身份比对用），失败返回空串（fail-closed）。"""
+    try:
+        return subprocess.run(
+            ["ps", "-p", str(pid), "-o", field],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _process_serve_root(pid: int) -> str:
+    """来源鉴定（评审 A-P2 完整版）：该 pid 由哪棵代码树拉起。载体优先级：
+    ① app-data run/proc-<pid>.root（_start_proc 落笔「ROOT<TAB>子代lstart」，
+    lstart 与 ps 现值精确比对——pid 复用必然对不上，标记作废）；
+    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径）；
+    ③ macOS `ps eww -p <pid> -o command=`（2026-09-22 补：实测能读出 env 里的
+    BOK_SERVE_ROOT——隔离 HOME 接管的 worker 标记文件落在对方 app-data、
+    本树 app-data 里没有，/proc 又不存在，旧版两载体全盲=来源「未知」，
+    他树 worker 会被 down/清扫当无主残留收割，6c82 接管实弹踩到）。
+    读不到/对不上返回空串=来源未知，调用方按未知走原语义；任何异常同空串。"""
+    if os.name == "nt":
+        return ""
+    try:
+        marker = app_data_dir() / "run" / f"proc-{pid}.root"
+        if marker.exists():
+            parts = marker.read_text().strip().split("\t")
+            if len(parts) == 2 and parts[1]:
+                cur = _ps_field(pid, "lstart=")
+                return parts[0] if cur and cur == parts[1] else ""
+            return ""
+    except Exception:
+        pass
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        for item in raw.split(b"\0"):
+            if item.startswith(b"BOK_SERVE_ROOT="):
+                return item.decode("utf-8", "replace").split("=", 1)[1]
+    except Exception:
+        pass
+    try:
+        # 载体③：macOS 环境经 ps eww 挂在 command 列尾部。只认变量名边界，
+        # 防「某 env 值里恰好含这段字面量」误报；取非空白段（ROOT 是路径无空格）。
+        # 实测边界：python 进程（=真实标的 worker/monitor）恒可读；/bin/sleep
+        # 这类短 argv 二进制读不出 env——载体只服务 bok 家进程，够用。
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = re.search(r"(?<![A-Za-z0-9_])BOK_SERVE_ROOT=(\S+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _pid_origin_foreign(pid: int) -> tuple[bool, str]:
+    """pid 是否属**另一棵代码树**（2026-09-22 pidfile 清杀路径补戳）。
+
+    返回 (foreign, root)：来源读得出且 ≠ 本树 ROOT → (True, root)；来源未知
+    （旧版进程/探测失败/pid 复用对不上）或本树 → (False, …)。fail-open 与
+    「down=停本树+无戳遗留」纪律一致——未知绝不挡杀，只有铁证是他树才让位。
+    只对 bok 家进程有意义（任意进程 env 里有 BOK_SERVE_ROOT 即视为 bok 子代）。"""
+    root = _process_serve_root(pid)
+    if not root:
+        return False, ""
+    if os.path.realpath(root) == os.path.realpath(str(ROOT)):
+        return False, root
+    return True, root
+
+
+def _sweep_stale_root_markers() -> None:
+    """清 proc-<pid>.root 残留：ps 探不到的 pid 视为死，标记删除（防标记文件
+    无限积累）；ps 探测失败=未知一律保留。"""
+    try:
+        markers = list((app_data_dir() / "run").glob("proc-*.root"))
+    except Exception:
+        return
+    for marker in markers:
+        try:
+            pid = int(marker.stem.removeprefix("proc-"))
+        except ValueError:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+            continue
+        try:
+            alive = subprocess.run(
+                ["ps", "-p", str(pid)], capture_output=True, text=True, timeout=5,
+            ).returncode == 0
+        except Exception:
+            continue
+        if not alive:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+
+
+# 端口 → 命令行身份标记（_sweep_orphan_listeners 双条件收割用）。端口是 bok
+# 固定拓扑（见 CORE_PORTS/WORKER_PORTS 语义）；身份复核防误杀同端口无关服务。
+# 8081-8083 额外认 multiprocessing.spawn：livekit-agents worker 的 spawn 子代
+# 命令行只有 `-c from multiprocessing.spawn import spawn_main`，父进程暴毙后
+# 命令行特征丢失但仍占端口——旧代码殭尸继续注册抢 job（A/B 污染实锤类）。
+_ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (8000, ("control_plane.main",)),
+    (8787, ("qwen3-asr",)),
+    (8788, ("qwen3-tts",)),
+    (8789, ("bge-embed",)),
+    # Laya 决策 sidecar(:8791):uvicorn 命令行带 --app-dir services/laya-sidecar。
+    (8791, ("laya-sidecar",)),
+    (1235, ("mlx_lm",)),
+    (1236, ("mlx_lm",)),
+    (1237, ("mlx_lm",)),
+    # llm-raw(1239)（2026-10-02 编排审计第二波）：queue proxy 拓扑下 mlx 的真实
+    # 监听口——父进程暴毙后代理仍转发失败、孤儿 mlx 却占着 GPU 解码不放，
+    # 身份标记同族（--model 路径 + mlx_lm）。
+    (1239, ("mlx_lm",)),
+    # settle-proxy(1238)（2026-10-03 I1 前门闸）：queue_proxy 同码同族（命令行
+    # 带 services/llm-mlx/queue_proxy.py）；父进程暴毙后占着 9B 前门口令新栈
+    # serve 等就绪假死——同 1239 的孤儿语义。
+    (1238, ("queue_proxy",)),
+    (7880, ("livekit-server",)),
+    (3000, ("next", "node")),
+    (8081, ("agent_runtime", "multiprocessing")),
+    (8082, ("agent_runtime", "multiprocessing")),
+    (8083, ("agent_runtime", "multiprocessing")),
+    # 演示档 worker（opt-in）：同族身份标记——只清「占着 8084 且是 bok 家进程」
+    # 的殭尸，身份不符照旧不动手。
+    (8084, ("agent_runtime", "multiprocessing")),
+)
+
+
+def _orphan_port_owners() -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """``_ORPHAN_PORT_OWNERS`` 的动态版：A 线 worker 口吃
+    ``_agent_worker_port()``（BOK_WORKER_PORT 错开时孤儿清扫/身份复核仍对得上
+    真口；2026-10-02 审计），其余条目原样（interp 8082/8083 与静态表相同）。"""
+    agent_port = _agent_worker_port()
+    if agent_port == 8081:
+        return _ORPHAN_PORT_OWNERS
+    return tuple(
+        (agent_port, markers) if port == 8081 else (port, markers)
+        for port, markers in _ORPHAN_PORT_OWNERS
+    )
+
+
+def _sweep_orphan_listeners(kill: bool = True,
+                            healthy_ok: bool = True) -> list[tuple[int, str, int]]:
+    """端口级孤儿兜底（2026-09-17 殭尸专项）：按 bok 端口表逐口查 LISTEN 进程，
+    命令行身份复核通过才收割；身份不符（他人物理占用）只报警不动手。
+
+    健康即非孤儿（2026-09-19 互杀事故收编）：宿主 CPU 风暴（Parallels 141%）
+    下 serve 的 1s 健康探测假死 → 180s 等待超时退出、留下正在加载模型的健康
+    子代 → 下一轮 serve 本函数把它们当孤儿杀掉 → 互杀循环、栈永远起不来。
+    身份复核只证明「这是 bok 家的进程」，不证明它已死——现动手前先做一次
+    放宽超时（5s）的健康探测（_relaxed_healthy：有 HTTP 健康面走 HTTP、无的
+    退 TCP），探测健康 → 跳过收割（left alone），不健康才照旧收割；返回值
+    swept 只含真正收割的条目（left-alone 的不进）。
+    来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：marker//proc stamp
+    读得出「拉起树」时，他树的 bok 栈永不收割——它可能正在加载模型（跨树互杀
+    同款根因），多会话纪律也禁碰他树进程；down 同样不收他树。读不出 stamp
+    （旧版进程/ps 失败）按来源未知走原健康闸/收割语义，旧行为兜底不变。
+    kill=False 只探测+报告不动手（健康的同样报 left alone；干跑/测试用）。
+    Windows 明跳（同 _sweep_orphan_workers：无安全身份来源，宁可少清不误杀）。"""
+    swept: list[tuple[int, str, int]] = []
+    if os.name == "nt":
+        return swept
+    _sweep_stale_root_markers()
+    for port, markers in _orphan_port_owners():
+        try:
+            out = subprocess.run(
+                ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except Exception:
+            continue
+        for line in out.split():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            try:
+                cmd = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+            except Exception:
+                cmd = ""
+            if not any(m in cmd for m in markers):
+                print(f"[sweep] port {port}: pid {pid} 身份不符（{cmd[:80] or '未知'}），不动", file=sys.stderr)
+                continue
+            # 来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：stamp 读得出
+            # 「拉起树」且 ≠ 本树 → 他会话/他树的 bok 栈，永不收割——它可能正在
+            # 加载模型（跨树互杀同款根因），多会话纪律也禁碰他树进程；down 同样
+            # 不收他树（down=停本树+无戳遗留）。stamp 读不出按来源未知走下面
+            # 原健康闸/收割语义，旧行为兜底不变。
+            proc_root = _process_serve_root(pid)
+            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(ROOT)):
+                print(
+                    f"[sweep] port {port}: pid {pid} 属另一代码树（{proc_root}）——不动"
+                    "（他树进程永不收割；要切换先在对方 down）",
+                    file=sys.stderr,
+                )
+                continue
+            # 健康即非孤儿（2026-09-19 互杀事故）：动手前放宽超时（5s）复检一次，
+            # 活的放行——CPU 风暴下上一轮 serve 探测假死退出留下的健康子代，
+            # 不能在这里被当孤儿误杀。healthy_ok=False（cmd_down 专用）跳过该闸：
+            # down 的拆除契约要求连「pidfile 够不着但健康」的残留一并收掉——
+            # pidfile 被覆写成死 pid 时这是唯一回收路径（评审 P1-1）。
+            if healthy_ok and _relaxed_healthy(port):
+                print(
+                    f"[sweep] port {port}: pid {pid} healthy — left alone"
+                    "（serve 将复用该进程；多 worktree/旧代码疑虑先 down 再起）",
+                    file=sys.stderr,
+                )
+                continue
+            swept.append((port, cmd[:60], pid))
+            if not kill:
+                continue
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    continue
+    return swept
+
+
+def _nvidia_gate() -> tuple[bool, str]:
+    """Windows LLM requires an NVIDIA GPU: driver >= 550, VRAM >= 8GB."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return False, "NVIDIA GPU 未检测到（nvidia-smi 无输出）"
+        line = out.stdout.strip().splitlines()[0]
+        driver, mem = [p.strip() for p in line.split(",")]
+        driver_major = int(driver.split(".")[0])
+        mem_mb = int(float(mem))
+        if driver_major < 550:
+            return False, f"NVIDIA 驱动 {driver} 过低，需要 >= 550"
+        if mem_mb < 8192:
+            return False, f"显存 {mem_mb}MB < 8192MB（建议 >= 8GB）"
+        return True, f"NVIDIA OK driver={driver} vram={mem_mb}MB"
+    except Exception as exc:
+        return False, f"nvidia-smi 不可用: {exc}"
+
+
+def _doctor_gpu_gate(packaged: bool, fails: list[str]) -> None:
+    """Windows/Linux(CUDA) NVIDIA 硬件门禁（独立于虚拟声卡检测）。
+
+    曾误缩进在 `if not va_ok:` 下——装了 VB-CABLE 的 Windows 机器直接跳过 GPU
+    检查（打包 doctor 漏报），而没装虚拟声卡的 mac 反而被拖去跑 nvidia-smi
+    （packaged 模式误报 fail）。d0035c3 原始意图就是挂在 Windows 分支
+    （nvidia-smi 是 Windows LLM=CUDA llama.cpp 的前置，mac 无此检查）。
+    Linux 扩档（2026-09-22，runbook §5⑥）：GPU 节点同为 CUDA llama.cpp 前置，
+    同门同判（nvidia-smi/驱动 ≥550/显存 ≥8GB 同阈值）；mac 仍无此检查。
+    """
+    if os.name != "nt" and not is_linux():
+        return
+    ok, msg = _nvidia_gate()
+    print(f"nvidia gate: {msg}")
+    if packaged and not ok:
+        fails.append(msg)
+
+
+def _import_ok(py: Path, module: str) -> bool:
+    try:
+        r = subprocess.run(
+            [str(py), "-c", f"import {module}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
+    """MiniMax 音色校验探针：settings tts.provider=minimax 时，要求 api_key 非空
+    且至少一个已配音色能在 MiniMax get_voice 下解析。
+
+    - key 缺失 → 静默跳过（凭据永不入码，缺失本身唔算故障——用户可能纯用本地 TTS）。
+    - 无任何已配音色 → 记 warning（设置页漏配，通话会 beep）。
+    - get_voice 可达且列出了音色、但已配音色全部唔喺列表 → 硬 fail（确定性错配）。
+    - 网络不可达/接口异常 → 只提示，唔 fail（doctor 唔依赖外网）。
+    """
+    db = data / "bok_voice.db"
+    if not db.exists():
+        print("minimax tts voice: skipped (no settings db)")
+        return
+    import sqlite3 as _sqlite3
+
+    try:
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT tts_json FROM global_settings WHERE id='global'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"minimax tts voice: skipped (settings db unreadable: {exc})")
+        return
+    if not row:
+        print("minimax tts voice: skipped (settings empty)")
+        return
+    try:
+        tts = json.loads(row[0] or "{}")
+    except Exception:
+        tts = {}
+    provider = str(tts.get("provider") or "").strip().lower()
+    if provider not in ("minimax", "minimax_streaming"):
+        return  # 非 MiniMax 供应商:静默返回
+    api_key = str(tts.get("api_key") or "").strip() or os.environ.get("MINIMAX_API_KEY", "").strip()
+    if not api_key:
+        # 静默跳过:未配 key 唔係结构故障。
+        print("minimax tts voice: skipped (provider=minimax but api_key empty)")
+        return
+    voices = [str(tts.get(k) or "").strip() for k in ("speaker", "speaker_zh", "speaker_cantonese", "speaker_en")]
+    configured = [v for v in voices if v]
+    if not configured:
+        # 按本函数 docstring 的原意记 warning 而非硬 fail:e20ed7a 时代的「全空=静音」
+        # 前提已失效——A 线运行时有默认音色兜底(Cantonese_crisp_news_anchor_vv2,
+        # 三语通用、空音色防 beep),漏配只是设置页待补,不是发布阻断项。
+        msg = (
+            "minimax tts: provider=minimax 且已配 key,"
+            "但 speaker_zh/cantonese/en 全空(运行时走默认音色兜底,设置页可补配)"
+        )
+        print(f"minimax tts voice: warning ({msg})")
+        return
+    region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        base = "https://api.minimax.chat/v1" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1"
+    root = base.split("/v1/")[0]
+    try:
+        status, raw = _http_call(
+            f"{root}/v1/get_voice", "POST",
+            body=json.dumps({"voice_type": "all"}).encode(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout_s=8,
+        )
+        if status != 200:
+            print(f"minimax tts voice: warning (get_voice HTTP {status})")
+            return
+        body = json.loads(raw.decode())
+    except Exception as exc:
+        # 探针够唔到外网(离线 doctor/网络抖动)→ 只提示,唔当 fail。
+        print(f"minimax tts voice: warning (probe unreachable: {exc})")
+        return
+    if str((body.get("base_resp") or {}).get("status_code")) not in ("0", "None"):
+        print(f"minimax tts voice: warning (get_voice base_resp={body.get('base_resp')})")
+        return
+    found: set[str] = set()
+
+    def _collect(node) -> None:
+        if isinstance(node, dict):
+            vid = node.get("voice_id")
+            if isinstance(vid, str):
+                found.add(vid)
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, list):
+            for v in node:
+                _collect(v)
+
+    _collect(body.get("data") or {})
+    if not found:
+        print("minimax tts voice: warning (get_voice returned no voices)")
+        return
+    resolved = [v for v in configured if v in found]
+    if resolved:
+        print(f"minimax tts voice: ok ({', '.join(resolved)}; {len(found)} voices on account)")
+    else:
+        msg = f"minimax tts: 已配音色全部唔喺账号音色列表: {configured}"
+        print(f"minimax tts voice: FAIL ({msg})")
+        fails.append(msg)
+
+
+def _model_present(repo: str) -> bool:
+    """模型在盘判定:app-data 布局优先,mac 再认 lmstudio 布局(~/.lmstudio
+    models,与 cmd_download 的 ensure 同款)——9B settle 只以 lmstudio 布局
+    在盘时,旧版 doctor 恒报 MISSING 而同一台机 :1237 分明在跑(2026-09-17 修)。"""
+    target = model_dir(repo)
+    if target.exists() and any(target.iterdir()):
+        return True
+    if is_mac():
+        lm = _lmstudio_models_dir() / repo
+        return lm.exists() and any(lm.iterdir())
+    return False
+
+
+def _doctor_draft_warning(current: dict[str, str]) -> str:
+    """draft 模型 doctor 警告判定(纯函数,离线可单测):BOK_LLM_DRAFT=1 且
+    draft 模型缺席 → 警告文案;其余(默认关/在盘/表无条目)回 ""。
+
+    警告只进 doctor 打印面,**不进 fails**(不判死、不进 packaged 门禁)——
+    draft 是 opt-in 特性,缺席时 _llm_draft_flags 回 [] 正常起无 draft 服务,
+    功能零损失,不构成「活着但残废」。"""
+    if not _llm_draft_enabled():
+        return ""
+    repo = current.get("llm_draft", "")
+    if not repo or _model_present(repo):
+        return ""
+    return (f"llm draft: BOK_LLM_DRAFT=1 但模型未在盘 ({repo}) — serve 将无 draft "
+            "起 :1235(不 fail);补齐: python tools/bok.py download --only llm_draft")
+
+
+def _swap_used_gb() -> float:
+    """本机 swap 已用 GB（mac=sysctl vm.swapusage / linux=/proc/meminfo；失败=-1）。"""
+    try:
+        if _platform.system() == "Darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=3
+            ).stdout
+            for part in out.split():
+                pass
+            m = re.search(r"used\s*=\s*([\d.]+)M", out)
+            return float(m.group(1)) / 1024.0 if m else -1.0
+        swap = {}
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            if ln.startswith(("SwapTotal", "SwapFree")):
+                k, v = ln.split(":")
+                swap[k] = int(v.strip().split()[0]) / 1048576.0  # kB→GB
+        if "SwapTotal" in swap:
+            return swap["SwapTotal"] - swap.get("SwapFree", 0.0)
+        return -1.0
+    except Exception:
+        return -1.0
+
+
+def _warn_memory_posture(fails: list[str], *, packaged: bool) -> None:
+    """内存姿态检查（2026-10-01 第十五波,call-dc54f542 根修配套）：swap 挤压会把
+    MLX 权重页出→首 token 3-25s（实测 26GB swap 欠账窗口,LLM 轮全灭由罐头垫）。
+    >8GB 警告（语音栈常驻 ~12-18GB 统一内存,桌面应用挤占是主要来源）。"""
+    used = _swap_used_gb()
+    if used < 0:
+        print("memory posture: swap 读取失败(跳过)")
+        return
+    lvl = "ok" if used < 2 else ("warn" if used < 8 else "CRITICAL")
+    print(f"memory posture: swap used {used:.1f}GB [{lvl}]")
+    if used >= 8:
+        msg = (f"swap {used:.0f}GB 挤压——MLX 权重会被页出,首 token 可达 3-25s。"
+               "关桌面大户/重启清欠账后再跑语音。")
+        print(f"  ⚠ {msg}")
+        if packaged:
+            fails.append(msg)
+
+
+# queue_proxy 租约看门狗打点字面量（services/llm-mlx/queue_proxy.py
+# `[llm-queue] lease-timeout forced-reclaim ...`）——doctor 计数面单点，防两侧
+# 字面量漂移假绿（test_doctor_blind_spots 有源级 pin）。
+_LEASE_TIMEOUT_MARKER = "lease-timeout forced-reclaim"
+
+
+def _doctor_queue_proxy_lease_timeouts(log_dir: Path) -> int | None:
+    """llm-proxy.log + settle-proxy.log 的租约看门狗打点合计（None=两份都读不出）。
+
+    队列代理的槽泄漏/断连僵尸回收证据全在这行——doctor 汇总一行数字面
+    （informational：历史累计非当前故障，要判窗看行内时间戳）。
+    settle-proxy(:1238,2026-10-03 I1) 与 :1235 同码同打点，同扫求和。"""
+    total: int | None = None
+    for name in ("llm-proxy.log", "settle-proxy.log"):
+        try:
+            text = (log_dir / name).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        total = (total or 0) + text.count(_LEASE_TIMEOUT_MARKER)
+    return total
+
+
+def cmd_doctor() -> int:
+    """Preflight diagnostics. In packaged mode every check is a hard gate."""
+    key = platform_key()
+    packaged = is_packaged()
+    fails: list[str] = []
+    print(f"platform: {_platform.system()} ({key})")
+    print(f"packaged: {packaged}")
+    print(f"app-data: {app_data_dir()}")
+
+    data = app_data_dir()
+    try:
+        data.mkdir(parents=True, exist_ok=True)
+        probe = data / ".doctor-write"
+        probe.write_text("ok")
+        probe.unlink()
+        print("app-data writable: ok")
+    except Exception as exc:
+        fails.append(f"app-data 不可写: {exc}")
+
+    _warn_memory_posture(fails, packaged=packaged)
+
+    py = sidecar_python("qwen3-asr-sidecar")
+    print(f"runtime python: {py} {'ok' if py.exists() else 'MISSING'}")
+    if not py.exists():
+        fails.append(f"runtime python missing: {py}")
+    else:
+        if is_mac():
+            for mod, p in (("mlx_audio", py), ("mlx_lm", sidecar_python("llm-mlx"))):
+                ok = _import_ok(p, mod)
+                print(f"  import {mod}: {'ok' if ok else 'FAIL'}")
+                if packaged and not ok:
+                    fails.append(f"import {mod} failed")
+        else:
+            for mod in ("qwen_asr", "torch"):
+                ok = _import_ok(py, mod)
+                print(f"  import {mod}: {'ok' if ok else 'FAIL'}")
+                if packaged and not ok:
+                    fails.append(f"import {mod} failed")
+
+    # 本地语义端点判定(LiveKit turn-detector v1-mini):缺失时端点判定退回纯 VAD,
+    # 客户思考停顿更容易被提前截断。粤(cantonese)语无官方校准,阈值回退英文档。
+    # import 名是 livekit.local_inference(命名空间包)——pip 名 livekit-local-inference
+    # 的下划线拼法不是模块路径,v0.2.0 首次 tag 流水线即被此假 MISSING 判死(mac
+    # verify 挂 31 分钟后 FAIL,2026-09-15 实证)。
+    eot_ok = _import_ok(py, "livekit.local_inference") if py.exists() else False
+    print(f"local EOT inference (turn-detector v1-mini): {'ok' if eot_ok else 'MISSING(退回纯 VAD 端点)'}")
+    if packaged and not eot_ok:
+        fails.append("livekit-local-inference missing (EOT 退回纯 VAD)")
+
+    livekit = _embedded_livekit()
+    print(f"livekit-server: {livekit if livekit else 'MISSING'}")
+    if packaged and livekit is None:
+        fails.append("livekit-server missing")
+
+    node = bundled_node()
+    print(f"node: {node if node else 'MISSING'}")
+    if packaged and node is None:
+        fails.append("node missing")
+
+    if not is_mac():
+        llama = bundled_llama()
+        print(f"llama-server: {llama if llama else 'MISSING'}")
+        if packaged and llama is None:
+            fails.append("llama-server missing (Windows 需要 CUDA 版)")
+
+    # 虚拟声卡（B 线同传路由用；A 线通话不需要——报告性不判死：纯 A 线部署/
+    # CI runner 都没有音频设备）。macOS=BlackHole、Windows=VB-CABLE，两平台
+    # 生态不同不能共用；装法见 scripts/setup-virtual-audio.sh|ps1。
+    va_ok = _virtual_audio_present()
+    print(f"virtual audio ({'BlackHole' if is_mac() else 'VB-CABLE'}): "
+          f"{'ok' if va_ok else 'MISSING(B线同传需要;A线可忽略)'}")
+    if not va_ok:
+        print("  (一键安装: scripts/setup-virtual-audio."
+              f"{'sh' if is_mac() else 'ps1'}；装完重启浏览器)")
+    # NVIDIA 门禁独立于虚拟声卡有无（曾误缩进在 if not va_ok 下，见 _doctor_gpu_gate）。
+    _doctor_gpu_gate(packaged=packaged, fails=fails)
+
+    current = MODELS["mac"] if is_mac() else MODELS["windows"]
+    for name, repo in current.items():
+        if not repo:
+            continue
+        present = _model_present(repo)
+        print(f"model {name}: {'ok' if present else 'MISSING'} ({repo})")
+        if not present:
+            # 模型在 CI/首启前允许缺失：由 setup status 门禁管理，不阻塞 bundle 校验。
+            print("  (模型权重不随包，首启向导下载；doctor 不将其视为结构失败)")
+
+    # draft 模型警告(opt-in 特性):只在 BOK_LLM_DRAFT=1 且缺席时出一行——
+    # 不进 fails(不判死),缺席时 serve 自动回落无 draft,见 _doctor_draft_warning。
+    draft_warn = _doctor_draft_warning(current)
+    if draft_warn:
+        print(f"  {draft_warn}")
+
+    for name, port in CORE_PORTS:
+        if name == "llm-raw" and not healthy(port) and not _llm_raw_expected():
+            # queue proxy 关（或非 mac）=mlx 直跑 :1235，:1239 设计缺席——
+            # 标 skipped 不骗 DOWN（同 cmd_status 先例）。
+            print(f"  port {port:<5} ({name}): skipped (queue proxy off)")
+            continue
+        print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")
+    # worker 探针读端点本体(TCP UP 对错码/未 register 假活不可见);缺席只打印
+    # 不判死——打包 doctor 在栈未起时也要能跑。
+    for name, port in _worker_ports():
+        ok, detail = _probe_worker(port)
+        print(f"  worker {port:<5} ({name}): {detail}")
+    # LLM 功能探针:端口 UP ≠ 能用,见 _probe_llm docstring; informational
+    # 不进 fails——冷启动页入(~40s)会假警,不得卡打包门禁。
+    if healthy(1235):
+        llm_ok, llm_detail = _probe_llm()
+        print(f"  llm 功能探针: {llm_detail}")
+        if not llm_ok:
+            print("    (llm 端口 UP 但 prefill 探针失败——通话会顿;重跑 doctor 区分冷启动)")
+    # MT 功能探针(:1236,2026-09-19 同传 2/8 FAIL 实案):mlx_lm 被 repo-id 请求
+    # wedge 时 TCP/健康面全绿、生成永挂——模型在盘才探,informational 不进 fails
+    # (与 :1235 同款冷启动页入假警语义)。显式传在盘路径(忽略 /v1/models 扫描
+    # 结果),prompt 用代表性长句(见 _probe_llm docstring 的 Hy-MT2 短输入坑)。
+    if healthy(1236):
+        mt_model = _mt_llm_model(current)
+        if mt_model and Path(mt_model).exists():
+            mt_ok, mt_detail = _probe_llm(
+                "http://127.0.0.1:1236/v1", model=mt_model,
+                prompt="Translate to English: 你好世界")
+            print(f"  mt 功能探针: {mt_detail}")
+            if not mt_ok:
+                print("    (mt 端口 UP 但 prefill 探针失败——B 线同传会挂死/退主 LLM;"
+                      "重跑 doctor 区分冷启动)")
+        else:
+            # 评审 P2-2:serve 侧「:1236 健康即下发 MT_*」会把非法 model 透传给
+            # worker(interpret 守卫兜底回退主 LLM)——诊断面对同一错配不能零输出。
+            print(f"  mt 功能探针: SKIP (MT 模型缺失/非法: {mt_model[:60] or 'unset'})"
+                  " — B 线已回退主 LLM,查 MT_LLM_MODEL/MODELS 表")
+
+    # a_reply 专线功能探针（:1237，2026-10-02 审计补盲）：P2 翻档后 :1237 是
+    # 通话回复主脑（9B 专线），此前 doctor 只探 :1235/:1236——:1237 wedge 时
+    # 通话回复直接灭而 doctor 全绿。同 _probe_llm max_tokens=1 形状（显式在盘
+    # 模型路径），informational 不进 fails（冷启动页入同 :1235 语义）。
+    if healthy(1237):
+        _ar_model = _settle_llm_model(current)
+        if _ar_model and Path(_ar_model).exists():
+            ar_ok, ar_detail = _probe_llm("http://127.0.0.1:1237/v1", model=_ar_model)
+            print(f"  a_reply 功能探针(:1237): {ar_detail}")
+            if not ar_ok:
+                print("    (a_reply 专线端口 UP 但 prefill 探针失败——通话回复会灭;"
+                      "重跑 doctor 区分冷启动)")
+        else:
+            print(f"  a_reply 功能探针(:1237): SKIP (9B 模型缺失/非法: "
+                  f"{_ar_model[:60] or 'unset'}) — a_reply 回退 :1235")
+
+    # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
+    if healthy(8000):
+        try:
+            body = json.dumps({"account_id": "acc-001", "room_name": "doctor-probe"}).encode()
+            headers = {"Content-Type": "application/json"}
+            # B1/B2 起 /api/token 在 auth-on 下要求身份；机器通道（BOK_CP_TOKEN）
+            # 直通——auth-on 栈必须带（agent worker 同源同款，serve 与 doctor 同 env）。
+            cp_token = os.environ.get("BOK_CP_TOKEN", "").strip()
+            if cp_token:
+                headers["Authorization"] = f"Bearer {cp_token}"
+            status, raw = _http_call(
+                "http://127.0.0.1:8000/api/token", "POST",
+                body=body, headers=headers, timeout_s=8,
+            )
+            if status == 401:
+                if not cp_token:
+                    msg = ("token endpoint HTTP 401（auth-on 栈要求身份——请带 "
+                           "BOK_CP_TOKEN=<serve 同值> 重跑 doctor；agent worker 同理）")
+                else:
+                    msg = "token endpoint HTTP 401（LiveKit 凭据缺失或服务异常）"
+                fails.append(msg)
+                print(f"token endpoint: FAIL ({msg})")
+            elif status != 200:
+                msg = f"token endpoint HTTP {status}（LiveKit 凭据缺失或服务异常）"
+                fails.append(msg)
+                print(f"token endpoint: FAIL ({msg})")
+            else:
+                payload = json.loads(raw.decode())
+                tok = str(payload.get("participantToken") or "")
+                if tok.count(".") == 2:
+                    print("token endpoint: ok (real JWT)")
+                else:
+                    msg = "token endpoint 返回的不是三段式 JWT（疑似旧 sha256 兜底）"
+                    fails.append(msg)
+                    print(f"token endpoint: FAIL ({msg})")
+        except Exception as exc:
+            msg = f"token endpoint 不可达: {exc}"
+            fails.append(msg)
+            print(f"token endpoint: FAIL ({msg})")
+    else:
+        print("token endpoint: skipped (control-plane down)")
+
+    # P3-C 配套检查（2026-09-17 全量 debug；2026-09-21 Item 4 扩判据）：
+    # LIVEKIT_API_SECRET 未配置且（auth-on 或 bind 非回环）时，CP webhook 验签对
+    # 无签名请求一律 401 拒收——LiveKit 崩溃补位（participant_left 重派）会静默
+    # 失效。与 CP 端闸同判据；仅「回环 bind + 双关 auth-off」保留 fail-open（F2
+    # 契约）。纯 informational，不进 packaged 门禁 fails（本地 auth-off 未配
+    # secret 是常态）。
+    _doc_auth_on = os.environ.get("BOK_AUTH_REQUIRED", "").strip() == "1"
+    _doc_lk_secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+    _doc_bind = _cp_bind_host().strip().strip("[]").lower()
+    try:
+        _doc_exposed = not ipaddress.ip_address(_doc_bind).is_loopback
+    except ValueError:
+        _doc_exposed = _doc_bind not in ("", "localhost")
+    if (_doc_auth_on or _doc_exposed) and not _doc_lk_secret:
+        print("webhook secret: MISSING (auth-on/非回环 bind 拒收无签名 webhook)")
+    else:
+        print(f"webhook secret: {'ok' if _doc_lk_secret else 'n/a (回环+auth-off fail-open)'}")
+
+    # MiniMax 云 TTS 探针:provider=minimax 时校验 api_key 非空 + 至少一个已配音色
+    # 能喺账号音色列表解析(key 缺失静默跳过,凭据永不入码)。
+    _doctor_minimax_tts(data, fails)
+
+    # M-11（2026-09-23 修复波#3，task-13 F-M1）云配额健康：本地端口全绿 ≠ 云配额
+    # 活着——2056 风暴期全健康面绿了 11 分钟。近窗(5min)打点聚合,命中进 fails
+    # （「活着但残废」正是 doctor 的管辖面;配额恢复后重跑 doctor 即转绿）。
+    _ph = _provider_health_summary()
+    if _ph is None:
+        print("  cloud-tts 配额面: n/a (provider health scanner unavailable)")
+    else:
+        _ph_fails = _provider_health_fails(_ph)
+        if _ph_fails:
+            for _msg in _ph_fails:
+                fails.append(_msg)
+            print(
+                f"  cloud-tts 配额面: FAIL (近 {_ph['window_s']:.0f}s"
+                f" 2056×{_ph['quota_2056']['count']} 限流×{_ph['rate_limit']['count']})"
+            )
+        else:
+            print(f"  cloud-tts 配额面: ok (近 {_ph['window_s']:.0f}s 无 2056/限流打点)")
+
+    # queue_proxy 租约看门狗计数（2026-10-02 审计补盲）：槽泄漏/断连僵尸的
+    # 代理侧证据（lease-timeout forced-reclaim）此前无人汇总。informational
+    # 不进 fails——历史累计非当前故障；日志缺席静默（dev 非代理拓扑常态）。
+    _lease_n = _doctor_queue_proxy_lease_timeouts(app_data_dir() / "logs")
+    if _lease_n is not None:
+        print(f"doctor: queue_proxy lease_timeouts={_lease_n}")
+
+    if packaged and fails:
+        print("\nPACKAGED DOCTOR FAILED:")
+        for f in fails:
+            print(f"  - {f}")
+        return 1
+    if fails:
+        print("\nwarnings (dev mode, non-blocking):")
+        for f in fails:
+            print(f"  - {f}")
+    print("doctor: OK" if not fails else "doctor: warnings")
+    return 0
+
+
+def _agent_prod_env() -> dict[str, str]:
+    """agent/interp worker 生产环境（与 cmd_serve 同源）。"""
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    env = {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "agent",
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
+    }
+    _apply_judge_env(env, _cur)
+    _apply_bok_passthrough_env(env)
+    # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸 SSLCertVerificationError；
+    # 固化 SSL_CERT_FILE（P5 遗留项），interp 经 _interp_env 的 dict 拷贝继承。
+    return _bake_ssl_cert_file(env, repo_python())
+
+
+def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
+    """B 线 interpreter 追加 env:MT 翻译小模型(:1236,可选增强)。
+
+    MT_LLM_MODEL 必须是后端真认的模型路径(与主 LLM 同一解析);MT_* 只在
+    模型目录在盘或 :1236 已健康(与 _start_mt_llm 同判)时下发——模型缺失/
+    Windows 无 mt 条目时完全不注入,interpret 侧按 env 有无回退主 LLM
+    :1235/DeepSeek,避免 worker 指去死端口整场无声。MINIMAX_* 不在这里注入
+    ——TTS 供应商/音色由 interpret.py 按设置与方向解析。
+    """
+    env = dict(agent_env)
+    # B 线句级提交(2026-09-16 起)与 A 线同档默认开：interpret.py 的
+    # turn_handling 已切 turn_detection=stt（与句级 FINAL 成对，_turn_handling_opts
+    # 单源复用 A 线 _turn_detection_mode_from_env/_endpointing_delays_from_env），
+    # STT 说话中按句 FINAL+EOS 成轮 → 翻译+TTS 与源语音重叠，同传粒度从
+    # 「停嘴整段」提前到句级。kill-switch 配对全自动：TURN_DETECTION≠stt
+    # (空串/vad/EOT) 时 livekit_plugins.sentence_commit_enabled() 自行熄火 +
+    # endpointing min_delay 自动回 ≥0.35 地板，无需动这里。setdefault 不抢用户
+    # 显式 env（QWEN3_ASR_SENTENCE_COMMIT=0 仍是应急逃生口）。
+    env.setdefault("QWEN3_ASR_SENTENCE_COMMIT", "1")
+    # B 线子句级提交(2026-09-16):逗号/顿号/分号也作提交边界——译员按子句跟,
+    # 长句唔使等整句讲完才出译文(「说话时间+生成时间」体感长的主刀)。默认 1,
+    # 显式 0 逃生;A 线 worker 唔带此 env,客服轮次仍按句。
+    env.setdefault("QWEN3_ASR_CLAUSE_COMMIT", "1")
+    # B 线长度触发子句提交(2026-09-17 边说边译档):连续语流无逗号无 0.45s 停顿
+    # 时,滑窗未提交前缀攒够字数(默认 10)且跨窗稳定即就地切句——标点档/停顿档
+    # 的第三事件源,译出声不等人讲完。默认 1,显式 0 逃生;A 线唔带此 env。
+    env.setdefault("QWEN3_ASR_CLAUSE_LEN_COMMIT", "1")
+    # VAD 停嘴门槛(2026-10-02 收编):旧版在此 setdefault 0.35(2026-09-17 B 线
+    # 专属调参,当时 A 线 0.45)——但 env 优先级压过设置面,设置页对 B 线永久
+    # 说谎(改了不生效)。现拆 setdefault:B 线与 A 线同读设置面 vad 段
+    # (interpret _cfg_float / agent _vad_float 同一序:显式 env 部署覆盖 >
+    # 设置页 > 缺省 0.35),显式 env 仍经下方透传白名单下发。当前设置值 0.35=
+    # 拆钉零行为变化;后续调门槛只动设置页,两线同源。
+    # B 线开关透传(_agent_worker_env 是白名单 env,不透传 os.environ——
+    # 不显式带上的话文档里的逃生门在 dev/prod 栈都是死的,2026-09-16 实证)。
+    for _k in (
+        "BOK_INTERP_MT_CONTEXT",
+        # E5 增补 2026-09-21:MT 出口确定性语言校验+单次强化重试总闸。默认开
+        # ——正常轮零额外延迟,仅错语言轮多一次往返;=0 回退旧「出口不校验」档。
+        "BOK_INTERP_MT_LANGGUARD",
+        "BOK_INTERP_REV_AUDIO",
+        "BOK_INTERP_BACKLOG",
+        "BOK_INTERP_MAX_BACKLOG_S",
+        "BOK_INTERP_VOICE_TAGS",
+        # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
+        # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
+        "BOK_INTERP_SRC_TELEMETRY",
+        "BOK_INTERP_SRC_TELEMETRY_S",
+        # B 线订阅自愈 2026-09-30：set_subscribed 官方手动订阅口(对账定案)
+        # ——检测到已发布未订上即重发订阅;=0 回纯观测档。
+        "BOK_INTERP_SRC_HEAL",
+        # B 线 MiniMax 硬失败兜底 2026-09-27：主档云端 MiniMax 失败时 FallbackAdapter
+        # 备档=本地 Qwen3-TTS 是否装备。=0 显式跳过本地 TTS 时不装备，与 bok.py
+        # _local_tts_needed 同键语义；未设=装备，本地 sidecar 未跑时逐请求穿透。
+        "BOK_LOCAL_TTS",
+        "MINIMAX_MODEL",
+        "QWEN3_ASR_SENTENCE_COMMIT",
+        "QWEN3_ASR_CLAUSE_COMMIT",
+        "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS",
+        "QWEN3_ASR_CLAUSE_LEN_COMMIT",
+        "QWEN3_ASR_CLAUSE_LEN_CHARS",
+        "VAD_MIN_SILENCE_DURATION",
+    ):
+        if os.environ.get(_k):
+            env[_k] = os.environ[_k]
+    mt_model = _mt_llm_model(MODELS["mac"] if is_mac() else MODELS["windows"])
+    if (mt_model and Path(mt_model).exists()) or healthy(1236):
+        env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+        if mt_model:
+            env["MT_LLM_MODEL"] = mt_model
+    return env
+
+
+def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
+    """生产常驻单元清单（mac plists 与 Windows Task Scheduler 任务共用同一份定义，
+    含完整 env（SSL_CERT_FILE 烘焙后），防两平台定义漂移）。
+
+    ``with_model_plane=True``（opt-in，`prod install --with-model-plane`，2026-10-02
+    审计）：追加 `bok-model-plane` 单元跑 `bok up --models-only`（RunAtLoad 开机
+    补拉模型面 + KeepAlive 幂等重扫；重启后 :8787/:1235/:1236/:1237/:1239 不再
+    等人工）。默认 False——既有装机渲染逐字节零变化。"""
+    agent_env = _agent_prod_env()
+    livekit_bin = str(_embedded_livekit() or "livekit-server")
+    py = repo_python()
+    # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
+    units = [
+        (
+            "bok-control-plane",
+            [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"],
+            _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()),
+            "Bok 控制面 API",
+        ),
+        ("bok-livekit", [livekit_bin, "--config", str(_livekit_config_path())], {}, "实时语音信令/媒体"),
+        ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
+        (
+            "bok-interp-fwd",
+            [str(py), "-m", "agent_runtime.interpret"],
+            {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"},
+            "B 线同传 fwd",
+        ),
+        (
+            "bok-interp-rev",
+            [str(py), "-m", "agent_runtime.interpret"],
+            {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"},
+            "B 线同传 rev",
+        ),
+    ]
+    if with_model_plane:
+        # 模型面常驻（opt-in）：`bok up --models-only` 幂等（health 门防叠进程）
+        # ——RunAtLoad 开机补拉；KeepAlive 让 launchd 周期重扫（进程退出即被
+        # 10s 节流重启），模型面掉线不等人。env 用 agent 面（BOK_CP_TOKEN 等
+        # passthrough 在内，download 与 CP 探测同源）。
+        units.append(
+            (
+                "bok-model-plane",
+                [str(py), str(ROOT / "tools" / "bok.py"), "up", "--models-only"],  # G2 W①:同上
+                agent_env,
+                "模型面常驻（asr/llm/mt/settle/tts；bok up --models-only 幂等重扫）",
+            )
+        )
+    if _realtime_demo_enabled():
+        # 演示档常驻单元（opt-in，同 _worker_specs 门）：BOK_QWEN_REALTIME=1 才
+        # 生成 launchd/schtasks/systemd 单元——健康面 WORKER_PORTS 不收 :8084
+        # （默认栈不跑演示档，常列会令 prod status 对未启用部署恒 DEGRADED）。
+        units.append(
+            (
+                "bok-realtime",
+                [str(py), "-m", "agent_runtime.realtime_demo"],
+                {**agent_env, "BOK_SERVICE": "realtime-demo"},
+                "云端 Realtime S2S 演示档",
+            )
+        )
+    return units
+
+
+def _systemd_staging_dir(explicit: str = "") -> Path:
+    """systemd 单元暂存目录解析（2026-09-24 appliance 档）：旗标 > env > 缺省
+    `<repo>/release-artifacts/systemd/`（与 build_node_pkg/build_runtime_pkg 的
+    产物目录同根，不打包脚本排除面之外另立家）。
+
+    防线：解析结果落在 /etc 下（含 /etc/systemd/system）直接拒——本工具是
+    generate-not-execute 姿态，装载归操作员 root；staging 指到系统目录等于
+    变相代写。注意 /etc 在 macOS 是 /private/etc 的符号链接，两侧都要 resolve
+    后再比，守卫才在双平台都成立。"""
+    raw = (explicit or os.environ.get("BOK_SYSTEMD_STAGING_DIR") or "").strip()
+    path = Path(raw).expanduser() if raw else ROOT / "release-artifacts" / "systemd"
+    resolved = path.resolve()
+    etc = Path("/etc").resolve()
+    if resolved == etc or etc in resolved.parents:
+        raise SystemExit(
+            f"[prod] staging 目录不得落在 /etc 下（{resolved}）——装载归操作员 root，"
+            "本工具只生成（换个目录或用 --staging-dir/BOK_SYSTEMD_STAGING_DIR 覆盖）")
+    return path
+
+
+def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = None,
+                     open_firewall: bool = False, staging_dir: str = "",
+                     with_model_plane: bool = False) -> int:
+    """生成生产常驻单元（mac launchd plist / Windows Task Scheduler / Linux
+    systemd 暂存），不启动。
+
+    dev 栈用 `bok.py serve`（前台 + run/*.pid）；生产档把常驻进程交给 OS 守护
+    （launchd KeepAlive / schtasks RestartOnFailure / systemd Restart=always），
+    补上桌面形态天然缺的 watchdog。首次需配 livekit.yaml 生产键（services/livekit-server/livekit.yaml）。
+
+    Windows（无头部署，tools/schtasks_units.py 单点生成）：
+      - 缺省真注册 5 个 stack 任务（单机全栈模式；需要管理员 PowerShell）；
+      - `--node-agent [node_agent 参数...]` 改注册单个 bok-node-agent 任务
+        （节点包拓扑：node_agent 内部经 cmd_up 拉全栈，心跳/凭据参数原样透传），
+        例：bok.py prod install --node-agent --cp-url http://cp:8000 --license-key bokn_xxx；
+      - `--open-firewall` 执行 netsh 放行（:8000/:7880 TCP+UDP，需管理员；
+        缺省只打印计划）。
+    Linux（Ubuntu appliance 全栈，tools/systemd_units.py 单点生成）：
+      - 只生成到暂存目录（--staging-dir / BOK_SYSTEMD_STAGING_DIR 可覆盖，缺省
+        <repo>/release-artifacts/systemd/），**永不写 /etc/systemd/system**；
+      - 输出打印 cp + daemon-reload + enable --now 逐字装载指引（root 执行）；
+      - /etc/bok/bok.env 由操作员维护（示例文本随输出打印，本工具不代写）。
+    --with-model-plane（opt-in，默认 OFF；mac/Windows 档）：追加
+      `bok-model-plane` 常驻单元跑 `bok up --models-only`——重启后模型面
+      （:8787/:1235/:1236/:1237/:1239）由 launchd/schtasks 补拉，不再等人工。
+      默认不传 = 既有装机渲染逐字节零变化；Linux systemd 档暂不接（单元面
+      由 systemd_units 模块单点，另窗收编）。
+    """
+    if is_mac() and node_agent:
+        print("[prod] --node-agent 是 Windows 节点拓扑模式；mac 全栈机用标准 5 单元安装",
+              file=sys.stderr)
+        return 2
+
+    if is_mac():
+        unit_dir = app_data_dir() / "units"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = app_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if open_firewall:
+            print("[prod] --open-firewall 是 Windows(netsh) 专用；mac 走系统防火墙应用签名规则，忽略")
+        for name, args, env, comment in _prod_units(with_model_plane=with_model_plane):
+            label = f"com.bokvoice.{name}"
+            arg_xml = "\n".join(f"    <string>{a}</string>" for a in args)
+            env_xml = "\n".join(f"      <key>{k}</key>\n      <string>{v}</string>" for k, v in sorted(env.items()))
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0">\n<dict>\n'
+                f"  <key>Label</key><string>{label}</string>\n"
+                "  <key>ProgramArguments</key>\n  <array>\n" + arg_xml + "\n  </array>\n"
+                f"  <key>WorkingDirectory</key><string>{ROOT}</string>\n"
+                "  <key>EnvironmentVariables</key>\n  <dict>\n" + env_xml + "\n  </dict>\n"
+                "  <key>RunAtLoad</key><true/>\n"
+                "  <key>KeepAlive</key><true/>\n"
+                f"  <key>StandardOutPath</key><string>{log_dir / (name + '.log')}</string>\n"
+                f"  <key>StandardErrorPath</key><string>{log_dir / (name + '.err.log')}</string>\n"
+                "</dict>\n</plist>\n"
+            )
+            out = unit_dir / f"{label}.plist"
+            out.write_text(plist)
+            print(f"generated {out.relative_to(app_data_dir())}  ({comment})")
+        print(f"\nunits 目录: {unit_dir}")
+        print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
+        print(
+            "mac 卸载:                      bok.py prod uninstall"
+            "（或 launchctl bootout gui/$(id -u)/com.bokvoice.bok-control-plane 等）"
+        )
+        print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+        return 0
+
+    if is_linux() and os.name != "nt":
+        # Linux（Ubuntu appliance 全栈，2026-09-24 重构）：systemd 单元只**生成**
+        # 到暂存目录（generate-not-execute，同 schtasks 档姿态且更保守——连注册
+        # 动作都不代跑）：/etc/systemd/system 与 /etc/bok/bok.env 永不代写，装载
+        # 归操作员 root（cp → daemon-reload → enable --now，逐字指引见输出）。
+        # Restart=always/RestartSec=3 语义边界见 systemd_units 模块 docstring。
+        # `os.name != "nt"` 与 is_linux() 双条件：test_prod_windows 以
+        # os.name="nt" 打桩模拟 Windows，而 CI 跑在 ubuntu-latest（is_linux 真）——
+        # 只看 is_linux 会在 Linux 上把模拟 Windows 的用例截胡（容器实测 6 红）。
+        import systemd_units as _sd
+
+        staging = _systemd_staging_dir(staging_dir)
+        if node_agent:
+            node_args = list(node_args or [])
+            if "--cp-url" not in node_args:
+                print("[prod] --node-agent 需要 node_agent 参数（--cp-url 必填）："
+                      "bok.py prod install --node-agent --cp-url <url> "
+                      "[--license-key KEY] [--ui-dir DIR] ...",
+                      file=sys.stderr)
+                return 2
+            rendered = [_sd.render_node_agent_unit(str(ROOT), str(repo_python()), node_args)]
+        else:
+            rendered = _sd.render_all_units(str(ROOT), str(repo_python()),
+                                            cp_bind_host=_cp_bind_host())
+        staging.mkdir(parents=True, exist_ok=True)
+        for fname, text in rendered:
+            (staging / fname).write_text(text, encoding="utf-8")
+            print(f"generated {staging / fname}")
+        print(f"\nstaging 目录: {staging}")
+        concrete = [n for n, _t in rendered if n != _sd.SIDECAR_UNIT]
+        print("装载（root 逐字执行；先备好 /etc/bok/bok.env——缺文件单元拒绝启动）：")
+        print(f"  cp {staging}/*.service /etc/systemd/system/")
+        print("  systemctl daemon-reload")
+        print("  systemctl enable --now " + " ".join(concrete))
+        print("sidecar 模板 bok-sidecar@.service：按文件内注释把对应实例（asr :8787 /")
+        print("  tts :8788 / embed :8789）的 ExecStart 替换占位行后再")
+        print("  systemctl enable --now bok-sidecar@asr.service（tts/embed 同式）")
+        print("日志面: journalctl -u bok-cp.service -f（各单元同式）")
+        print("env 文件 /etc/bok/bok.env 示例（本工具不代写；照抄建文件后按需增删）：")
+        print(_sd.env_file_sample(str(ROOT)), end="")
+        print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+        return 0
+
+    # Windows 前置的 app-data 目录（units 存 xml 副本 / logs 给 cmd 前缀链重定向；
+    # mac 分支已各自创建，Linux 暂存档不落 app-data）。
+    unit_dir = app_data_dir() / "units"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = app_data_dir() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Windows：Task Scheduler 真注册（BootTrigger=开机自起 + RestartOnFailure=
+    # 崩溃拉回 + SYSTEM principal，与 mac plists 同信息量；XML/argv 组装见
+    # tools/schtasks_units.py，元素顺序/env 前缀链约束见其模块 docstring）。
+    import schtasks_units as _sch
+
+    if node_agent:
+        node_args = list(node_args or [])
+        if "--cp-url" not in node_args:
+            print("[prod] --node-agent 需要 node_agent 参数（--cp-url 必填）："
+                  "bok.py prod install --node-agent --cp-url <url> "
+                  "[--node-token TOK | --license-key KEY] [--ui-dir DIR] ...",
+                  file=sys.stderr)
+            return 2
+        py = repo_python()
+        units = [(
+            "node-agent",
+            [str(py), str(ROOT / "tools" / "node_agent.py"), *node_args],
+            {"PYTHONUNBUFFERED": "1"},
+            "薄节点守护（cmd_up 拉全栈 + 心跳；参数原样透传 node_agent）",
+        )]
+    else:
+        units = _prod_units(with_model_plane=with_model_plane)
+
+    comspec = os.environ.get("ComSpec", "cmd.exe")
+    install_ok = True
+    for name, args, env, comment in units:
+        tname = _sch.task_name(name)
+        arguments = _sch.build_cmd_arguments(env, args, str(ROOT),
+                                             log_dir / f"{name}.log",
+                                             log_dir / f"{name}.err.log")
+        xml = _sch.build_unit_task_xml(name, comspec, arguments, str(ROOT))
+        xml_path = _sch.write_task_xml(unit_dir / f"{tname}.xml", xml)
+        r = _sch.run_schtasks(_sch.schtasks_create_argv(tname, xml_path))
+        if r.returncode == 0:
+            print(f"registered {tname}  ({comment})")
+            print(f"  xml: {xml_path.relative_to(app_data_dir())}")
+            print(f"  action: {comspec} {arguments}")
+        else:
+            install_ok = False
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            print(f"FAILED {tname}: schtasks rc={r.returncode} {detail}"
+                  "（需要管理员 PowerShell？）", file=sys.stderr)
+
+    fw_rc = _sch.apply_firewall_rules(open_firewall)
+    print(f"\nunits 目录: {unit_dir}")
+    print("windows 查询: schtasks /query /tn bok-control-plane 等（开机自起+RestartOnFailure 拉回）")
+    print("windows 卸载: bok.py prod uninstall")
+    print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+    return 0 if (install_ok and fw_rc == 0) else 1
+
+
+def cmd_prod_uninstall(staging_dir: str = "") -> int:
+    """卸载生产常驻单元（mac launchd bootout+删 plist / Windows schtasks /delete /
+    Linux 清暂存副本）。
+
+    幂等：未安装的单元记 informational 不算失败；真失败（权限/删除被拒）返回 1。
+    Windows 卸载面含 bok-node-agent（装过 --node-agent 的机器一把清）。
+    Windows 停栈顺序（schtasks /end 只杀 Exec 动作进程 cmd.exe，链式子进程
+    存活——probe_windows_lifecycle B5b 断言）：/end 全部 → 按 pidfile 补杀
+    幸存子进程（cmd_down，ours-only）→ /delete 全部。
+    Linux（2026-09-24 暂存档）：只删暂存目录 bok-*.service 副本 + 兼容清扫
+    2026-09-20 档落在 app-data/units 的旧副本；系统面（/etc/systemd/system +
+    enable 状态）归操作员 root 停用删除（逐字指引见输出，本函数零特权动作）。
+    """
+    unit_dir = app_data_dir() / "units"
+    failures = 0
+    if is_mac():
+        names = [u[0] for u in _prod_units()]
+        # opt-in 模型面单元（--with-model-plane，2026-10-02）：默认清单不含它——
+        # 装过的机器卸载不能残留（bootout+删 plist）；未装=plist 不在,静默
+        # （零输出变化，不骗 not installed）。
+        if (unit_dir / "com.bokvoice.bok-model-plane.plist").exists():
+            names.append("bok-model-plane")
+        for name in names:
+            label = f"com.bokvoice.{name}"
+            plist = unit_dir / f"{label}.plist"
+            if not plist.exists():
+                print(f"[uninstall] {label}: not installed")
+                continue
+            r = subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                print(f"[uninstall] {label}: bootout ok")
+            else:
+                # 未加载（No such process）是幂等卸载的常态，不算失败。
+                tail = ((r.stderr or "").strip().splitlines() or [""])[0][:120]
+                print(f"[uninstall] {label}: bootout rc={r.returncode} {tail}")
+            plist.unlink(missing_ok=True)
+            print(f"[uninstall] removed {plist.relative_to(app_data_dir())}")
+        return 0
+
+    if is_linux() and os.name != "nt":
+        # Linux（2026-09-24 暂存目录档）：删暂存 bok-*.service 副本 + 兼容清扫
+        # 2026-09-20 档落在 app-data/units 的旧副本；系统面需操作员 root 停用
+        # 删除后 daemon-reload（本函数不代跑特权命令，双条件同 install 的
+        # 「模拟 Windows 用例不被 Linux 截胡」判例）。
+        staging = _systemd_staging_dir(staging_dir)
+        for path in sorted(staging.glob("bok-*.service")):
+            path.unlink()
+            print(f"[uninstall] removed {path}")
+        for path in sorted(unit_dir.glob("bok-*.service")):
+            path.unlink()
+            print(f"[uninstall] removed legacy {path}")
+        print("[uninstall] 系统面（/etc/systemd/system）需以 root 逐字执行：")
+        print("  systemctl disable --now bok-cp.service bok-agent-worker.service"
+              " bok-interp-fwd.service bok-interp-rev.service bok-node-agent.service")
+        print("  rm -f /etc/systemd/system/bok-*.service")
+        print("  systemctl daemon-reload")
+        return 0
+
+    import schtasks_units as _sch
+
+    names = [u[0] for u in _prod_units()] + ["node-agent"]
+    # opt-in 模型面任务（--with-model-plane，2026-10-02）：装过才补进卸载面
+    # （xml 副本是「装过」的廉价判据；默认 OFF 的既有装机零输出变化）。
+    if (unit_dir / f"{_sch.task_name('bok-model-plane')}.xml").exists():
+        names.append("bok-model-plane")
+    # /end 只终止任务实例的 Exec 动作进程（本仓恒为 cmd.exe），cmd_up 拉起的
+    # 链式子进程（ASR/TTS/LLM/LiveKit/CP/worker）会存活——scripts/probes/
+    # probe_windows_lifecycle.py B5b 在真 Windows 上断言这一点。顺序：
+    # ①逐任务 /end（停动作进程）→ ②按 pidfile 精确清幸存子进程（ours-only；
+    # 勿按镜像名杀——python.exe/livekit-server.exe 是共享镜像，会误杀无关
+    # 进程；无 pidfile 的任务树成员如 node_agent 自身无法廉价归因，见 WARNING
+    # 尾注）→ ③/delete /f 卸载注册。
+    for name in names:
+        _sch.run_schtasks(_sch.schtasks_end_argv(_sch.task_name(name)))
+    alive = [pf for pf in sorted((app_data_dir() / "run").glob("*.pid"))
+             if _pid_alive(pf)]
+    if alive:
+        stems = ", ".join(pf.stem for pf in alive)
+        print(f"[uninstall] WARNING: schtasks /end 杀不到链式子进程，仍在运行: {stems}"
+              " —— best-effort taskkill /T /F（按 pidfile，逐树收割）", file=sys.stderr)
+        cmd_down()
+        print("[uninstall] note: 无 pidfile 记录的任务树成员（如 node_agent 自身）"
+              "若仍存活，请按 PID 手工 taskkill——无法按镜像名安全归因")
+    for name in names:
+        tname = _sch.task_name(name)
+        # /delete /f 卸载注册（未安装 rc!=0 + "does not exist" 属幂等常态）。
+        r = _sch.run_schtasks(_sch.schtasks_delete_argv(tname))
+        combined = ((r.stdout or "") + (r.stderr or "")).lower()
+        if r.returncode == 0:
+            print(f"[uninstall] {tname}: deleted")
+        elif "does not exist" in combined:
+            print(f"[uninstall] {tname}: not installed")
+        else:
+            failures += 1
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            print(f"[uninstall] FAILED {tname}: schtasks rc={r.returncode} {detail}",
+                  file=sys.stderr)
+        xml_path = unit_dir / f"{tname}.xml"
+        if xml_path.exists():
+            xml_path.unlink()
+            print(f"[uninstall] removed {xml_path.relative_to(app_data_dir())}")
+    return 1 if failures else 0
+
+
+def cmd_prod_status() -> int:
+    """生产健康面汇总:官方健康端点(livekit GET /、worker GET :port/worker)+ sidecar /health。
+
+    worker 三件(8081-8083)是 _prod_units 的常驻单元,失联必须 DEGRADED——
+    旧版只探 :8081,B 线 fwd/rev 双 worker 静默缺失健康面照绿(2026-09-17 补盲)。
+    可选增强(mt/settle)起了才纳入,缺模型环境不算降级；llm-raw(:1239)同属可选线
+    ——queue proxy 关/整栈未起不点名,代理活而 1239 死=半瘫必须点名（见
+    _llm_raw_status_check_expected）。
+    """
+    print("bok prod status:")
+    # 可选线 :1239（llm-raw）「预期在场才查」：queue proxy 拓扑（mac+开）下
+    # mlx 的真实监听口——代理活着而它死了，生成会全灭而旧四表全绿。
+    checks = [
+        (name, port, path) for (name, port, path) in PROD_HTTP_CHECKS
+        if port != 1239 or _llm_raw_status_check_expected()
+    ]
+    if healthy(1236):
+        checks.append(("mt-llm", 1236, "/v1/models"))
+    if healthy(1237):
+        checks.append(("settle-llm", 1237, "/v1/models"))
+    if healthy(1238):
+        # :1237 前门闸（2026-10-03 I1）：「起了才查」同款——queue 关的栈没有它。
+        checks.append(("settle-proxy", 1238, "/__llmqueue/stats"))
+    if healthy(8789):
+        # W1b embedding sidecar:/health 本体答 ready(未就绪答 ready=false 但
+        # 200——下面 "Not Ready" 同款行检不出,暖机窗极短可接受;DOWN 才是缺席)。
+        checks.append(("embed", 8789, "/health"))
+    if healthy(8791):
+        # Laya 决策 sidecar:同款「起了才查」——sidecar 未起的部署(模型/venv
+        # 缺席或 BOK_LAYA_JUDGE=0)不进表,健康面不假 DEGRADED;/health ok=false
+        # (模型加载失败)仍是本体作答算活,真 DOWN 才缺席。
+        checks.append(("laya", 8791, "/health"))
+    all_ok = True
+    for name, port, path in checks:
+        try:
+            r = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3)
+            body = r.read(200).decode()[:200]
+            ok = (r.status == 200 or r.status == 426) and "Not Ready" not in body
+            print(f"  {name:<13} :{port}  {'ok' if ok else 'NON-200'}")
+            all_ok = all_ok and ok
+        except urllib.error.HTTPError as exc:
+            # 426 Upgrade Required = WS 服务本体作答（非升级请求一律 426,
+            # urlopen 以 HTTPError 抛出）——比 TCP 探活证据更强,视为活。
+            if exc.code == 426:
+                print(f"  {name:<13} :{port}  ok (ws worker, 426 upgrade)")
+            else:
+                print(f"  {name:<13} :{port}  HTTP {exc.code}")
+                all_ok = False
+        except Exception as exc:
+            print(f"  {name:<13} :{port}  DOWN ({exc})")
+            all_ok = False
+    for name, port in _worker_ports():
+        ok, detail = _probe_worker(port)
+        print(f"  {name:<13} :{port}  {detail}")
+        all_ok = all_ok and ok
+    print("prod: OK" if all_ok else "prod: DEGRADED")
+    return 0 if all_ok else 1
+
+
+def cmd_prod(cmd: str, node_agent: bool = False,
+             node_args: list[str] | None = None,
+             open_firewall: bool = False, staging_dir: str = "",
+             with_model_plane: bool = False) -> int:
+    if cmd == "install":
+        return cmd_prod_install(node_agent=node_agent, node_args=node_args,
+                                open_firewall=open_firewall,
+                                staging_dir=staging_dir,
+                                with_model_plane=with_model_plane)
+    if cmd == "uninstall":
+        return cmd_prod_uninstall(staging_dir=staging_dir)
+    return cmd_prod_status()
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("catalog", "manifest", "status", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
+        sub.add_parser(name)
+    p_up = sub.add_parser("up", help="拉起全栈；--models-only=只拉模型面（跳过通话面）")
+    p_up.add_argument("--models-only", action="store_true",
+                      help="只起模型面（asr/llm/mt/settle/tts+proxy；云 TTS 档跳过 :8788），"
+                           "不拉 LiveKit/worker/monitor（prod 常驻单元 bok-model-plane 用）")
+    p_dl = sub.add_parser("download", help="下载平台模型表（--only 子集=装机选型）")
+    p_dl.add_argument("--only", nargs="*", default=None,
+                      help="只下载指定模型键（asr tts_preset tts_clone llm llm_4b mt settle embedding laya）")
+    sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
+    p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
+    p_prod.add_argument("action", nargs="?", default="status",
+                        choices=["install", "status", "uninstall"])
+    p_prod.add_argument("--node-agent", action="store_true",
+                        help="[install;Windows] 注册单个 node_agent 任务，其余参数原样透传")
+    p_prod.add_argument("--open-firewall", action="store_true",
+                        help="[install;Windows] 执行 netsh 防火墙放行(需管理员；缺省只打印计划)")
+    p_prod.add_argument("--staging-dir", default="",
+                        help="[install/uninstall;Linux] systemd 单元暂存目录"
+                             "（缺省 <repo>/release-artifacts/systemd；"
+                             "BOK_SYSTEMD_STAGING_DIR 同义，旗标优先）")
+    p_prod.add_argument("--with-model-plane", action="store_true",
+                        help="[install;mac/Windows] 追加 opt-in 常驻单元 "
+                             "bok-model-plane（bok up --models-only，重启补拉模型面；"
+                             "缺省 OFF=既有装机零变化）")
+    p_setup = sub.add_parser("setup", help="First-run model readiness / download")
+    p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
+    # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
+    args, extra = p.parse_known_args(argv)
+    args.extra = list(extra)
+    return args
+
+
+def cmd_tts_pregen(extra: list[str] | None = None) -> int:
+    """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
+
+    额外参数原样透传给 scripts/runtime/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
+    子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
+    MiniMax WSS 无此必炸。
+    """
+    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, repo_python())
+    proc = subprocess.run(
+        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "pregen_tts.py"), *(extra or [])],
+        env={**os.environ, **env},
+    )
+    return proc.returncode
+
+
+def cmd_tts_mine(extra: list[str] | None = None) -> int:
+    """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/runtime/mine_qa.py。
+
+    --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
+    `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
+    """
+    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, repo_python())
+    proc = subprocess.run(
+        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "mine_qa.py"), *(extra or [])],
+        env={**os.environ, **env},
+    )
+    return proc.returncode
+
+
+# clean-testdata 的 CP base（模块级读 env：进程启动时即定值；同时把「env 读取」
+# 移出函数作用域（路径正则/鉴权头在闭包外构造，函数内只留白名单闸+_http_call，
+# 静态污点分析可完整看见净化链）
+_CP_CLEAN_BASE_URL = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
+
+
+def cmd_clean_testdata() -> int:
+    """清理历史测试数据(QA B3/B7,2026-09-09):对象下拉曾被 300+ E2E/soak 残留灌满。
+
+    默认 dry-run 只打印;`--apply` 才真删(经 CP API,审计可追溯)。范围:
+    ①对象 display_name 匹配测试前缀;②人设同名同公司重复(保留最早)。
+    """
+    import re as _re
+
+    base = _CP_CLEAN_BASE_URL
+    apply_mode = "--apply" in sys.argv
+    token = os.environ.get("BOK_CP_TOKEN", "")
+    # 数据驱动路径白名单：删除目标的 id 来自 CP 响应（o['id']），只认
+    # objects/personas 资源 + uuid hex 段，其余（含 ../、斜杠夹带）一律拒发。
+    _cp_path_re = _re.compile(r"^/api/(objects|personas)(/[A-Za-z0-9._-]{1,64})?$")
+    _auth_headers = {"Authorization": f"Bearer {token}"} if token else None
+
+    def _get(path: str):
+        if not _cp_path_re.match(path):
+            raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
+        status, raw = _http_call(f"{base}{path}", headers=_auth_headers, timeout_s=15)
+        if status != 200:
+            raise RuntimeError(f"CP GET {path} -> HTTP {status}")
+        return json.loads(raw.decode())
+
+    def _delete(path: str) -> None:
+        if not _cp_path_re.match(path):
+            raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
+        status, _raw = _http_call(f"{base}{path}", "DELETE", headers=_auth_headers, timeout_s=15)
+        if status not in (200, 204):
+            raise RuntimeError(f"CP DELETE {path} -> HTTP {status}")
+
+    pat = _re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
+    objs = _get("/api/objects")
+    stale = [o for o in objs if pat.match(str(o.get("display_name") or ""))]
+    print(f"objects: total={len(objs)} stale-matched={len(stale)}")
+    for o in stale:
+        print(f"  - {o['id']} {o.get('display_name')}")
+        if apply_mode:
+            _delete(f"/api/objects/{o['id']}")
+
+    seen: set[tuple[str, str]] = set()
+    dupes = []
+    for p_ in _get("/api/personas"):
+        k = (str(p_.get("name") or ""), str(p_.get("company") or ""))
+        if k in seen:
+            dupes.append(p_)
+        else:
+            seen.add(k)
+    print(f"personas: duplicate-matched={len(dupes)}")
+    for p_ in dupes:
+        print(f"  - {p_['id']} {p_.get('name')} / {p_.get('company')}")
+        if apply_mode:
+            _delete(f"/api/personas/{p_['id']}")
+
+    if not apply_mode:
+        print("dry-run: 未删除任何数据。加 --apply 执行。")
+    else:
+        print("apply done。")
+    return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.cmd == "setup":
+        return cmd_setup(args.action)
+    if args.cmd == "prod":
+        return cmd_prod(args.action,
+                        node_agent=getattr(args, "node_agent", False),
+                        node_args=getattr(args, "extra", None),
+                        open_firewall=getattr(args, "open_firewall", False),
+                        staging_dir=getattr(args, "staging_dir", ""),
+                        with_model_plane=getattr(args, "with_model_plane", False))
+    if args.cmd == "tts-pregen":
+        return cmd_tts_pregen(getattr(args, "extra", None))
+    if args.cmd == "clean-testdata":
+        return cmd_clean_testdata()
+    if args.cmd == "tts-mine":
+        return cmd_tts_mine(getattr(args, "extra", None))
+    if args.cmd == "monitor":
+        return cmd_monitor()
+    if args.cmd == "download":
+        only = set(getattr(args, "only", None) or []) or None
+        return cmd_download(only=only)
+    if args.cmd == "up":
+        return cmd_up(models_only=bool(getattr(args, "models_only", False)))
+    return {"catalog": cmd_catalog, "manifest": cmd_manifest, "status": cmd_status,
+            "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
