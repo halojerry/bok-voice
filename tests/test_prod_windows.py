@@ -94,7 +94,7 @@ def test_kill_tree_windows_builds_taskkill_command(monkeypatch) -> None:
 
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    bok._kill_proc_tree(12345)  # 不应抛
+    bok.proc._kill_proc_tree(12345)  # 不应抛
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv == ["taskkill", "/PID", "12345", "/T", "/F"]
@@ -109,7 +109,7 @@ def test_kill_tree_windows_not_found_is_silent(monkeypatch) -> None:
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: subprocess.CompletedProcess(argv, 128, stdout="", stderr="ERROR: process not found"))
-    bok._kill_proc_tree(99)  # 不应抛
+    bok.proc._kill_proc_tree(99)  # 不应抛
 
 
 def test_kill_tree_windows_failure_surfaced(monkeypatch) -> None:
@@ -117,8 +117,8 @@ def test_kill_tree_windows_failure_surfaced(monkeypatch) -> None:
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access is denied."))
-    with pytest.raises(bok._KillTreeError) as ei:
-        bok._kill_proc_tree(99)
+    with pytest.raises(bok.proc._KillTreeError) as ei:
+        bok.proc._kill_proc_tree(99)
     assert "taskkill" in str(ei.value) and "rc=1" in str(ei.value)
 
 
@@ -129,8 +129,8 @@ def test_kill_tree_windows_timeout_surfaced(monkeypatch) -> None:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    with pytest.raises(bok._KillTreeError):
-        bok._kill_proc_tree(99)
+    with pytest.raises(bok.proc._KillTreeError):
+        bok.proc._kill_proc_tree(99)
 
 
 def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
@@ -142,7 +142,7 @@ def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
     calls: list[tuple] = []
     monkeypatch.setattr(bok.os, "getpgid", lambda pid: 4242)
     monkeypatch.setattr(bok.os, "killpg", lambda pgid, sig: calls.append(("killpg", pgid, sig)))
-    bok._kill_proc_tree(123)
+    bok.proc._kill_proc_tree(123)
     assert calls == [("killpg", 4242, signal.SIGTERM)]
 
     def _raise(pgid, sig):
@@ -151,7 +151,7 @@ def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
     calls.clear()
     monkeypatch.setattr(bok.os, "killpg", _raise)
     monkeypatch.setattr(bok.os, "kill", lambda pid, sig: calls.append(("kill", pid, sig)))
-    bok._kill_proc_tree(123)
+    bok.proc._kill_proc_tree(123)
     assert calls == [("kill", 123, signal.SIGTERM)]
 
 
@@ -231,7 +231,7 @@ def test_sweep_orphan_workers_windows_is_documented_skip(monkeypatch) -> None:
 
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", explode)
-    assert bok._sweep_orphan_workers() == []
+    assert bok.proc._sweep_orphan_workers() == []
 
 
 # ---------------- ④ schtasks_units：XML 契约 ----------------
@@ -399,7 +399,7 @@ def test_doctor_gpu_gate_skipped_on_mac(monkeypatch, capsys) -> None:
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "x"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert calls == []  # mac 无 nvidia-smi：门禁不适用
     assert fails == []
     assert "nvidia gate" not in capsys.readouterr().out
@@ -412,11 +412,11 @@ def test_doctor_gpu_gate_runs_on_linux(monkeypatch, capsys) -> None:
     monkeypatch.setattr(bok.os, "name", "posix")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]
     assert fails == []  # dev 只提示
     assert "nvidia gate: NVIDIA OK" in capsys.readouterr().out
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert calls == [1, 1] and fails == []  # gate 过线=packaged 也不 fail
 
 
@@ -426,7 +426,7 @@ def test_doctor_gpu_gate_runs_regardless_of_virtual_audio(monkeypatch, capsys) -
     monkeypatch.setattr(bok.os, "name", "nt")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]  # 门禁被评估（虚拟声卡状态无关——本函数根本不读它）
     assert fails == []
     assert "nvidia gate: NVIDIA OK" in capsys.readouterr().out
@@ -436,9 +436,9 @@ def test_doctor_gpu_gate_packaged_failure_fails_doctor(monkeypatch) -> None:
     monkeypatch.setattr(bok.os, "name", "nt")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: (False, "NVIDIA GPU 未检测到"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert fails == []  # dev 模式只提示
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert fails == ["NVIDIA GPU 未检测到"]  # packaged 硬失败
 
 
@@ -459,7 +459,7 @@ def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) 
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
-    rc = bok.cmd_prod_install()
+    rc = bok.prod.cmd_prod_install()
     assert rc == 0
     creates = [c for c in calls if c[1] == "/create"]
     assert [c[3] for c in creates] == [
@@ -483,7 +483,7 @@ def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tm
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     node_args = ["--cp-url", "http://127.0.0.1:8000", "--node-token", "tok",
                  "--ui-dir", "C:\\a b\\out"]
-    rc = bok.cmd_prod_install(node_agent=True, node_args=node_args)
+    rc = bok.prod.cmd_prod_install(node_agent=True, node_args=node_args)
     assert rc == 0
     creates = [c for c in calls if c[1] == "/create"]
     assert len(creates) == 1 and creates[0][3] == "bok-node-agent"
@@ -500,7 +500,7 @@ def test_prod_install_windows_node_agent_requires_cp_url(monkeypatch, tmp_path: 
     patch_bok(monkeypatch, "is_mac", lambda: False)
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
-    rc = bok.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
+    rc = bok.prod.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
     assert rc == 2
 
 
@@ -509,7 +509,7 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
-    assert bok.cmd_prod_install() == 1
+    assert bok.prod.cmd_prod_install() == 1
 
 
 @pytest.mark.skipif(sys.platform != "darwin",
@@ -517,7 +517,7 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
                            "Linux 上 prod install 走不到该分支(跟进项:非 mac/nt 平台应有显式 unsupported 挡板)")
 def test_prod_install_mac_node_agent_rejected(monkeypatch, tmp_path: Path) -> None:
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
-    assert bok.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
+    assert bok.prod.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
 
 
 def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Path) -> None:
@@ -528,7 +528,7 @@ def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     (tmp_path / "units").mkdir()
     (tmp_path / "units" / "bok-agent.xml").write_text("x", encoding="utf-16")
-    rc = bok.cmd_prod_uninstall()
+    rc = bok.prod.cmd_prod_uninstall()
     assert rc == 0
     deletes = [c for c in calls if c[1] == "/delete"]
     assert [c[3] for c in deletes] == [
@@ -548,7 +548,7 @@ def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_pat
                                            stderr="ERROR: The specified task name does not exist in the system.")
 
     monkeypatch.setattr(schtasks_units, "run_schtasks", fake_run)
-    assert bok.cmd_prod_uninstall() == 0  # 未安装 ≠ 失败
+    assert bok.prod.cmd_prod_uninstall() == 0  # 未安装 ≠ 失败
 
 
 def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) -> None:
@@ -556,7 +556,7 @@ def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) ->
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
-    assert bok.cmd_prod_uninstall() == 1
+    assert bok.prod.cmd_prod_uninstall() == 1
 
 
 def test_parse_args_prod_passthrough_preserves_order() -> None:
@@ -656,7 +656,7 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
     run_dir.mkdir()
     (run_dir / "bok-agent.pid").write_text("111\n")
     (run_dir / "llm.pid").write_text("222\n")
-    rc = bok.cmd_prod_uninstall()
+    rc = bok.prod.cmd_prod_uninstall()
     captured = capsys.readouterr()
     assert rc == 0
     assert down_calls == [1]
@@ -676,7 +676,7 @@ def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: P
     patch_bok(monkeypatch, "_pid_alive", lambda pf: False)
     down_calls: list[int] = []
     patch_bok(monkeypatch, "cmd_down", lambda: down_calls.append(1))
-    assert bok.cmd_prod_uninstall() == 0
+    assert bok.prod.cmd_prod_uninstall() == 0
     captured = capsys.readouterr()
     assert down_calls == []
     assert "WARNING" not in captured.err
@@ -690,7 +690,7 @@ def test_doctor_gpu_gate_called_at_function_top_level() -> None:
     cmd_doctor 里的调用必须位于函数体顶层（缩进 4，不在任何 `if not va_ok:`
     块内）——曾误缩进在块内（缩进 8），装了虚拟声卡的 Windows 机器结构性跳过
     GPU 门禁。行为回归见 ⑤ 的三只 gate 单测，这里钉「调用位置」本身。"""
-    src = inspect.getsource(bok.cmd_doctor)
+    src = inspect.getsource(bok.doctor.cmd_doctor)
     calls = [
         (idx, ln)
         for idx, ln in enumerate(src.splitlines())
@@ -720,7 +720,7 @@ def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
 
 def _cp_unit_args(monkeypatch, tmp_path: Path) -> list[str]:
     _patch_prod_unit_deps(monkeypatch, tmp_path)
-    units = {name: args for name, args, _env, _comment in bok._prod_units()}
+    units = {name: args for name, args, _env, _comment in bok.prod._prod_units()}
     return units["bok-control-plane"]
 
 
@@ -757,23 +757,23 @@ def test_prod_units_cp_bind_host_blank_env_falls_back(monkeypatch, tmp_path: Pat
 
 def test_monitor_kill_round_none_active_calls_is_conservative() -> None:
     """active_calls=None（CP 不可达=状态未知）→ kill 恒 False（旧 None 当 0 误杀）。"""
-    assert bok._monitor_kill_round(2, None) == (False, True)
-    assert bok._monitor_kill_round(11, None)[0] is False
+    assert bok.proc._monitor_kill_round(2, None) == (False, True)
+    assert bok.proc._monitor_kill_round(11, None)[0] is False
     # 未知档也按 veto 节奏打点（首过 idle 门槛一次 + 每 12 轮提醒），不静默。
-    assert bok._monitor_kill_round(12, None) == (False, True)
+    assert bok.proc._monitor_kill_round(12, None) == (False, True)
 
 
 def test_monitor_kill_round_zero_still_uses_idle_threshold() -> None:
     """active_calls=0（确认无在途）→ 仍按 idle 门槛补拉（保守修不误伤真死 worker）。"""
-    assert bok._monitor_kill_round(1, 0) == (False, False)
-    assert bok._monitor_kill_round(2, 0) == (True, False)
+    assert bok.proc._monitor_kill_round(1, 0) == (False, False)
+    assert bok.proc._monitor_kill_round(2, 0) == (True, False)
     # 在途 >0 恒不杀（G3 硬 veto）。
-    assert bok._monitor_kill_round(99, 1)[0] is False
+    assert bok.proc._monitor_kill_round(99, 1)[0] is False
 
 
 def test_monitor_kill_round_source_pins_none_guard() -> None:
     """源码 pin：None 的显式保守分支必须在 `if not active_calls` 之前。"""
-    src = inspect.getsource(bok._monitor_kill_round)
+    src = inspect.getsource(bok.proc._monitor_kill_round)
     assert "active_calls is None" in src, (
         "_monitor_kill_round must special-case None (CP unreachable) before the "
         "falsy `if not active_calls` branch")

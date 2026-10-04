@@ -397,7 +397,7 @@ def test_bok_realtime_prod_unit_opt_in(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_interp_env", lambda env: {})
     patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
     monkeypatch.delenv("BOK_QWEN_REALTIME", raising=False)
-    assert "bok-realtime" not in {u[0] for u in bok_mod._prod_units()}
+    assert "bok-realtime" not in {u[0] for u in bok_mod.prod._prod_units()}
     monkeypatch.setenv("BOK_QWEN_REALTIME", "1")
-    assert "bok-realtime" in {u[0] for u in bok_mod._prod_units()}
+    assert "bok-realtime" in {u[0] for u in bok_mod.prod._prod_units()}
     assert ("realtime-demo", 8084) not in bok_mod.WORKER_PORTS

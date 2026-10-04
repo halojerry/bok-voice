@@ -48,11 +48,11 @@ def test_core_ports_cover_embed_and_optional_exemption():
     """W1b embedding sidecar(:8789) 进单点表 + 享可选豁免(缺模型不算超时/降级)。"""
     assert ("embed", 8789) in bok.CORE_PORTS
     assert "embedding" in bok.OPTIONAL_MODELS
-    assert 8789 in bok._OPTIONAL_LLM_PORTS
+    assert 8789 in bok.health._OPTIONAL_LLM_PORTS
     # 宽松终检:缺口仅 embed → 放行(镜像 mt/settle 语义)。
-    assert bok._only_optional_ports([8789]) is True
+    assert bok.health._only_optional_ports([8789]) is True
     # 孤儿清扫身份映射:殭尸 embed 进程按端口+命令行双条件收割。
-    assert any(port == 8789 and "bge-embed" in markers for port, markers in bok._ORPHAN_PORT_OWNERS)
+    assert any(port == 8789 and "bge-embed" in markers for port, markers in bok.proc._ORPHAN_PORT_OWNERS)
     # 放宽探活面:暖机窗 /health 应答(哪怕 ready=false)算进程在。
     assert bok._SWEEP_HTTP_PATHS.get(8789) == "/health"
 
@@ -71,7 +71,7 @@ def test_worker_ports_triple_matches_prod_units(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
     patch_bok(monkeypatch, "_interp_env", lambda env: {})
     patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
-    unit_names = {name for name, _args, _env, _comment in bok._prod_units()}
+    unit_names = {name for name, _args, _env, _comment in bok.prod._prod_units()}
     assert {"bok-agent", "bok-interp-fwd", "bok-interp-rev"} <= unit_names
 
 
@@ -117,7 +117,7 @@ def test_probe_llm_uses_absolute_model_path(monkeypatch):
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm()
+    ok, detail = bok.doctor._probe_llm()
     assert ok
     assert seen["body"]["model"] == "/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
     assert seen["body"]["max_tokens"] == 1
@@ -132,7 +132,7 @@ def test_probe_llm_timeout_env_and_fail_wording(monkeypatch):
         raise TimeoutError("timed out")
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm()
+    ok, detail = bok.doctor._probe_llm()
     assert not ok
     assert "FAIL" in detail
     assert "wedge" in detail  # 冷启动页入与 wedge 的区分提示必须带
@@ -154,7 +154,7 @@ def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm(
+    ok, detail = bok.doctor._probe_llm(
         "http://127.0.0.1:1236/v1",
         model="/Users/x/Hy-MT2-1.8B-8bit",
         prompt="Translate to English: 你好世界")
@@ -172,20 +172,20 @@ def test_model_present_recognizes_lmstudio_layout(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
     repo = "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"
     # 两处都不在 → MISSING
-    assert not bok._model_present(repo)
+    assert not bok.doctor._model_present(repo)
     # 只有 app-data 在 → ok(lmstudio 不用看)
     app = tmp_path / "appdata" / repo
     app.mkdir(parents=True)
     (app / "model.safetensors").write_text("x")
-    assert bok._model_present(repo)
+    assert bok.doctor._model_present(repo)
     # 只有 lmstudio 在 → ok(mac 上旧行为恒 MISSING 的断层)
     lm = tmp_path / "lmstudio" / repo
     lm.mkdir(parents=True)
     (lm / "model.safetensors").write_text("x")
-    assert bok._model_present(repo)
+    assert bok.doctor._model_present(repo)
     # 非 mac 平台不认 lmstudio 布局(用两边都不在盘的另一个 repo 验证)
     patch_bok(monkeypatch, "is_mac", lambda: False)
-    assert not bok._model_present("mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
+    assert not bok.doctor._model_present("mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
 
 
 def test_prod_status_degraded_when_bline_worker_down(monkeypatch, capsys):
@@ -199,7 +199,7 @@ def test_prod_status_degraded_when_bline_worker_down(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 1
     assert "prod: DEGRADED" in out
@@ -213,7 +213,7 @@ def test_prod_status_ok_when_workers_alive(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 0
     assert "prod: OK" in out
@@ -231,22 +231,22 @@ def test_monitor_veto_blocks_kill_with_active_calls():
     """硬 veto 纯函数判定：active_calls>0 任何探活失败都不杀；无通话/CP 不可达
     退回连续失败口径（idle 门槛 2 轮）。"""
     # 无通话在途：2 轮（≥10s）杀（旧 idle 口径不变）
-    assert bok._monitor_kill_round(1, 0) == (False, False)
-    assert bok._monitor_kill_round(2, 0) == (True, False)
-    assert bok._monitor_kill_round(99, 0)[0] is True
+    assert bok.proc._monitor_kill_round(1, 0) == (False, False)
+    assert bok.proc._monitor_kill_round(2, 0) == (True, False)
+    assert bok.proc._monitor_kill_round(99, 0)[0] is True
     # CP 不可达（None）= 保守不杀(2026-09-28 生命周期护栏:None 曾落 falsy 分支
     # 令 veto 静默失效——CP 抖一下 + worker 探活失败 = 可能杀掉在途 worker)
-    assert bok._monitor_kill_round(1, None) == (False, False)
-    assert bok._monitor_kill_round(2, None) == (False, True)
+    assert bok.proc._monitor_kill_round(1, None) == (False, False)
+    assert bok.proc._monitor_kill_round(2, None) == (False, True)
     # 有通话在途：恒不杀（硬 veto）——streak 多深都不杀，等场景间隙 active 归零
     for n in (1, 2, 3, 12, 60, 999):
-        kill, _veto = bok._monitor_kill_round(n, 2)
+        kill, _veto = bok.proc._monitor_kill_round(n, 2)
         assert kill is False, f"active_calls>0 时 streak={n} 不得杀"
     # veto 打点节奏：首过 idle 门槛一次 + 此后每 12 轮提醒一次（防长窗静默/刷屏）
-    assert bok._monitor_kill_round(2, 2) == (False, True)
-    assert bok._monitor_kill_round(3, 2) == (False, False)
-    assert bok._monitor_kill_round(12, 2) == (False, True)
-    assert bok._monitor_kill_round(24, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(2, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(3, 2) == (False, False)
+    assert bok.proc._monitor_kill_round(12, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(24, 2) == (False, True)
 
 
 def test_monitor_probe_uses_real_worker_endpoint(monkeypatch):

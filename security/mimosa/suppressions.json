@@ -159,6 +159,22 @@
       "verdict": "false-positive",
       "reason": "静态臆测链『queue_proxy HTTP 输入 → room_claim 路径穿越』无真实数据流：queue_proxy 只路由 LLM chat/completions（model/base_url 字段→上游转发），全文件不 import/引用 room_claim；room_claim 锁路径唯一源=claims_dir()（BOK_ROOM_CLAIM_DIR env/缺省 app-data，非请求输入），且房名拼路径前经 _ROOM_SAFE 白名单收敛（穿越段映射 _，2026-10-03 加固）",
       "evidence": "apps/agent/agent_runtime/room_claim.py _ROOM_SAFE/claims_dir; services/llm-mlx/queue_proxy.py（无 room_claim 引用，grep 可复验）; tests/test_room_claim.py"
+    },
+    {
+      "id": "fp-mine-qa-cp-request-taint",
+      "publicClass": "other-security",
+      "path_glob": "scripts/runtime/mine_qa.py",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链（BOK_CP_URL/--cp 缺省 http://127.0.0.1:8000、BOK_CP_TOKEN→Bearer）：operator 诊断 CLI 配置面（bok.py tts-mine 执行体，同 fp-agent-sidecar-taint/fp-bok-cli-loopback 先例），非远端用户输入；payload 全 JSON 序列化打 qa-entries/qa-pairs API，无命令/SQL/路径 sink；扫描器跨文件 sink 归因（load_intent_catalog.py:118）=同族 env→request 共享形状（2026-10-04 Ethan 指派 triage）",
+      "evidence": "scripts/runtime/mine_qa.py:47-60 _safe_urlopen 出站闸 + :84-91 _cp_request 单点 + :274/:284 env 缺省；调用点 :191/:260/:294/:324/:335/:364"
+    },
+    {
+      "id": "fp-probe-branch-action-cp-taint",
+      "publicClass": "other-security",
+      "path_glob": "scripts/probes/probe_branch_action.py",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链：出站单点 _cp→erc.cp_request（urlguard import 期闸+就地 scheme/host/userinfo 校验，CONTROL_PLANE_URL 缺省 http://127.0.0.1:8000，BOK_CP_TOKEN→CP_HEADERS），payload=探针常量 JSON（模板/对象/人设/建单/token，E2E- 前缀自清理），无命令/SQL/路径 sink；扫描器跨文件 sink 归因（probe_flow_graph.py:763）=同族 env→request 共享件（2026-10-04 Ethan 指派 triage）",
+      "evidence": "scripts/probes/probe_branch_action.py:487-490 _cp 委托 + 调用点 :495/:510/:519/:528/:757；scripts/e2e/e2e_real_customer.py:59-106 CONTROL_PLANE_URL env+gate()+cp_request；同族先例 fixed-scripts-urlguard-gate/fixed-scripts-cp-api-entries"
     }
   ]
 }

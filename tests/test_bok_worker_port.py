@@ -88,9 +88,9 @@ def test_desktop_targets_follow_env(monkeypatch) -> None:
 def test_orphan_owners_follow_env(monkeypatch) -> None:
     """孤儿清扫端口表：agent 条目吃 helper（身份标记不变），其余原样。"""
     monkeypatch.delenv("BOK_WORKER_PORT", raising=False)
-    assert bok._orphan_port_owners() == bok._ORPHAN_PORT_OWNERS
+    assert bok.proc._orphan_port_owners() == bok.proc._ORPHAN_PORT_OWNERS
     monkeypatch.setenv("BOK_WORKER_PORT", "9081")
-    owners = dict(bok._orphan_port_owners())
+    owners = dict(bok.proc._orphan_port_owners())
     assert "agent_runtime" in " ".join(owners[9081])
     assert 8081 not in owners
     assert 8082 in owners and 8083 in owners, "interp 条目不动"
@@ -99,14 +99,14 @@ def test_orphan_owners_follow_env(monkeypatch) -> None:
 
 def test_sweep_listeners_uses_dynamic_owners() -> None:
     """源级 pin：孤儿清扫迭代动态表（静态表是默认档，env 档必须同样被扫）。"""
-    src = inspect.getsource(bok._sweep_orphan_listeners)
+    src = inspect.getsource(bok.proc._sweep_orphan_listeners)
     assert "_orphan_port_owners()" in src, (
         "_sweep_orphan_listeners must iterate _orphan_port_owners()")
 
 
 def test_shared_iteration_sites_use_dynamic_table() -> None:
     """三张共用健康面（status/doctor/prod status）迭代动态 worker 表。"""
-    for fn in (bok.cmd_status, bok.cmd_doctor, bok.cmd_prod_status):
+    for fn in (bok.cmd_status, bok.doctor.cmd_doctor, bok.prod.cmd_prod_status):
         src = inspect.getsource(fn)
         assert "_worker_ports()" in src, (
             f"{fn.__name__} must iterate _worker_ports() so BOK_WORKER_PORT "

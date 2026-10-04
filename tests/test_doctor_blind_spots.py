@@ -38,19 +38,19 @@ class _FakeResp(io.BytesIO):
 def test_lease_timeout_census(tmp_path: Path) -> None:
     log = tmp_path / "llm-proxy.log"
     log.write_text("boot\n" + _LEASE_LINE * 3 + "other\n", encoding="utf-8")
-    assert bok._doctor_queue_proxy_lease_timeouts(tmp_path) == 3
-    assert bok._doctor_queue_proxy_lease_timeouts(tmp_path / "missing") is None
+    assert bok.doctor._doctor_queue_proxy_lease_timeouts(tmp_path) == 3
+    assert bok.doctor._doctor_queue_proxy_lease_timeouts(tmp_path / "missing") is None
 
 
 def test_lease_marker_matches_queue_proxy_source() -> None:
     """计数标记必须与 queue_proxy.py 真打点字面量一致（防字面量漂移假绿）。"""
     src = (ROOT / "services" / "llm-mlx" / "queue_proxy.py").read_text(encoding="utf-8")
     assert "lease-timeout forced-reclaim" in src
-    assert bok._LEASE_TIMEOUT_MARKER == "lease-timeout forced-reclaim"
+    assert bok.doctor._LEASE_TIMEOUT_MARKER == "lease-timeout forced-reclaim"
 
 
 def test_doctor_source_pins() -> None:
-    src = inspect.getsource(bok.cmd_doctor)
+    src = inspect.getsource(bok.doctor.cmd_doctor)
     assert "_doctor_queue_proxy_lease_timeouts(" in src, "doctor 必须汇总租约超时"
     assert "queue_proxy lease_timeouts=" in src
     assert "a_reply" in src, "doctor 必须为 a_reply 专线打功能探针行"
@@ -92,7 +92,7 @@ def test_doctor_a_reply_probe_line(monkeypatch, tmp_path: Path, capsys) -> None:
         raise urllib.error.URLError(f"unexpected url {url}")
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_doctor()
+    rc = bok.doctor.cmd_doctor()
     assert rc == 0
     out = capsys.readouterr().out
     assert "a_reply 功能探针" in out and "ok " in out

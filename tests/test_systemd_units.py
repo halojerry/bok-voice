@@ -224,14 +224,14 @@ def _linux(monkeypatch, tmp_path: Path) -> None:
 def test_staging_dir_default(monkeypatch, tmp_path):
     _linux(monkeypatch, tmp_path)
     monkeypatch.delenv("BOK_SYSTEMD_STAGING_DIR", raising=False)
-    assert bok._systemd_staging_dir("") == bok.ROOT / "release-artifacts" / "systemd"
+    assert bok.prod._systemd_staging_dir("") == bok.ROOT / "release-artifacts" / "systemd"
 
 
 def test_staging_dir_env_override_and_flag_precedence(monkeypatch, tmp_path):
     _linux(monkeypatch, tmp_path)
     monkeypatch.setenv("BOK_SYSTEMD_STAGING_DIR", str(tmp_path / "envstage"))
-    assert bok._systemd_staging_dir("") == tmp_path / "envstage"
-    assert bok._systemd_staging_dir(str(tmp_path / "flagstage")) == tmp_path / "flagstage"
+    assert bok.prod._systemd_staging_dir("") == tmp_path / "envstage"
+    assert bok.prod._systemd_staging_dir(str(tmp_path / "flagstage")) == tmp_path / "flagstage"
 
 
 def test_staging_dir_refuses_etc(monkeypatch, tmp_path):
@@ -241,7 +241,7 @@ def test_staging_dir_refuses_etc(monkeypatch, tmp_path):
     monkeypatch.setenv("BOK_SYSTEMD_STAGING_DIR", "")
     for bad in ("/etc/systemd/system", "/etc/bok", "/etc"):
         with pytest.raises(SystemExit):
-            bok._systemd_staging_dir(bad)
+            bok.prod._systemd_staging_dir(bad)
 
 
 # ---------------- bok.py 接线：install / uninstall Linux 分支 ----------------
@@ -259,7 +259,7 @@ def test_prod_install_linux_writes_staging_only_and_prints_load_steps(
     _linux(monkeypatch, tmp_path)
     staging = tmp_path / "staging"
     before = _etc_units()
-    rc = bok.cmd_prod_install(staging_dir=str(staging))
+    rc = bok.prod.cmd_prod_install(staging_dir=str(staging))
     out = capsys.readouterr().out
     assert rc == 0
     assert sorted(p.name for p in staging.glob("*.service")) == sorted(_UNIT_NAMES)
@@ -277,7 +277,7 @@ def test_prod_install_linux_writes_staging_only_and_prints_load_steps(
 def test_prod_install_linux_node_agent_single_unit(monkeypatch, tmp_path, capsys):
     _linux(monkeypatch, tmp_path)
     staging = tmp_path / "staging"
-    rc = bok.cmd_prod_install(
+    rc = bok.prod.cmd_prod_install(
         staging_dir=str(staging), node_agent=True,
         node_args=["--cp-url", "http://10.0.0.5:8000", "--license-key", "bokn_x"])
     out = capsys.readouterr().out
@@ -290,7 +290,7 @@ def test_prod_install_linux_node_agent_single_unit(monkeypatch, tmp_path, capsys
 
 def test_prod_install_linux_node_agent_requires_cp_url(monkeypatch, tmp_path):
     _linux(monkeypatch, tmp_path)
-    rc = bok.cmd_prod_install(staging_dir=str(tmp_path), node_agent=True,
+    rc = bok.prod.cmd_prod_install(staging_dir=str(tmp_path), node_agent=True,
                               node_args=["--license-key", "x"])
     assert rc == 2
 
@@ -298,7 +298,7 @@ def test_prod_install_linux_node_agent_requires_cp_url(monkeypatch, tmp_path):
 def test_prod_install_linux_default_staging_via_env(monkeypatch, tmp_path, capsys):
     _linux(monkeypatch, tmp_path)
     monkeypatch.setenv("BOK_SYSTEMD_STAGING_DIR", str(tmp_path / "env-out"))
-    assert bok.cmd_prod_install() == 0
+    assert bok.prod.cmd_prod_install() == 0
     assert (tmp_path / "env-out" / "bok-cp.service").exists()
 
 
@@ -313,7 +313,7 @@ def test_prod_uninstall_linux_clears_staging_and_legacy(monkeypatch, tmp_path, c
     legacy.mkdir()
     (legacy / "bok-agent.service").write_text("old", encoding="utf-8")
     (legacy / "com.bokvoice.bok-agent.plist").write_text("keep-me", encoding="utf-8")
-    rc = bok.cmd_prod_uninstall(staging_dir=str(staging))
+    rc = bok.prod.cmd_prod_uninstall(staging_dir=str(staging))
     out = capsys.readouterr().out
     assert rc == 0
     assert not list(staging.glob("bok-*.service"))
@@ -325,7 +325,7 @@ def test_prod_uninstall_linux_clears_staging_and_legacy(monkeypatch, tmp_path, c
 
 def test_prod_uninstall_linux_idempotent_on_empty_staging(monkeypatch, tmp_path):
     _linux(monkeypatch, tmp_path)
-    assert bok.cmd_prod_uninstall(staging_dir=str(tmp_path / "missing")) == 0
+    assert bok.prod.cmd_prod_uninstall(staging_dir=str(tmp_path / "missing")) == 0
 
 
 # ---------------- CLI 旗标 ----------------

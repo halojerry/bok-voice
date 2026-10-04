@@ -11,7 +11,27 @@ from __future__ import annotations
 # 权威定义所在模块映射。W② 搬运时逐行改道,例如:
 #   "app_data_dir": "bokctl.paths",
 #   "_FORWARD_ENV": "bokctl.env",
-PATCH_TARGETS: dict[str, str] = {}
+PATCH_TARGETS: dict[str, str] = {
+    # prod 域(W② 搬出)
+    "cmd_prod": "bokctl.prod",
+    # doctor 域(W② 搬出)
+    "_nvidia_gate": "bokctl.doctor",
+    "_model_present": "bokctl.doctor",
+    "_warn_memory_posture": "bokctl.doctor",
+    "_doctor_gpu_gate": "bokctl.doctor",
+    "_doctor_draft_warning": "bokctl.doctor",
+    "_doctor_minimax_tts": "bokctl.doctor",
+    # proc 域(W② 搬出)
+    "_ps_field": "bokctl.proc",
+    "_sweep_orphan_workers": "bokctl.proc",
+    "_sweep_orphan_listeners": "bokctl.proc",
+    "_kill_proc_tree": "bokctl.proc",
+    "_ensure_monitor": "bokctl.proc",
+    # health 域(W② 搬出)
+    "_http_ok": "bokctl.health",
+    "_llm_http_ready": "bokctl.health",
+    "_ports_down_after_grace": "bokctl.health",
+}
 
 _DEFAULT_TARGET = "bokctl.core"
 

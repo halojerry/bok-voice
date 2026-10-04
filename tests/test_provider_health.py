@@ -142,10 +142,10 @@ def test_bok_status_and_doctor_use_shared_scanner(tmp_path, monkeypatch, capsys)
     assert summary["degraded"] is True
 
     # fail 消息生成器（doctor 用）：配额死进 fails、干净不出行
-    fails = bok._provider_health_fails(summary)
+    fails = bok.doctor._provider_health_fails(summary)
     assert len(fails) == 1 and "2056" in fails[0]
     clean = scan_provider_health(tmp_path / "empty-logs", window_s=300.0, now=_NOW)
-    assert bok._provider_health_fails(clean) == []
+    assert bok.doctor._provider_health_fails(clean) == []
 
 
 def test_bok_provider_health_summary_none_when_module_missing(tmp_path, monkeypatch):

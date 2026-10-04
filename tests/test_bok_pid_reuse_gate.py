@@ -105,21 +105,21 @@ def test_pid_reused_stale_helper(monkeypatch, tmp_path) -> None:
     run = _run_dir(home)
     pidfile = run / "agent.pid"
     pidfile.write_text("12345")
-    assert bok._pid_reused_stale(pidfile, 12345) is False  # 无戳 fail-open
+    assert bok.proc._pid_reused_stale(pidfile, 12345) is False  # 无戳 fail-open
 
     (run / "proc-12345.root").write_text(f"{bok.ROOT}\tOLD LSTART\n", encoding="utf-8")
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
-    assert bok._pid_reused_stale(pidfile, 12345) is True
+    assert bok.proc._pid_reused_stale(pidfile, 12345) is True
 
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "OLD LSTART" if field == "lstart=" else "")
-    assert bok._pid_reused_stale(pidfile, 12345) is False  # 戳对得上=不是复用
+    assert bok.proc._pid_reused_stale(pidfile, 12345) is False  # 戳对得上=不是复用
 
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "")  # ps 读不出
-    assert bok._pid_reused_stale(pidfile, 12345) is False
+    assert bok.proc._pid_reused_stale(pidfile, 12345) is False
 
     (run / "proc-12345.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")  # 坏戳
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: "NEW LSTART" if field == "lstart=" else "")
-    assert bok._pid_reused_stale(pidfile, 12345) is False
+    assert bok.proc._pid_reused_stale(pidfile, 12345) is False
 
 
 # ---------------------------------------------------------------------------

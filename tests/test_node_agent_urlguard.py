@@ -43,7 +43,7 @@ def test_validate_cp_base_fatals_on_never_legit_set():
 
 
 def test_opener_does_not_follow_redirects():
-    # Bearer 凭据不跟随重定向：30x 一律 RuntimeError（bok._NoRedirect 同款）
+    # Bearer 凭据不跟随重定向：30x 一律 RuntimeError（bokctl.proc._NoRedirect 同款）
     handler = node_agent._NoRedirect()
     with pytest.raises(RuntimeError, match="redirect not allowed"):
         handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example.net/x")

@@ -101,9 +101,9 @@ def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
 
 def test_prod_units_model_plane_default_off(monkeypatch, tmp_path) -> None:
     _patch_prod_unit_deps(monkeypatch, tmp_path)
-    names = [n for n, *_ in bok._prod_units()]
+    names = [n for n, *_ in bok.prod._prod_units()]
     assert "bok-model-plane" not in names, "默认渲染必须与既有装机逐字节一致"
-    units = {n: args for n, args, _env, _c in bok._prod_units(with_model_plane=True)}
+    units = {n: args for n, args, _env, _c in bok.prod._prod_units(with_model_plane=True)}
     assert "bok-model-plane" in units
     argv = units["bok-model-plane"]
     assert argv[-2:] == ["up", "--models-only"]
@@ -114,10 +114,10 @@ def test_prod_install_mac_plist_gated_by_flag(monkeypatch, tmp_path) -> None:
     _patch_prod_unit_deps(monkeypatch, tmp_path)
     patch_bok(monkeypatch, "is_mac", lambda: True)
     patch_bok(monkeypatch, "is_linux", lambda: False)
-    assert bok.cmd_prod_install() == 0
+    assert bok.prod.cmd_prod_install() == 0
     unit_dir = tmp_path / "units"
     assert not (unit_dir / "com.bokvoice.bok-model-plane.plist").exists()
-    assert bok.cmd_prod_install(with_model_plane=True) == 0
+    assert bok.prod.cmd_prod_install(with_model_plane=True) == 0
     plist = unit_dir / "com.bokvoice.bok-model-plane.plist"
     assert plist.exists()
     text = plist.read_text(encoding="utf-8")
@@ -136,10 +136,10 @@ def test_prod_uninstall_mac_removes_opt_in_model_plane(monkeypatch, tmp_path, ca
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: _sp.CompletedProcess(argv, 0, stdout="", stderr=""))
-    assert bok.cmd_prod_install(with_model_plane=True) == 0
+    assert bok.prod.cmd_prod_install(with_model_plane=True) == 0
     unit_dir = tmp_path / "units"
     assert (unit_dir / "com.bokvoice.bok-model-plane.plist").exists()
-    assert bok.cmd_prod_uninstall() == 0
+    assert bok.prod.cmd_prod_uninstall() == 0
     assert not (unit_dir / "com.bokvoice.bok-model-plane.plist").exists()
     assert "bok-model-plane" in capsys.readouterr().out
 
