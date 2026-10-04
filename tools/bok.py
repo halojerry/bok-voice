@@ -26,7 +26,6 @@ import platform as _platform
 import re
 import signal
 import socket
-import re
 import subprocess
 import sys
 import time
@@ -2434,6 +2433,11 @@ _FORWARD_ENV = (
     # cpu_percent,共享机桌面噪音过 0.7 线=拒派空房全哑;钉 0.99 仅近全饱和才拒,
     # 生产专用节点想保守可设回 0.7。
     "BOK_WORKER_LOAD_THRESHOLD",
+    # SIP 拨号模式覆盖（dialer.py:51 resolve_dial_mode：有值即显式覆盖 settings
+    # sip.mode，合法 mock/real、非法回落 mock）；CP 面同键另走 _control_plane_env
+    # （campaign.py:61 消费），本行补 agent worker 面——不登记则 prod 封闭 env 面
+    # agent 侧恒读空串，env 覆盖结构性死门（2026-10-03 C2）。
+    "BOK_SIP_MODE",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

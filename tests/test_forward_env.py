@@ -14,7 +14,10 @@ kill-switch、BOK_CP_TOKEN auth-on worker 上报，两次实弹同病）。
 
 扫描面（2026-09-20 D14 修正）：`rglob` **递归覆盖子包**（plugins/、providers/ 等
 ——旧 `glob("*.py")` 非递归，`providers/livekit_plugins.py` 的 61 键整包漏扫）；
-`__pycache__` 等非源码目录显式跳过。
+`__pycache__` 等非源码目录显式跳过。形态补盲（2026-10-03 C2）：除
+`os.environ.get("KEY"`/`os.getenv("KEY"` 外，`env.get("BOK_SIP_MODE")` 这类
+「收 env Mapping 参数再读」的字典形态一并提取——dialer.py 的真实读面此前
+结构上扫不到（BOK_SIP_MODE 死门从未被本门禁揪出的根因）。
 """
 from __future__ import annotations
 
@@ -59,7 +62,13 @@ _EXEMPT["S2S_" + "API_KEY"] = "s2s 试点腿：s2s_realtime 缺省材料的覆�
 
 
 def _agent_env_reads() -> set[str]:
-    """agent_runtime 全部 `os.environ.get("KEY"`/`os.getenv("KEY"` 读取面（静态扫）。
+    """agent_runtime 全部 env 读取面（静态扫）。
+
+    形态① `os.environ.get("KEY"`/`os.getenv("KEY"`（进程 env 直读）；
+    形态② `.get("BOK_XXX")`/`.get('BOK_XXX')` 字典传参形态（2026-10-03 C2 补
+    盲区：dialer.py `env.get("BOK_SIP_MODE")` 这类收 env Mapping 再读的写法，
+    进程 env 正则在结构上扫不到；变量名不限 env——凡字面 `BOK_` 键即算实读面；
+    刻意收窄到 BOK_ 前缀，防 settings dict 等价键误报）。
 
     递归扫全部子包（plugins/、providers/ 等，2026-09-20 D14 修正：旧
     `glob("*.py")` 非递归，providers/ 整包 61 键漏扫）；`__pycache__` 显式跳过
@@ -72,6 +81,7 @@ def _agent_env_reads() -> set[str]:
         src = path.read_text(encoding="utf-8")
         reads |= set(re.findall(r'os\.environ\.get\(\s*"([A-Z][A-Z0-9_]+)"', src))
         reads |= set(re.findall(r'os\.getenv\(\s*"([A-Z][A-Z0-9_]+)"', src))
+        reads |= set(re.findall(r"""\.get\(\s*["'](BOK_[A-Z0-9_]+)["']""", src))
     return reads
 
 

@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.intent_rules import validate_conditions
+from bok_voice_core.metrics_kinds import METRICS_KINDS_LITERAL
 from bok_voice_core.model_routes import (
     LANES as MODEL_LANES,
     PROVIDER_OPENAI as MODEL_PROVIDER_OPENAI,
@@ -7460,9 +7461,13 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
 
 
 class AgentMetricSample(BaseModel):
-    """单条指标样本（契约 §1：kind 枚举固定四种，ms 毫秒）。"""
+    """单条指标样本（契约 §1：kind 枚举固定四种，ms 毫秒）。
 
-    kind: Literal["llm_ttft", "asr_transcribe", "tts_first_audio", "vad_infer"]
+    kind 单源=``bok_voice_core.metrics_kinds.METRICS_KINDS_LITERAL``（worker
+    上报/CP 滚动窗/schema 三面共用；改枚举同步该模块，勿在本文件回抄字面量）。
+    """
+
+    kind: METRICS_KINDS_LITERAL
     ms: float
     ts: str = ""
 
