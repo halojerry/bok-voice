@@ -71,7 +71,7 @@ def test_worker_ports_triple_matches_prod_units(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
     patch_bok(monkeypatch, "_interp_env", lambda env: {})
     patch_bok(monkeypatch, "_control_plane_env", lambda db: {})
-    unit_names = {name for name, _args, _env, _comment in bok._prod_units()}
+    unit_names = {name for name, _args, _env, _comment in bok.prod._prod_units()}
     assert {"bok-agent", "bok-interp-fwd", "bok-interp-rev"} <= unit_names
 
 
@@ -199,7 +199,7 @@ def test_prod_status_degraded_when_bline_worker_down(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 1
     assert "prod: DEGRADED" in out
@@ -213,7 +213,7 @@ def test_prod_status_ok_when_workers_alive(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 0
     assert "prod: OK" in out

@@ -459,7 +459,7 @@ def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) 
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
-    rc = bok.cmd_prod_install()
+    rc = bok.prod.cmd_prod_install()
     assert rc == 0
     creates = [c for c in calls if c[1] == "/create"]
     assert [c[3] for c in creates] == [
@@ -483,7 +483,7 @@ def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tm
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     node_args = ["--cp-url", "http://127.0.0.1:8000", "--node-token", "tok",
                  "--ui-dir", "C:\\a b\\out"]
-    rc = bok.cmd_prod_install(node_agent=True, node_args=node_args)
+    rc = bok.prod.cmd_prod_install(node_agent=True, node_args=node_args)
     assert rc == 0
     creates = [c for c in calls if c[1] == "/create"]
     assert len(creates) == 1 and creates[0][3] == "bok-node-agent"
@@ -500,7 +500,7 @@ def test_prod_install_windows_node_agent_requires_cp_url(monkeypatch, tmp_path: 
     patch_bok(monkeypatch, "is_mac", lambda: False)
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
-    rc = bok.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
+    rc = bok.prod.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
     assert rc == 2
 
 
@@ -509,7 +509,7 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
-    assert bok.cmd_prod_install() == 1
+    assert bok.prod.cmd_prod_install() == 1
 
 
 @pytest.mark.skipif(sys.platform != "darwin",
@@ -517,7 +517,7 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
                            "Linux 上 prod install 走不到该分支(跟进项:非 mac/nt 平台应有显式 unsupported 挡板)")
 def test_prod_install_mac_node_agent_rejected(monkeypatch, tmp_path: Path) -> None:
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
-    assert bok.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
+    assert bok.prod.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
 
 
 def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Path) -> None:
@@ -528,7 +528,7 @@ def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     (tmp_path / "units").mkdir()
     (tmp_path / "units" / "bok-agent.xml").write_text("x", encoding="utf-16")
-    rc = bok.cmd_prod_uninstall()
+    rc = bok.prod.cmd_prod_uninstall()
     assert rc == 0
     deletes = [c for c in calls if c[1] == "/delete"]
     assert [c[3] for c in deletes] == [
@@ -548,7 +548,7 @@ def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_pat
                                            stderr="ERROR: The specified task name does not exist in the system.")
 
     monkeypatch.setattr(schtasks_units, "run_schtasks", fake_run)
-    assert bok.cmd_prod_uninstall() == 0  # 未安装 ≠ 失败
+    assert bok.prod.cmd_prod_uninstall() == 0  # 未安装 ≠ 失败
 
 
 def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) -> None:
@@ -556,7 +556,7 @@ def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) ->
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
-    assert bok.cmd_prod_uninstall() == 1
+    assert bok.prod.cmd_prod_uninstall() == 1
 
 
 def test_parse_args_prod_passthrough_preserves_order() -> None:
@@ -656,7 +656,7 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
     run_dir.mkdir()
     (run_dir / "bok-agent.pid").write_text("111\n")
     (run_dir / "llm.pid").write_text("222\n")
-    rc = bok.cmd_prod_uninstall()
+    rc = bok.prod.cmd_prod_uninstall()
     captured = capsys.readouterr()
     assert rc == 0
     assert down_calls == [1]
@@ -676,7 +676,7 @@ def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: P
     patch_bok(monkeypatch, "_pid_alive", lambda pf: False)
     down_calls: list[int] = []
     patch_bok(monkeypatch, "cmd_down", lambda: down_calls.append(1))
-    assert bok.cmd_prod_uninstall() == 0
+    assert bok.prod.cmd_prod_uninstall() == 0
     captured = capsys.readouterr()
     assert down_calls == []
     assert "WARNING" not in captured.err
@@ -720,7 +720,7 @@ def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
 
 def _cp_unit_args(monkeypatch, tmp_path: Path) -> list[str]:
     _patch_prod_unit_deps(monkeypatch, tmp_path)
-    units = {name: args for name, args, _env, _comment in bok._prod_units()}
+    units = {name: args for name, args, _env, _comment in bok.prod._prod_units()}
     return units["bok-control-plane"]
 
 

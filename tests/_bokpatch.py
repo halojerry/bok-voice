@@ -11,7 +11,10 @@ from __future__ import annotations
 # 权威定义所在模块映射。W② 搬运时逐行改道,例如:
 #   "app_data_dir": "bokctl.paths",
 #   "_FORWARD_ENV": "bokctl.env",
-PATCH_TARGETS: dict[str, str] = {}
+PATCH_TARGETS: dict[str, str] = {
+    # prod 域(W② 搬出)
+    "cmd_prod": "bokctl.prod",
+}
 
 _DEFAULT_TARGET = "bokctl.core"
 

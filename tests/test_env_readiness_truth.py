@@ -76,7 +76,7 @@ def test_prod_units_control_plane_env_carries_auth_trio(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_embedded_livekit", lambda: None)
     patch_bok(monkeypatch, "_agent_prod_env", lambda: {})
     patch_bok(monkeypatch, "_interp_env", lambda env: {})
-    units = {name: env for name, _args, env, _comment in bok._prod_units()}
+    units = {name: env for name, _args, env, _comment in bok.prod._prod_units()}
     cp_env = units["bok-control-plane"]
     assert cp_env["BOK_AUTH_REQUIRED"] == "1"
     assert cp_env["BOK_CP_TOKEN"] == "test-cp-token"
@@ -124,7 +124,7 @@ def test_prod_status_queue_off_does_not_report_1239(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 0
     assert "prod: OK" in out
@@ -146,7 +146,7 @@ def test_prod_status_flags_half_dead_mlx(monkeypatch, capsys):
         return _FakeResp(b'{"ok": true}')
 
     monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    rc = bok.cmd_prod_status()
+    rc = bok.prod.cmd_prod_status()
     out = capsys.readouterr().out
     assert rc == 1
     assert "prod: DEGRADED" in out
