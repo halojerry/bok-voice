@@ -15,8 +15,9 @@
 test_forward_env.py 扫 agent_runtime 读取面管「漏登记」，本测试管「静默漂移」）。
 
 W③（2026-10-05）起加钉 CLI 分派面：
-  ⑤ 分派注册表：bokctl.cli._COMMANDS 键集 == 全部 14 个子命令（冻结
-     frozenset），每个值都有可调用的 run(args)（run(args) 协议）；
+  ⑤ 分派注册表：bokctl.cli._COMMANDS 键集 == 全部子命令（冻结 frozenset，
+     14 键基线；2026-10-06 demo-setup 立法 +1=15 键），每个值都有可调用的
+     run(args)（run(args) 协议）；
   ⑥ 门面恒等：``bok.parse_args is bokctl.cli.parse_args``、
      ``bok.main is bokctl.cli.main``、
      ``bok.commands.down.cmd_down is bokctl.commands.down.cmd_down`` 所指
@@ -146,18 +147,20 @@ def test_facade_identity_env_module():
     assert bok.env._BOK_PASSTHROUGH_KEYS is bok.env._FORWARD_ENV
 
 
-# ── ⑤ 冻结快照（W③ 2026-10-05 CLI 分家时刻的 14 子命令全集）────────────────
+# ── ⑤ 冻结快照（W③ 2026-10-05 CLI 分家时刻的 14 子命令 + 2026-10-06 demo-setup
+#    立法 +1 = 15 子命令全集）────────────────────────────────────────────────
 _SUBCOMMAND_NAMES: frozenset[str] = frozenset({
     "catalog", "manifest", "status", "serve", "down", "doctor", "tts-mine",
     "clean-testdata", "monitor", "up", "download", "tts-pregen", "prod", "setup",
+    "demo-setup",
 })
 
 
-def test_dispatch_registry_covers_exactly_the_14_subcommands():
-    """⑤ 分派注册表钉死：_COMMANDS 键集 == 全部 14 子命令（新增/删除子命令
+def test_dispatch_registry_covers_exactly_the_15_subcommands():
+    """⑤ 分派注册表钉死：_COMMANDS 键集 == 全部 15 子命令（新增/删除子命令
     必须显式立法进表+快照），且每个值都有可调用的 run(args)（run 协议）。"""
     assert set(bokctl.cli._COMMANDS) == set(_SUBCOMMAND_NAMES), (
-        "bokctl.cli._COMMANDS 与 14 子命令全集漂移——新增/删除子命令是显式"
+        "bokctl.cli._COMMANDS 与 15 子命令全集漂移——新增/删除子命令是显式"
         "立法动作：同步 cli._COMMANDS 与本测试的 _SUBCOMMAND_NAMES 快照"
     )
     for name, mod in bokctl.cli._COMMANDS.items():

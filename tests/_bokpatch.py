@@ -87,6 +87,7 @@ PATCH_TARGETS: dict[str, str] = {
     "cmd_tts_mine": "bokctl.commands.misc",
     "cmd_clean_testdata": "bokctl.commands.misc",
     "cmd_setup": "bokctl.commands.setup",
+    "cmd_demo_setup": "bokctl.commands.demo_setup",
     # env 域(W② 搬出,最后一批:worker/CP env 组装+_FORWARD_ENV 立法单点表;
     # 行集=实际被 patch 的名件,未列名件(_FORWARD_ENV/_apply_* 等)测试面用
     # bok.env.X 读)
