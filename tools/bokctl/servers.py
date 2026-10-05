@@ -23,7 +23,10 @@ bokctl/commands/{serve,up}.py——本域保留它们下面的全部服务面实
   住 bokctl.commands.download,本域穿 `commands.download.cmd_download()` 取。
 - 本域自有函数(_cmd_up_services/_start_call_plane/_start_llm/
   _start_mt_llm/_start_settle_proxy/_start_settle_llm/_start_laya/_worker_specs/
-  _realtime_demo_enabled/_local_tts_needed/_qwen3_*_sidecar_env/_apply_mlx_
+  _realtime_demo_enabled/_local_tts_needed/_cloud_posture/_ensure_only_for_
+  posture(2026-10-05 demo-cloud wave:云姿势判定+ensure 收窄集,读设置库判
+  asr/llm/settle/mt 各腿云本地,保守法+worker 真相优先,零 bok_voice_core
+  import)/_qwen3_*_sidecar_env/_apply_mlx_
   template_fix/_mlx_hf_offline_env/_settle_cache_bytes/_default_prompt_cache_
   bytes/_physical_mem_gib/_mac_llm_server_argv/_warn_llm_not_http_ready/
   _repo_web_modules + spawn 原语 _start_proc/_spawn_kwargs/_rotate_log/
@@ -214,6 +217,192 @@ def _local_tts_needed() -> tuple[bool, str]:
         return True, f"读取失败({exc.__class__.__name__})默认拉起"
 
 
+def _cloud_posture() -> dict:
+    """云端演示档姿势判定（2026-10-05 demo-cloud wave）：读 CP 设置库判 serve
+    侧哪些本地服务可以不拉、哪些模型不必 ensure（A 线全云豆包+DeepSeek+MiniMax、
+    B 线豆包 ASR + MT 本地 :1236 的演示形态，本地盘只落真正需要的权重）。
+
+    三条立法：
+    - **保守法（旧行为零变化）**：DB 缺失/损坏/列缺/JSON 坏 → 各云腿一律判本地
+      （=与改造前 serve 完全同形）。绝不因设置读不出而少拉服务。
+    - **worker 行为真相优先**：serve 只在 worker 真会走云端时才跳过本地件——
+      `BOK_DOUBAO_ASR=0`（worker 总闸回退本地 Qwen3-ASR）与
+      `BOK_MODEL_ROUTING=0`（路由表忽略→env 缺省链=本地 :1235/:1237）恒判本地，
+      即使设置面写了云端档。
+    - **零 bok_voice_core import**：CLI 在裸环境（bootstrap 前/打包节点）跑，
+      路由表语义在此按 packages/core/bok_voice_core/model_routes.py 同款规则
+      轻量镜像（provider 规范化、未知值坍缩 local），不 import 共享契约包。
+
+    判据（与 agent 装配分支同源）：
+    - asr_cloud：``asr_json.provider ∈ {doubao, doubao_asr}`` 且凭据在场（新式
+      单 ``api_key``，或旧式 ``app_id``+``access_token`` 两者齐——agent.py 装配
+      点同判）；缺凭据=agent 会回退本地 → 判本地。
+    - llm_cloud / settle_cloud：``model_routing_json.lanes`` 的 a_reply+judge+
+      settle（/settle 单独）provider=="openai"。
+    - mt_local：lanes.mt provider≠"openai"（缺省/缺席/local → True，:1236 照旧
+      按模型在盘拉起）。
+
+    env 闸（serve 侧旋钮；worker 不读这两个键、不入 _FORWARD_ENV）：
+    ``BOK_LOCAL_ASR``=1 强制本地 / =0 强制跳过本地；``BOK_LOCAL_LLM`` 同镜像
+    （作用于 :1235 与 :1237 两腿，mt 车道仍按路由表）。``BOK_DOUBAO_ASR=0``
+    优先于 ``BOK_LOCAL_ASR=0``（worker 物理行为赢）。
+
+    返回 dict：``asr_cloud/asr_why、llm_cloud/llm_why、settle_cloud/settle_why、
+    mt_local/mt_why``。
+    """
+    asr_cloud, asr_why = False, ""
+    llm_cloud, llm_why = False, ""
+    settle_cloud, settle_why = False, ""
+    mt_local, mt_why = True, ""
+
+    def _route_all_local(why: str) -> None:
+        nonlocal llm_cloud, llm_why, settle_cloud, settle_why, mt_local, mt_why
+        llm_cloud, llm_why = False, why
+        settle_cloud, settle_why = False, why
+        mt_local, mt_why = True, why
+
+    asr_cfg: dict = {}
+    lanes: dict = {}
+    db_note = ""
+    routing_bad = False
+    try:
+        import sqlite3
+
+        db_path = paths.app_data_dir() / "bok_voice.db"
+        if not db_path.exists():
+            db_note = "无设置库(保守=本地)"
+        else:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "SELECT asr_json, model_routing_json FROM global_settings"
+                    " WHERE id='global'"
+                ).fetchone()
+            finally:
+                con.close()
+            if row:
+                try:
+                    asr_cfg = json.loads(row[0]) if row[0] else {}
+                except (ValueError, TypeError):
+                    asr_cfg = {}
+                if not isinstance(asr_cfg, dict):
+                    asr_cfg = {}
+                try:
+                    routing = json.loads(row[1]) if row[1] else {}
+                except (ValueError, TypeError):
+                    routing = {}
+                    routing_bad = True
+                if isinstance(routing, dict):
+                    raw_lanes = routing.get("lanes")
+                    if isinstance(raw_lanes, dict):
+                        lanes = raw_lanes
+    except Exception as exc:  # noqa: BLE001 - 启动器不因设置问题崩
+        db_note = f"读取失败({exc.__class__.__name__})(保守=本地)"
+
+    def _lane_provider(lane: str) -> str:
+        cfg = lanes.get(lane)
+        if not isinstance(cfg, dict):
+            return "local"
+        p = str(cfg.get("provider") or "local").strip() or "local"
+        # 未知值按 model_routes._normalize_lane 同款坍缩 local。
+        return p if p in ("openai", "local") else "local"
+
+    # ---- ASR 腿（:8787）----
+    if os.environ.get("BOK_DOUBAO_ASR", "").strip() == "0":
+        asr_cloud, asr_why = False, "BOK_DOUBAO_ASR=0 worker 回退本地"
+    else:
+        override = os.environ.get("BOK_LOCAL_ASR", "").strip()
+        if override == "1":
+            asr_cloud, asr_why = False, "BOK_LOCAL_ASR=1 强制本地"
+        elif override == "0":
+            asr_cloud, asr_why = True, "BOK_LOCAL_ASR=0 强制跳过本地"
+        elif db_note:
+            asr_cloud, asr_why = False, db_note
+        else:
+            provider = str(asr_cfg.get("provider") or "").strip().lower()
+            if provider in ("doubao", "doubao_asr"):
+                new_style = bool(str(asr_cfg.get("api_key") or "").strip())
+                old_style = bool(str(asr_cfg.get("app_id") or "").strip()) and bool(
+                    str(asr_cfg.get("access_token") or "").strip()
+                )
+                if new_style or old_style:
+                    asr_cloud, asr_why = True, "asr.provider=doubao(云凭据在场)"
+                else:
+                    asr_cloud, asr_why = False, "asr.provider=doubao 缺凭据(agent 回退本地)"
+            else:
+                asr_cloud, asr_why = False, f"asr.provider={provider or '未设'}(本地)"
+
+    # ---- LLM 腿（:1235 主 / :1237 settle / mt 车道）----
+    if os.environ.get("BOK_MODEL_ROUTING", "").strip() == "0":
+        _route_all_local("BOK_MODEL_ROUTING=0 路由忽略(env 缺省链=本地)")
+    elif os.environ.get("BOK_LOCAL_LLM", "").strip() == "1":
+        _route_all_local("BOK_LOCAL_LLM=1 强制本地")
+    elif os.environ.get("BOK_LOCAL_LLM", "").strip() == "0":
+        llm_cloud, llm_why = True, "BOK_LOCAL_LLM=0 强制跳过本地"
+        settle_cloud, settle_why = True, "BOK_LOCAL_LLM=0 强制跳过本地"
+        mt_local = _lane_provider("mt") != "openai"
+        mt_why = f"路由 mt={_lane_provider('mt')}"
+    elif db_note:
+        _route_all_local(db_note)
+    elif routing_bad:
+        _route_all_local("路由表损坏(保守=本地)")
+    else:
+        llm_cloud = (
+            _lane_provider("a_reply") == "openai"
+            and _lane_provider("judge") == "openai"
+            and _lane_provider("settle") == "openai"
+        )
+        llm_why = (
+            "路由 a_reply/judge/settle 全 openai"
+            if llm_cloud
+            else (
+                "路由未全云(a_reply="
+                f"{_lane_provider('a_reply')}/judge={_lane_provider('judge')}"
+                f"/settle={_lane_provider('settle')})"
+            )
+        )
+        settle_cloud = _lane_provider("settle") == "openai"
+        settle_why = f"路由 settle={_lane_provider('settle')}"
+        mt_local = _lane_provider("mt") != "openai"
+        mt_why = f"路由 mt={_lane_provider('mt')}"
+
+    return {
+        "asr_cloud": asr_cloud,
+        "asr_why": asr_why,
+        "llm_cloud": llm_cloud,
+        "llm_why": llm_why,
+        "settle_cloud": settle_cloud,
+        "settle_why": settle_why,
+        "mt_local": mt_local,
+        "mt_why": mt_why,
+    }
+
+
+def _ensure_only_for_posture(posture: dict, tts_needed: bool) -> set[str]:
+    """按姿势计算 `download --only` 收窄集（2026-10-05 demo-cloud wave）。
+
+    云腿对应的模型键不进 ensure（本地盘只落真正需要的权重）；mt_local 才含
+    mt；embedding/laya/llm_draft 恒不进——它们是盘上可选件，服务侧「模型在盘
+    才起」的既有门控自洽，收窄不改变其缺席语义（缺席=sidecar 跳过一行明示 +
+    agent 回退）。键集与当前平台表求交（非 mac 表无 mt/settle 等键时不产生
+    幽灵键；表内空 repo 条目 cmd_download 自身跳过）。
+    """
+    table = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
+    keys = set(table)
+    only: set[str] = set()
+    if not posture["asr_cloud"]:
+        only |= {"asr", "sensevoice"} & keys
+    if tts_needed:
+        only |= {"tts_preset", "tts_clone"} & keys
+    if not posture["llm_cloud"]:
+        only |= {"llm", "llm_4b"} & keys
+    if not posture["settle_cloud"]:
+        only |= {"settle"} & keys
+    if posture["mt_local"]:
+        only |= {"mt"} & keys
+    return only
+
+
 def _qwen3_tts_sidecar_env(base: dict[str, str]) -> dict[str, str]:
     """TTS sidecar 启动 env：必填键 + `QWEN3_TTS_*` 前缀整族透传（2026-09-28）。
 
@@ -363,7 +552,16 @@ def _warn_llm_not_http_ready(ports: Sequence[int]) -> None:
                   "(weights loading or half-dead)", file=sys.stderr)
 
 
-def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
+def _start_llm(
+    current: dict[str, str], run_dir: Path, log_dir: Path, posture: dict | None = None
+) -> None:
+    """主 LLM(:1235) 拉起。posture=调用方预算的 `_cloud_posture()` 结果
+    （2026-10-05 demo-cloud wave；None 时现场求值）——llm_cloud（路由
+    a_reply+judge+settle 全 openai）时整条本地链（mlx/queue proxy）不拉起。"""
+    p = posture if posture is not None else _cloud_posture()
+    if p["llm_cloud"]:
+        print(f"[bok] llm :1235 skipped (cloud: {p['llm_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        return
     # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
     # readiness 真话（2026-10-02）：TCP 跳过前补探一次 /v1/models，不就绪大声
@@ -530,12 +728,18 @@ def _start_settle_proxy(run_dir: Path, log_dir: Path) -> bool:
     return True
 
 
-def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+def _start_settle_llm(
+    current: dict[str, str], run_dir: Path, log_dir: Path, posture: dict | None = None
+) -> bool:
     """后台重活专线 LLM(:1237,9B):settle 纪要/知识蒸馏与 flow judge 指到这颗。
 
     可选服务(同 _start_mt_llm 契约):模型缺失直接跳过返回 False——Summarizer
     与 judge 走各自 env 缺席链路回退 :1235;端口已健康不重复起。Qwen3.5 家族
     与主 LLM 同模板参数(关思考);log WARNING(后台作业,唔刷屏)。
+
+    posture=调用方预算的 `_cloud_posture()` 结果（2026-10-05 demo-cloud wave；
+    None 时现场求值）——settle_cloud（路由 settle=openai）时 :1237 连同 :1238
+    前门闸整条不拉起（keep：BOK_DEV_9B 闸仍在其后）。
 
     9B 后端化(2026-09-25):默认不随栈常驻——9B 常驻=夜间崩速主犯之一
     (reports/latency-soak/LANE-AB-2026-09-25.md 附3:judge 9B 二号驻留与回复
@@ -545,6 +749,13 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     fallback),默认随栈(模型在盘);BOK_DEV_9B=0 显式关=旧形状(judge/settle
     回退 :1235)。
     """
+    p = posture if posture is not None else _cloud_posture()
+    if p["settle_cloud"]:
+        print(
+            f"[bok] settle lane :1237 skipped (cloud: {p['settle_why']}; BOK_LOCAL_LLM=1 强制拉起)",
+            file=sys.stderr,
+        )
+        return False
     if not env._dev_9b_enabled():
         print("[bok] 9B lane off (BOK_DEV_9B=0) — skip :1237 (a_reply 车道/judge/settle 回退 :1235)", file=sys.stderr)
         return False
@@ -692,15 +903,53 @@ def _cmd_up_services(models_only: bool = False) -> int:
     log_dir = paths.app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # 云端演示档姿势（2026-10-05 demo-cloud wave）：TTS 门控与云姿势判定先于
+    # ensure/拉起——模型只 ensure 真正需要的、云腿端口（:8787/:1235/:1237）
+    # 不拉起、就绪等待随之收窄。全本地形状逐字节同旧（零漂移铁律）。
+    tts_needed, tts_why = _local_tts_needed()
+    posture = _cloud_posture()
     print("[bok] ensuring models…")
     # cmd_download W③ 起住 bokctl.commands.download(模型 ensure 单点不变)。
-    commands.download.cmd_download()
+    if (
+        not posture["asr_cloud"]
+        and tts_needed
+        and not posture["llm_cloud"]
+        and not posture["settle_cloud"]
+    ):
+        # 全本地形状:整表 ensure 逐字节同旧(零漂移铁律)。
+        commands.download.cmd_download()
+    else:
+        only = _ensure_only_for_posture(posture, tts_needed)
+        print(
+            "[bok] cloud posture: "
+            f"asr={'cloud' if posture['asr_cloud'] else 'local'}"
+            f" tts={'local' if tts_needed else 'cloud'}"
+            f" llm={'cloud' if posture['llm_cloud'] else 'local'}"
+            f" mt={'local' if posture['mt_local'] else 'cloud'}"
+            f" settle={'cloud' if posture['settle_cloud'] else 'local'}"
+            f" — ensure narrowed: {sorted(only)}"
+            " (embed/laya/draft=盘上可选,不进 ensure;服务侧模型在盘才起)"
+        )
+        # 空收窄集（全云姿势且 mt 也走云）必须整支跳过：cmd_download(only=set())
+        # 的 `if only else None` 语义会把空集当「整表」，反向全量下载。
+        if only:
+            commands.download.cmd_download(only=only)
     print("[bok] starting services…")
 
     current = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
     asr_py = paths.sidecar_python("qwen3-asr-sidecar")
     tts_py = paths.sidecar_python("qwen3-tts-sidecar")
-    if not asr_py.exists() or not tts_py.exists():
+    # 云端演示档(2026-10-05 真栈实弹发现):sidecar venv 存在性检查只对「本姿势
+    # 真要拉起」的 sidecar 生效——云 ASR 档不起 :8787 就不要求其 venv 在盘
+    # (否则演示新机/干净 worktree 在全云档被一个用不上的 venv 卡 exit 2)。
+    _missing = []
+    if not posture["asr_cloud"] and not asr_py.exists():
+        _missing.append(("asr", asr_py))
+    if tts_needed and not tts_py.exists():
+        _missing.append(("tts", tts_py))
+    if _missing:
+        for _which, _p in _missing:
+            print(f"[bok] sidecar python missing ({_which}): {_p}", file=sys.stderr)
         print(
             "[bok] sidecar pythons missing — run setup"
             " (./scripts/bootstrap.sh; node 节点机=scripts/install-node.sh)",
@@ -741,16 +990,23 @@ def _cmd_up_services(models_only: bool = False) -> int:
         if (_sv_dir / "model.int8.onnx").is_file() and (_sv_dir / "tokens.txt").is_file():
             asr_env["QWEN3_ASR_SV_MODEL_DIR"] = str(_sv_dir)
     if not core.healthy(8787):
-        _start_proc(
-            [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
-             "--host", "127.0.0.1", "--port", "8787"],
-            run_dir / "asr.pid", log_dir / "asr.log",
-            # 前缀整族透传（2026-10-02）：sidecar 专属调参键 prod 封闭 env 可达
-            # （TTS `_qwen3_tts_sidecar_env` 先例；BOK_ASR_ENGINE/DEVICE 已在上
-            # 方显式进 asr_env）。
-            env=_qwen3_asr_sidecar_env(asr_env),
-        )
-    tts_needed, tts_why = _local_tts_needed()
+        if posture["asr_cloud"]:
+            # 云端演示档（2026-10-05）：worker 装配吃豆包云 ASR，本地 Qwen3-ASR
+            # sidecar 不拉起（1.9GB+ 权重零消费）；BOK_LOCAL_ASR=1 是显式回拉口。
+            print(
+                f"[bok] asr sidecar :8787 skipped (cloud: {posture['asr_why']};"
+                " BOK_LOCAL_ASR=1 强制拉起)"
+            )
+        else:
+            _start_proc(
+                [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
+                 "--host", "127.0.0.1", "--port", "8787"],
+                run_dir / "asr.pid", log_dir / "asr.log",
+                # 前缀整族透传（2026-10-02）：sidecar 专属调参键 prod 封闭 env 可达
+                # （TTS `_qwen3_tts_sidecar_env` 先例；BOK_ASR_ENGINE/DEVICE 已在上
+                # 方显式进 asr_env）。
+                env=_qwen3_asr_sidecar_env(asr_env),
+            )
     if tts_needed and not core.healthy(8788):
         # 清残留：serve 重试可能叠加多个卡死的 TTS 进程，先按 pidfile 收掉。
         _stop_pidfile(run_dir / "tts.pid")
@@ -770,9 +1026,9 @@ def _cmd_up_services(models_only: bool = False) -> int:
     elif not tts_needed:
         print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
 
-    _start_llm(current, run_dir, log_dir)
+    _start_llm(current, run_dir, log_dir, posture)
     want_mt = _start_mt_llm(current, run_dir, log_dir)
-    want_settle = _start_settle_llm(current, run_dir, log_dir)
+    want_settle = _start_settle_llm(current, run_dir, log_dir, posture)
     # W1b embedding sidecar(:8789,bge-m3 MLX):意图语义车道可选增强——镜像
     # mt/settle 的「模型在盘才起」姿势;venv/模型/端口三缺一即跳过,agent 装配
     # 面降级闩自动关语义车道。W1b 只做 mac-mlx 形态,windows 表无 embedding 键。
@@ -807,7 +1063,17 @@ def _cmd_up_services(models_only: bool = False) -> int:
     print("[bok] waiting for services…")
     # mt(:1236)/settle(:1237)/embed(:8789)/laya(:8791)仅在确实拉起时纳入等待;主栈端口照旧。
     # :8788 同理（2026-09-27 全云端门控）——跳过时不等待也不进重启兜底。
-    core_ports = (8787, 1235) + ((8788,) if tts_needed else ())
+    # 云腿（:8787/:1235，2026-10-05 demo-cloud）按姿势收窄——跳过时不等待也不进
+    # 宽松终检缺口（镜像 tts_needed 模式）。
+    asr_skip = posture["asr_cloud"]
+    llm_skip = posture["llm_cloud"]
+    core_ports = (
+        ((8787,) if not asr_skip else ())
+        + ((1235,) if not llm_skip else ())
+        + ((8788,) if tts_needed else ())
+    )
+    asr_ready = "asr=skipped(cloud)" if asr_skip else "asr=8787"
+    llm_ready = "llm=skipped(cloud)" if llm_skip else "llm=1235"
     tts_ready = "tts=8788" if tts_needed else "tts=skipped(cloud-only)"
     targets = (
         core_ports
@@ -821,7 +1087,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
     mo_suffix = " (models-only)" if models_only else ""
     for _ in range(180):
         if all(core.healthy(p) for p in targets):
-            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235{mt_ready_suffix}{mo_suffix}")
+            print(f"[bok] ready: {asr_ready} {tts_ready} {llm_ready}{mt_ready_suffix}{mo_suffix}")
             return 0
         time.sleep(1)
     # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
@@ -850,7 +1116,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
                 break
             time.sleep(1)
     if all(core.healthy(p) for p in targets):
-        print(f"[bok] ready (after tts restart): asr=8787 {tts_ready} llm=1235{mt_ready_suffix}")
+        print(f"[bok] ready (after tts restart): {asr_ready} {tts_ready} {llm_ready}{mt_ready_suffix}")
         return 0
     if want_mt and all(core.healthy(p) for p in core_ports) and not core.healthy(1236):
         # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
@@ -862,7 +1128,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
     # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
     still_down = health._ports_down_after_grace(targets)
     if not still_down:
-        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235{mt_ready_suffix}")
+        print(f"[bok] ready (relaxed recheck): {asr_ready} {tts_ready} {llm_ready}{mt_ready_suffix}")
         return 0
     if health._only_optional_ports(still_down):
         # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行

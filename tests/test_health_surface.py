@@ -317,6 +317,14 @@ def test_dev_9b_off_skips_settle_llm_start(monkeypatch, tmp_path, capsys):
     不等 :1237）；stderr 留一行明示回退。2026-10-01 P2 翻档后缺省=开。"""
     monkeypatch.setenv("BOK_DEV_9B", "0")
     started: list[list[str]] = []
+    # 密闭纪律（2026-10-05 demo-cloud）：_start_settle_llm 云姿势闸读真 DB——
+    # 钉全本地，本测试断言的是 BOK_DEV_9B 闸自己的跳过分支。
+    patch_bok(monkeypatch, "_cloud_posture", lambda: {
+        "asr_cloud": False, "asr_why": "",
+        "llm_cloud": False, "llm_why": "",
+        "settle_cloud": False, "settle_why": "",
+        "mt_local": True, "mt_why": "",
+    })
     patch_bok(monkeypatch, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
     rc = bok.servers._start_settle_llm({}, tmp_path, tmp_path)
     assert rc is False

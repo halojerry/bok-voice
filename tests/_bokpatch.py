@@ -62,6 +62,7 @@ PATCH_TARGETS: dict[str, str] = {
     "_apply_mlx_template_fix": "bokctl.servers",
     "_worker_specs": "bokctl.servers",
     "_local_tts_needed": "bokctl.servers",
+    "_cloud_posture": "bokctl.servers",
     "_start_proc": "bokctl.servers",
     "_realtime_demo_enabled": "bokctl.servers",
     "_physical_mem_gib": "bokctl.servers",

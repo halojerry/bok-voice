@@ -330,6 +330,14 @@ def test_start_llm_tcp_skip_warns_when_http_not_ready(monkeypatch, tmp_path, cap
     告警一行；TCP 跳过语义本身不变（绝不双起）。"""
     patch_bok(monkeypatch, "is_mac", lambda: True)
     monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
+    # 密闭纪律（2026-10-05 demo-cloud）：_start_llm 云姿势闸读真 DB——钉全本地，
+    # 否则本机路由切云档时本测试被 skip 分支短路（假阴性）。
+    patch_bok(monkeypatch, "_cloud_posture", lambda: {
+        "asr_cloud": False, "asr_why": "",
+        "llm_cloud": False, "llm_why": "",
+        "settle_cloud": False, "settle_why": "",
+        "mt_local": True, "mt_why": "",
+    })
     patch_bok(monkeypatch, "healthy", lambda port: True)
     started: list = []
     patch_bok(monkeypatch, "_start_proc", lambda *a, **k: started.append(a))
