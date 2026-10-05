@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 """models 域(模型目录/路径/下载/选型:MODELS 平台模型表、model_dir/model_path
 解析、resolve_llm_repo 档位选型、_mt/_settle/laya/_llm_draft 专线模型解析、
-setup_models/cmd_setup/cmd_download/cmd_catalog/cmd_manifest 装机面;
+setup_models/cmd_catalog/cmd_manifest 装机面;
 G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
+
+G2 W③(2026-10-05):cmd_setup/cmd_download 两个命令入口随 CLI 分家搬入
+bokctl/commands/{setup,download}.py——本域保留模型表/解析/下载原语
+(_dir_sha256/_enable_hf_transfer 仍住此处,由 commands.download 穿 models.X 取)。
 
 - 本模块不再依赖 core(paths 波后 core.X 消费点清零):路径/平台锚(platform_key/
   is_packaged/is_mac/is_linux/app_data_dir)住 bokctl.paths,本模块穿
@@ -12,8 +16,8 @@ G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
   _lmstudio_models_dir/_usable_model_dir/model_path/_settings_llm_local_model/
   resolve_llm_repo/_mt_llm_model/_settle_llm_model/_usable_laya_dir/
   laya_model_path/_llm_draft_enabled/_llm_draft_model/_llm_draft_flags/
-  cmd_catalog/cmd_manifest/setup_models/_all_models_present/cmd_setup/
-  _dir_sha256/_enable_hf_transfer/cmd_download)域内裸名互调(同模块全局=
+  cmd_catalog/cmd_manifest/setup_models/_all_models_present/
+  _dir_sha256/_enable_hf_transfer)域内裸名互调(同模块全局=
   call-time 可 patch)。
 - 留守 core 的近邻(边界记录,2026-10-04;env 波更新):_dev_9b_enabled/
   _settle_gate_url 与整张 env 组装面 **W②-env 波(最后一批)已搬入 bokctl.env**
@@ -407,16 +411,6 @@ def _all_models_present() -> bool:
     return all(m["present"] for m in setup_models() if m["required"])
 
 
-def cmd_setup(action: str = "status") -> int:
-    if action == "download":
-        cmd_download()
-        print(json.dumps({"ready": _all_models_present()}, ensure_ascii=False))
-        return 0
-    data = {"ready": _all_models_present(), "models": setup_models()}
-    print(json.dumps(data, indent=2, ensure_ascii=False))
-    return 0
-
-
 def _dir_sha256(path: Path) -> str:
     import hashlib
 
@@ -438,59 +432,3 @@ def _enable_hf_transfer() -> None:
         os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     except Exception:
         pass
-
-
-def cmd_download(only: set[str] | None = None) -> int:
-    """下载平台模型表里的模型（幂等：已在盘跳过；`only` 限定子集——装机选型用）。
-
-    `only` 提到表内不存在的键（如非 mac 表的 mt/settle）→ 逐项说明「未配置，
-    对应功能回退主 LLM」，不算失败（与 OPTIONAL_MODELS 语义一致）。
-    """
-    key = paths.platform_key()
-    table = MODELS[key]
-    requested = set(only) if only else None
-    if requested:
-        for name in sorted(requested - set(table)):
-            print(f"  [skip] {name} 当前平台表未配置（可选档；对应功能回退主 LLM :1235）")
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception as exc:  # pragma: no cover
-        print(f"[download] huggingface_hub missing: {exc}", file=sys.stderr)
-        return 2
-    _enable_hf_transfer()
-    for name, repo in table.items():
-        if not repo:
-            continue
-        # draft 权重 opt-in(2026-09-25,BOK_LLM_DRAFT 默认关):全量下载/serve
-        # ensure 不拉 0.6B(~335MB)——默认档零下载零驻留(全栈 47/48G 内存压力
-        # 线上,没人用的权重不占盘不占内存)。显式 --only llm_draft 或
-        # BOK_LLM_DRAFT=1 才落盘。
-        if (name == "llm_draft" and not _llm_draft_enabled()
-                and (requested is None or "llm_draft" not in requested)):
-            print("  [skip] llm_draft (BOK_LLM_DRAFT!=1 默认不下载;补齐: download --only llm_draft)")
-            continue
-        if requested is not None and name not in requested:
-            continue
-        target = model_dir(repo)
-        if target.exists() and any(target.iterdir()):
-            print(f"  [ok]   {name} present  {target}")
-            continue
-        # mac dev 的 lmstudio 布局同样算「已在盘」——与 model_path 的「哪边真实
-        # 存在用哪边」同语义;不认的话 lmstudio 已有的模型会被重复下载 5.5GB
-        # (2026-09-17 settle 9B 实证:serve 在 ensure 步静默拉 HF)。
-        if paths.is_mac():
-            lm = _lmstudio_models_dir() / repo
-            if lm.exists() and any(lm.iterdir()):
-                print(f"  [ok]   {name} present (lmstudio)  {lm}")
-                continue
-        print(f"  [down] {name}  {repo}")
-        kwargs: dict = {}
-        if key == "windows" and name == "llm":
-            kwargs["allow_patterns"] = WINDOWS_LLM_GGUF_PATTERNS
-        # hf_hub 1.x 自动断点续传，无需显式 resume_download。
-        snapshot_download(repo_id=repo, local_dir=str(target), **kwargs)
-        print(f"  [ok]   {name} downloaded")
-    # hf_transfer 只用于下载加速；下载完成后摘掉，避免泄漏到 sidecar/LLM 进程，
-    # 防止模型加载阶段偶发阻塞（观察：TTS 首启卡死与 HF_HUB_ENABLE_HF_TRANSFER 同现）。
-    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
-    return 0

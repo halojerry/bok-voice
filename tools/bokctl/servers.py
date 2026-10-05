@@ -1,7 +1,11 @@
 #!/usr/bin/env python
-"""servers 域(serve/up 服务面:cmd_serve/cmd_up 编排、_start_* 服务拉起家族、
+"""servers 域(serve/up 服务面:服务拉起编排、_start_* 服务拉起家族、
 _worker_specs 装配、本地 TTS 门控、sidecar env 透传、LLM launch 配置件、
 spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
+
+G2 W③(2026-10-05):cmd_serve/cmd_up 两个命令入口随 CLI 分家搬入
+bokctl/commands/{serve,up}.py——本域保留它们下面的全部服务面实现
+(_cmd_up_services/_start_call_plane/_start_* 家族/_worker_specs 等)。
 
 - 本模块 `from bokctl import core/env`(及 health/proc/models/paths 域)拿模块
   对象:凡仍住在 core 的名字(healthy/_desktop_stack_targets/_agent_worker_port/
@@ -12,11 +16,12 @@ spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)�
   bokctl.env,本域穿 `env.X` 取(env 波新例:域间消费=改穿所属域,core 不做值
   转发);health/proc 域件穿 health.X/proc.X,models 域件(models.MODELS/model_path/
   resolve_llm_repo/_mt_llm_model/_settle_llm_model/laya_model_path/
-  _llm_draft_flags/cmd_download 等)穿 models.X 取;路径/平台锚(ROOT/
+  _llm_draft_flags 等)穿 models.X 取;路径/平台锚(ROOT/
   app_data_dir/repo_python/sidecar_python/is_mac/is_packaged/bundled_node/
   bundled_llama/_embedded_livekit/_livekit_config_path/MLX_SERVER_WRAPPER)
-  paths 波(2026-10-04)后穿 `paths.X` 取。
-- 本域自有函数(cmd_serve/cmd_up/_cmd_up_services/_start_call_plane/_start_llm/
+  paths 波(2026-10-04)后穿 `paths.X` 取;模型 ensure 的 cmd_download W③ 起
+  住 bokctl.commands.download,本域穿 `commands.download.cmd_download()` 取。
+- 本域自有函数(_cmd_up_services/_start_call_plane/_start_llm/
   _start_mt_llm/_start_settle_proxy/_start_settle_llm/_start_laya/_worker_specs/
   _realtime_demo_enabled/_local_tts_needed/_qwen3_*_sidecar_env/_apply_mlx_
   template_fix/_mlx_hf_offline_env/_settle_cache_bytes/_default_prompt_cache_
@@ -35,13 +40,14 @@ spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)�
   core」)已随 paths 波解除——常量随 ROOT 住 bokctl.paths,消费者穿 paths. 取;
   健康面五件套+端口表+_desktop_stack_targets
   (health 波既定);_cp_bind_host(prod 消费)/_pid_alive(prod 消费)判留;
-  cmd_monitor/cmd_down 留 core(proc 波边界记录——down 被 prod uninstall 与
-  node_agent 吃,monitor 是 core 命令;两者已改穿 servers.X 取装配/spawn 件)。
+  cmd_monitor/cmd_down W③ 起住 bokctl/commands/{monitor,down}.py(原 proc 波
+  判「留 core」随 CLI 分家解除——down 被 prod uninstall 与 node_agent 吃,
+  monitor 是命令;两者已改穿 servers.X 取装配/spawn 件)。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把 cmd_up/
   _cmd_up_services/_start_call_plane/_start_llm/_start_mt_llm/_start_settle_llm/
   _start_laya/_apply_mlx_template_fix/_worker_specs/_local_tts_needed/_start_proc/
-  _realtime_demo_enabled/_physical_mem_gib 改道 bokctl.servers);facade 读用
-  bok.servers.X。
+  _realtime_demo_enabled/_physical_mem_gib 改道——cmd_up W③ 起改道
+  bokctl.commands.up,其余仍 bokctl.servers);facade 读用 bok.servers.X。
 """
 from __future__ import annotations
 
@@ -54,7 +60,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from bokctl import core, env, health, models, paths, proc
+from bokctl import commands, core, env, health, models, paths, proc
 
 
 # spawn 原语四件(2026-10-04 servers 波随服务面搬出;消费者=本域 _start_* 家族
@@ -681,38 +687,14 @@ def _start_call_plane(py) -> bool:
     return True
 
 
-def cmd_up(models_only: bool = False) -> int:
-    """全栈拉起（node_agent 与 serve 共用）：服务面 + 通话面。
-
-    Ubuntu 节点形态修复（2026-09-20）：旧 cmd_up 只起服务面（sidecar/LLM/b-line），
-    LiveKit 与三个 agent worker 只在 dev `serve` 里起——节点装完打不了电话。
-    通话面现已提取为 _start_call_plane（与 serve 同源）。返回码沿用服务面语义：
-    通话面未齐只打 stderr 不篡改服务面结果（由调用方就绪等待如实失败，健康面
-    doctor 呈现 degrad）。
-
-    ``models_only=True``（`bok up --models-only`，2026-10-02 审计）：只拉模型面
-    （服务面：asr/llm/mt/settle/tts+proxy），跳过通话面（livekit/worker/monitor）
-    ——重启后模型面由可选常驻单元 `bok-model-plane` 补拉（`prod install
-    --with-model-plane`，默认 OFF），通话面归既有单元，人工零介入。
-    """
-    # 缺省档零参调用（既有 stub/调用方逐字节兼容）；仅显式 --models-only 传参。
-    rc = _cmd_up_services(models_only=True) if models_only else _cmd_up_services()
-    if rc:
-        return rc
-    if models_only:
-        print("[bok] models-only: 模型面就绪——通话面（livekit/worker/monitor）跳过")
-        return 0
-    _start_call_plane(paths.repo_python())
-    return 0
-
-
 def _cmd_up_services(models_only: bool = False) -> int:
     run_dir = paths.app_data_dir() / "run"
     log_dir = paths.app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     print("[bok] ensuring models…")
-    models.cmd_download()
+    # cmd_download W③ 起住 bokctl.commands.download(模型 ensure 单点不变)。
+    commands.download.cmd_download()
     print("[bok] starting services…")
 
     current = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
@@ -956,112 +938,3 @@ def _worker_specs(py) -> list[dict]:
             }
         )
     return specs
-
-
-def cmd_serve() -> int:
-    """Bring up the full no-Docker desktop stack and wait until ready.
-
-    Packaged mode (BOK_PACKAGED=1) serves the UI from the Tauri static bundle,
-    so the Next server on :3000 is NOT started. All local services bind
-    127.0.0.1 (CP honors BOK_BIND_HOST, default 127.0.0.1). Business data goes
-    to SQLite and the knowledge vault lives in app-data (never the read-only
-    bundle).
-    """
-    run_dir = paths.app_data_dir() / "run"
-    log_dir = paths.app_data_dir() / "logs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸+来源鉴定）：身份
-    # 复核不过的一律不动；他树 stamp 的 bok 栈永不收割（跨树互杀/多会话纪律）；
-    # 本树与无戳的再过健康闸——「健康」放行（防 CPU 风暴把加载中子代当孤儿误
-    # 杀的互杀循环）。残留面：同树「健康但旧代码」的进程无法从外部判定所载代
-    # 码版本，会被 spawn 门复用（A/B 污染面）——清扫日志逐口提示 left alone，
-    # 改完代码要吃新代码先 down 再起。
-    stale = proc._sweep_orphan_listeners()
-    for port, cmd, pid in stale:
-        print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
-
-    py = paths.repo_python()
-    # Dev 模式用系统 node 起 Next dev（打包模式 BOK_PACKAGED=1 跳过 web:3000）。
-    node = paths.bundled_node() or "node"
-    # control-plane
-    # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
-    db = (paths.app_data_dir() / "bok_voice.db").as_posix()
-    cp_env: dict[str, str] = env._control_plane_env(db)
-    if not core.healthy(8000):
-        _start_proc(
-            [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", core._cp_bind_host(), "--port", "8000"],
-            run_dir / "control-plane.pid",
-            log_dir / "control-plane.log",
-            env=cp_env,
-        )
-    # Dev mode: Next dev server on :3000 (packaged serves static UI from Tauri).
-    # next.config.mjs 是 output:"export"，`next start` 无法服务 export 产物，
-    # 必须用 `next dev`（export 只在 build 阶段生效）。
-    if not paths.is_packaged() and not core.healthy(3000):
-        _start_proc(
-            [
-                str(node),
-                str(_repo_web_modules() / "next" / "dist" / "bin" / "next"),
-                "dev",
-                "-H",
-                "127.0.0.1",
-                "-p",
-                "3000",
-            ],
-            run_dir / "web.pid",
-            log_dir / "web.log",
-            env={"NEXT_PUBLIC_CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")},
-            cwd=str(paths.ROOT / "apps" / "web"),
-        )
-
-    # 通话面（LiveKit + agent worker + 常驻监控）由 cmd_up→_start_call_plane 单点
-    # 拉起（2026-09-20 提取，serve 与 node_agent 全栈同源）；本函数只做就绪等待。
-    rc = cmd_up()
-    if rc:
-        return rc
-
-    print("[bok] waiting for desktop stack…")
-    desktop_tts_needed = _local_tts_needed()[0]
-    # 基础口表吃 _desktop_stack_targets()（agent worker 口=BOK_WORKER_PORT 动态；
-    # 2026-10-02 审计——旧版硬编码 8081，错开档就绪等待永远打缺省口）。
-    targets = core._desktop_stack_targets()
-    if desktop_tts_needed:
-        targets.insert(2, 8788)
-    if _realtime_demo_enabled():
-        # 演示档 worker 随栈拉起时纳入就绪等待（opt-in，:8084）。
-        targets.append(8084)
-    if core.healthy(1236):
-        # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
-        targets.append(1236)
-    if not paths.is_packaged():
-        targets.append(3000)
-    # 就绪判据（2026-10-02 readiness 真话）：1235（/v1/models）/8787/8788
-    # （/health）必须 HTTP 200——mlx 先绑端口后装权重、sidecar 模型装载中
-    # 503，TCP 通≠能干活；这些口的宽松终检同款（见 _serve_ready_probe*）。
-    if health._wait_desktop_ready(targets):
-        _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-        ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
-        if 1236 in targets:
-            ready += " mt=1236"
-        print(ready)
-        # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
-        if not paths.is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
-            try:
-                import webbrowser
-                webbrowser.open("http://127.0.0.1:3000")
-            except Exception:  # pragma: no cover - 打开浏览器失败不影响启动
-                pass
-        return 0
-    # 宽松终检（2026-09-19 互杀事故收编）：CPU 风暴下 1s 探测可整轮假死，
-    # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
-    # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
-    # 严格口（1235/8787/8788）的复检维持 HTTP-200 真话（still_down 点名如实）。
-    still_down = health._ports_down_after_grace(targets, probe=health._serve_ready_probe_relaxed)
-    if not still_down:
-        _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")
-        return 0
-    print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
-    return 1

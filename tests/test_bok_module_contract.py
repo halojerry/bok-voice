@@ -13,6 +13,14 @@
 
 新增/删除 env 键 → ② 必红：更新快照是**显式立法动作**（与在表里改行同责，
 test_forward_env.py 扫 agent_runtime 读取面管「漏登记」，本测试管「静默漂移」）。
+
+W③（2026-10-05）起加钉 CLI 分派面：
+  ⑤ 分派注册表：bokctl.cli._COMMANDS 键集 == 全部 14 个子命令（冻结
+     frozenset），每个值都有可调用的 run(args)（run(args) 协议）；
+  ⑥ 门面恒等：``bok.parse_args is bokctl.cli.parse_args``、
+     ``bok.main is bokctl.cli.main``、
+     ``bok.commands.down.cmd_down is bokctl.commands.down.cmd_down`` 所指
+     同一函数对象（门面镜像零拷贝）。
 """
 from __future__ import annotations
 
@@ -23,6 +31,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "tools"))
 
 import bok  # noqa: E402
+import bokctl.cli  # noqa: E402
+import bokctl.commands  # noqa: E402
 import bokctl.env  # noqa: E402
 
 
@@ -133,3 +143,29 @@ def test_facade_identity_env_module():
     assert bok.env._FORWARD_ENV is bokctl.env._FORWARD_ENV
     # 历史名别名同源（2026-09-18 旧调用面锚）
     assert bok.env._BOK_PASSTHROUGH_KEYS is bok.env._FORWARD_ENV
+
+
+# ── ⑤ 冻结快照（W③ 2026-10-05 CLI 分家时刻的 14 子命令全集）────────────────
+_SUBCOMMAND_NAMES: frozenset[str] = frozenset({
+    "catalog", "manifest", "status", "serve", "down", "doctor", "tts-mine",
+    "clean-testdata", "monitor", "up", "download", "tts-pregen", "prod", "setup",
+})
+
+
+def test_dispatch_registry_covers_exactly_the_14_subcommands():
+    """⑤ 分派注册表钉死：_COMMANDS 键集 == 全部 14 子命令（新增/删除子命令
+    必须显式立法进表+快照），且每个值都有可调用的 run(args)（run 协议）。"""
+    assert set(bokctl.cli._COMMANDS) == set(_SUBCOMMAND_NAMES), (
+        "bokctl.cli._COMMANDS 与 14 子命令全集漂移——新增/删除子命令是显式"
+        "立法动作：同步 cli._COMMANDS 与本测试的 _SUBCOMMAND_NAMES 快照"
+    )
+    for name, mod in bokctl.cli._COMMANDS.items():
+        assert callable(getattr(mod, "run", None)), f"_COMMANDS[{name!r}] 缺 run(args)"
+
+
+def test_facade_identity_cli_dispatch():
+    """⑥ 门面恒等：bok.parse_args/bok.main 与 cli 同一函数对象（core 经
+    vars(core) 镜像续读），命令实现与属主模块同对象（零拷贝）。"""
+    assert bok.parse_args is bokctl.cli.parse_args
+    assert bok.main is bokctl.cli.main
+    assert bok.commands.down.cmd_down is bokctl.commands.down.cmd_down

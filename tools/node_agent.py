@@ -2,7 +2,8 @@
 
 P0 职责：①向云 CP 心跳上报（失联 ≥max_missed 置 refuse_jobs 旗标，日志可见；
 拒派发的执行端是 livekit load_threshold，P3 接 commands 通道后由指令精确控制）
-②可选拉起全栈（复用 bok.cmd_up/cmd_down）③把 cpUrl/livekitUrl 注入 web 产物
+②可选拉起全栈（复用 bok.commands.up.cmd_up / bok.commands.down.cmd_down）
+③把 cpUrl/livekitUrl 注入 web 产物
 （runtime-config.js），使同一份静态导出可作节点本地坐席工作台；④**节点本地
 托管坐席 UI**（--ui-dir 给定即 stdlib 静态服务 :3000，话务员浏览器零安装访问；
 2026-09-17 起 runbook 的「http://<节点IP>:3000」由本进程兑现，不再依赖桌面壳）
@@ -406,7 +407,7 @@ def serve_ui(ui_dir: Path, bind: str = "0.0.0.0", port: int = 3000) -> None:
 # ---- 远程停机开关（site-delivery Task 6，wire 契约见 control_plane/main.py
 # node_heartbeat 的 401 detail 塑形 + scripts/probes/probe_killswitch.py ④⑤⑦⑨）----
 
-# 全栈停止钩子：full-stack 模式由 main 注入 bok.cmd_down 的幂等包装（kill 路径
+# 全栈停止钩子：full-stack 模式由 main 注入 bok.commands.down.cmd_down 的幂等包装（kill 路径
 # 与 main finally 共享同一「只真停一次」旗标）；heartbeat-only/启动早期无栈
 # 可停，保持 None。
 _kill_stack_hook: Callable[[], None] | None = None
@@ -947,10 +948,10 @@ def main(argv=None) -> int:
         if stack_down:
             return
         stack_down = True
-        bok.cmd_down()
+        bok.commands.down.cmd_down()
 
     _kill_stack_hook = _stop_stack_once
-    bok.servers.cmd_up()
+    bok.commands.up.cmd_up()
     stop = threading.Event()
     worker = threading.Thread(
         target=functools.partial(heartbeat_loop, cfg, stop,

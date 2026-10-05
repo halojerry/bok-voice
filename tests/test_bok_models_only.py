@@ -35,10 +35,10 @@ def test_models_only_skips_call_plane(monkeypatch) -> None:
         monkeypatch, "_start_call_plane",
         lambda py: (calls.append(("call_plane",)), True)[1])
     patch_bok(monkeypatch, "repo_python", lambda: "/py")
-    assert bok.servers.cmd_up(models_only=True) == 0
+    assert bok.commands.up.cmd_up(models_only=True) == 0
     assert calls == [("services", True)], "models-only 不得拉通话面"
     calls.clear()
-    assert bok.servers.cmd_up() == 0
+    assert bok.commands.up.cmd_up() == 0
     assert calls == [("services", False), ("call_plane",)], "缺省全栈行为零变化"
 
 

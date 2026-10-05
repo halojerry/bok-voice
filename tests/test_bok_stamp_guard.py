@@ -233,7 +233,7 @@ def test_cmd_down_skips_foreign_pidfile(monkeypatch, tmp_path, capsys):
         run = _run_dir(home)
         (run / "agent.pid").write_text(str(foreign.pid))
         (run / "tts.pid").write_text(str(unknown.pid))
-        rc = bok.cmd_down()
+        rc = bok.commands.down.cmd_down()
         assert rc == 0
         _assert_alive(foreign)
         err = capsys.readouterr().err
@@ -322,7 +322,7 @@ def test_cmd_monitor_writes_own_stamps(monkeypatch, tmp_path):
     bok.proc._write_proc_stamps(run / "monitor.pid", pid)
     assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
     import inspect
-    assert "_write_proc_stamps(run_dir / \"monitor.pid\", os.getpid())" in inspect.getsource(bok.cmd_monitor)
+    assert "_write_proc_stamps(run_dir / \"monitor.pid\", os.getpid())" in inspect.getsource(bok.commands.monitor.cmd_monitor)
 
 
 def test_pidfile_alive_stamped_pid_reuse_judged_dead(monkeypatch, tmp_path):

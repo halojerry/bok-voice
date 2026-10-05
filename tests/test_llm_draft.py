@@ -172,13 +172,13 @@ def test_download_draft_gate_opt_in(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "platform_key", lambda: "mac")
 
     _clear_draft_env(monkeypatch)
-    assert bok.models.cmd_download() == 0
+    assert bok.commands.download.cmd_download() == 0
     assert _DRAFT_REPO not in calls
 
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
-    assert bok.models.cmd_download() == 0
+    assert bok.commands.download.cmd_download() == 0
     assert calls.count(_DRAFT_REPO) == 1
 
     monkeypatch.delenv("BOK_LLM_DRAFT", raising=False)
-    assert bok.models.cmd_download(only={"llm_draft"}) == 0
+    assert bok.commands.download.cmd_download(only={"llm_draft"}) == 0
     assert calls.count(_DRAFT_REPO) == 2
