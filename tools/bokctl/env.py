@@ -717,6 +717,11 @@ _FORWARD_ENV = (
     "BOK_TTS_PREWARM",
     # Qwen3-ASR：agent 侧插件读面（sidecar 进程专属键另走 asr_env，不在此表）：
     "QWEN3_ASR_CHUNK_MS",
+    # B 线提交边界三键(2026-10-06 延迟压刀起显式登记:逗号档字数/长度档字数/
+    # 句级限速——operator 显式 export 须经 serve 面转发才能触达 B worker)。
+    "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS",
+    "QWEN3_ASR_CLAUSE_LEN_CHARS",
+    "QWEN3_ASR_COMMIT_MIN_INTERVAL_S",
     "QWEN3_ASR_HESITATION_GATE",
     "QWEN3_ASR_JOIN_HOLD_MS",
     "QWEN3_ASR_JOIN_HOLD_VOCAB",
@@ -865,6 +870,15 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     # 时,滑窗未提交前缀攒够字数(默认 10)且跨窗稳定即就地切句——标点档/停顿档
     # 的第三事件源,译出声不等人讲完。默认 1,显式 0 逃生;A 线唔带此 env。
     env.setdefault("QWEN3_ASR_CLAUSE_LEN_COMMIT", "1")
+    # B 线延迟压刀(2026-10-06):提交边界三收紧——demo-cloud 实弹分段账
+    # (perceived_ms 838→3878 同输入方差)定位大头=提交闸排队等待而非模型腿
+    # (mt_ms=260 恒定/ASR_MS 190-320/TTS 首音频 270-460≈地板 1s)。B 线专属:
+    # ①逗号档字数 8→6(自然短语组提前半拍);②长度档字数 10→8(地板即 8);
+    # ③句级提交限速 1.5→1.0s(连珠句排队窗缩短)。A 线 worker 唔带这些 env,
+    # 客服线逐字节零变化;三键均显式 env 可覆盖(经下方透传白名单)。
+    env.setdefault("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    env.setdefault("QWEN3_ASR_CLAUSE_LEN_CHARS", "8")
+    env.setdefault("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "1.0")
     # VAD 停嘴门槛(2026-10-02 收编):旧版在此 setdefault 0.35(2026-09-17 B 线
     # 专属调参,当时 A 线 0.45)——但 env 优先级压过设置面,设置页对 B 线永久
     # 说谎(改了不生效)。现拆 setdefault:B 线与 A 线同读设置面 vad 段
@@ -899,6 +913,7 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS",
         "QWEN3_ASR_CLAUSE_LEN_COMMIT",
         "QWEN3_ASR_CLAUSE_LEN_CHARS",
+        "QWEN3_ASR_COMMIT_MIN_INTERVAL_S",
         "VAD_MIN_SILENCE_DURATION",
     ):
         if os.environ.get(_k):

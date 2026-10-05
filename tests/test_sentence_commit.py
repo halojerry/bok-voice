@@ -1644,3 +1644,43 @@ def test_interp_env_len_commit_on():
     assert env2["QWEN3_ASR_CLAUSE_LEN_COMMIT"] == "0"
     env3 = bok.env._interp_env({"VAD_MIN_SILENCE_DURATION": "0.45"})
     assert env3["VAD_MIN_SILENCE_DURATION"] == "0.45"  # 显式 env 仍透传(部署覆盖)
+
+
+def test_commit_interval_env_knob():
+    """句级提交限速 env 化(2026-10-06 B 线延迟压刀):缺省 1.5=旧行为零漂移;
+    显式档/坏值/负数钳 0 三面。"""
+    _key = "QWEN3_ASR_COMMIT_MIN_INTERVAL_S"
+    _saved = os.environ.pop(_key, None)
+    try:
+        assert lp._sentence_commit_min_interval_s() == 1.5  # 缺省(无 env)
+        os.environ[_key] = "0.8"
+        assert lp._sentence_commit_min_interval_s() == 0.8
+        os.environ[_key] = "not-a-number"
+        assert lp._sentence_commit_min_interval_s() == 1.5  # 坏值回缺省
+        os.environ[_key] = "-3"
+        assert lp._sentence_commit_min_interval_s() == 0.0  # 负数钳 0
+    finally:
+        if _saved is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _saved
+
+
+def test_interp_env_boundary_tightening_defaults():
+    """B 线延迟压刀三收紧落 _interp_env setdefault(2026-10-06):逗号档 8→6/
+    长度档 10→8/限速 1.5→1.0;显式 env 不抢(逃生口)。"""
+    env = bok.env._interp_env({})
+    assert env.get("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS") == "6"
+    assert env.get("QWEN3_ASR_CLAUSE_LEN_CHARS") == "8"
+    assert env.get("QWEN3_ASR_COMMIT_MIN_INTERVAL_S") == "1.0"
+    env2 = bok.env._interp_env({"QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "1.5"})
+    assert env2["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "1.5"  # 显式逃生不抢
+
+
+def test_a_lane_env_untouched_boundary_keys():
+    """A 线 worker env(_agent_worker_env)不注入提交边界三键——客服线句级节奏
+    逐字节零变化(压刀只属 B 线)。"""
+    env = bok.env._agent_worker_env({})
+    for _k in ("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "QWEN3_ASR_CLAUSE_LEN_CHARS",
+               "QWEN3_ASR_COMMIT_MIN_INTERVAL_S"):
+        assert _k not in env
