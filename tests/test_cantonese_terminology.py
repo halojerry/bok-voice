@@ -39,7 +39,7 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # (per-call 固定语言,B 线 interpret 同值)。
     "apps/agent/agent_runtime/interpret.py": re.compile(r"Chinese,Yue"),
     # 0913 验收探针的 MM 合成话音线同枚举(t2a_v2 language_boost 外部字面量)。
-    "scripts/probes/acceptance_0913_scenarios.py": re.compile(r"Chinese,Yue"),
+    "scripts/archive/acceptance_0913_scenarios.py": re.compile(r"Chinese,Yue"),
     "scripts/lib/mm_voice.py": re.compile(r"Chinese,Yue"),
     "apps/agent/agent_runtime/agent.py": re.compile(r"Chinese,Yue"),
     # 5a(2026-09-30) AB 首 chunk 三臂样本脚本入库——同 MM language_boost 外部字面量。
