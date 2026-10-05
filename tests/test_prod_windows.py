@@ -185,7 +185,7 @@ def test_cmd_down_posix_stdout_contract(monkeypatch, tmp_path: Path, capsys) -> 
         killed.append(pid)
 
     patch_bok(monkeypatch, "_kill_proc_tree", fake_kill)
-    rc = bok.cmd_down()
+    rc = bok.commands.down.cmd_down()
     out = capsys.readouterr().out
     assert rc == 0
     assert killed == [111]
@@ -201,7 +201,7 @@ def test_cmd_down_windows_failure_surfaced_and_continues(monkeypatch, tmp_path: 
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access is denied."))
-    rc = bok.cmd_down()
+    rc = bok.commands.down.cmd_down()
     captured = capsys.readouterr()
     assert rc == 1
     assert "FAILED to stop a" in captured.err and "FAILED to stop b" in captured.err
@@ -217,7 +217,7 @@ def test_cmd_down_windows_success_and_notfound(monkeypatch, tmp_path: Path, caps
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp)
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    rc = bok.cmd_down()
+    rc = bok.commands.down.cmd_down()
     captured = capsys.readouterr()
     assert rc == 0
     assert "[down] stopped live (pid 10)" in captured.out
@@ -729,7 +729,7 @@ def test_prod_units_cp_bind_host_defaults_loopback(monkeypatch, tmp_path: Path) 
     monkeypatch.delenv("BOK_BIND_HOST", raising=False)
     argv = _cp_unit_args(monkeypatch, tmp_path)
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
-    serve_src = inspect.getsource(bok.servers.cmd_serve)
+    serve_src = inspect.getsource(bok.commands.serve.cmd_serve)
     assert "_cp_bind_host()" in serve_src, (
         "cmd_serve must consume the same _cp_bind_host() helper as _prod_units")
 
@@ -781,7 +781,7 @@ def test_monitor_kill_round_source_pins_none_guard() -> None:
 
 def test_monitor_respawn_branch_has_active_calls_veto() -> None:
     """源码 pin：LiveKit 重启分支的 respawn 必须先过 active-calls veto。"""
-    src = inspect.getsource(bok.cmd_monitor)
+    src = inspect.getsource(bok.commands.monitor.cmd_monitor)
     assert "veto respawn" in src, "cmd_monitor must veto respawn while calls active"
     assert "skip_lk_mark" in src, (
         "cmd_monitor must NOT mark lk_up when respawn is vetoed, so it retries "

@@ -318,7 +318,7 @@ def test_serve_wait_wiring_source_pins():
     assert "def _serve_ready_probe(" in src
     assert "def _serve_ready_probe_relaxed(" in src
     assert "_SERVE_HTTP_READY_PORTS" in src
-    serve_src = inspect.getsource(bok.servers.cmd_serve)
+    serve_src = inspect.getsource(bok.commands.serve.cmd_serve)
     assert "if health._wait_desktop_ready(targets):" in serve_src
     assert "_ports_down_after_grace(targets, probe=health._serve_ready_probe_relaxed)" in serve_src
     # 旧形状（对全部 target 用 1s TCP）绝不得回潮到 serve 等待环

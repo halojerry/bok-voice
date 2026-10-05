@@ -106,7 +106,7 @@ def test_sweep_listeners_uses_dynamic_owners() -> None:
 
 def test_shared_iteration_sites_use_dynamic_table() -> None:
     """三张共用健康面（status/doctor/prod status）迭代动态 worker 表。"""
-    for fn in (bok.cmd_status, bok.doctor.cmd_doctor, bok.prod.cmd_prod_status):
+    for fn in (bok.commands.status.cmd_status, bok.doctor.cmd_doctor, bok.prod.cmd_prod_status):
         src = inspect.getsource(fn)
         assert "_worker_ports()" in src, (
             f"{fn.__name__} must iterate _worker_ports() so BOK_WORKER_PORT "
@@ -115,8 +115,8 @@ def test_shared_iteration_sites_use_dynamic_table() -> None:
 
 def test_monitor_banner_and_serve_wiring() -> None:
     """monitor 横幅与 serve 等待环都必须吃动态口。"""
-    assert "_agent_worker_port()" in inspect.getsource(bok.cmd_monitor)
-    assert "_desktop_stack_targets()" in inspect.getsource(bok.servers.cmd_serve)
+    assert "_agent_worker_port()" in inspect.getsource(bok.commands.monitor.cmd_monitor)
+    assert "_desktop_stack_targets()" in inspect.getsource(bok.commands.serve.cmd_serve)
 
 
 def test_relaxed_healthy_worker_http_surface_follows_env(monkeypatch) -> None:

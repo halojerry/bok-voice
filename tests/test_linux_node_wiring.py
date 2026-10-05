@@ -146,7 +146,7 @@ def test_cmd_up_runs_services_then_call_plane(monkeypatch):
     calls: list[str] = []
     patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 0)[1])
     patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
-    assert bok.servers.cmd_up() == 0
+    assert bok.commands.up.cmd_up() == 0
     assert calls == ["services", "call_plane"]
 
 
@@ -154,7 +154,7 @@ def test_cmd_up_skips_call_plane_when_services_fail(monkeypatch):
     calls: list[str] = []
     patch_bok(monkeypatch, "_cmd_up_services", lambda: (calls.append("services"), 1)[1])
     patch_bok(monkeypatch, "_start_call_plane", lambda py: (calls.append("call_plane"), True)[1])
-    assert bok.servers.cmd_up() == 1
+    assert bok.commands.up.cmd_up() == 1
     assert calls == ["services"]  # 服务面失败即短路，通话面不拉
 
 

@@ -141,7 +141,7 @@ def test_cmd_down_skips_reused_pid_stamp(monkeypatch, tmp_path, capsys) -> None:
         patch_bok(
             monkeypatch, "_ps_field",
             lambda pid, field: "LIVE LSTART" if field == "lstart=" else "")
-        rc = bok.cmd_down()
+        rc = bok.commands.down.cmd_down()
         assert rc == 0
         _assert_alive(proc)
         out = capsys.readouterr().out
@@ -164,7 +164,7 @@ def test_cmd_down_kills_when_stamp_matches(monkeypatch, tmp_path, capsys) -> Non
         patch_bok(
             monkeypatch, "_ps_field",
             lambda pid, field: "MATCH LSTART" if field == "lstart=" else "")
-        rc = bok.cmd_down()
+        rc = bok.commands.down.cmd_down()
         assert rc == 0
         _wait_dead(proc)
         out = capsys.readouterr().out
@@ -189,7 +189,7 @@ def test_cmd_down_legacy_sidecar_pid_reuse_guard(monkeypatch, tmp_path, capsys) 
         patch_bok(
             monkeypatch, "_ps_field",
             lambda pid, field: "LIVE LSTART" if field == "lstart=" else "")
-        rc = bok.cmd_down()
+        rc = bok.commands.down.cmd_down()
         assert rc == 0
         _assert_alive(proc)
         assert f"[bok] stale pidfile sidecar-asr pid={proc.pid} reused — skip kill" in capsys.readouterr().out

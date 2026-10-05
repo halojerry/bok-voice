@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from bokctl import core, env, paths, servers
+from bokctl import commands, core, env, paths, servers
 
 
 def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
@@ -292,7 +292,7 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     Windows 卸载面含 bok-node-agent（装过 --node-agent 的机器一把清）。
     Windows 停栈顺序（schtasks /end 只杀 Exec 动作进程 cmd.exe，链式子进程
     存活——probe_windows_lifecycle B5b 断言）：/end 全部 → 按 pidfile 补杀
-    幸存子进程（core.cmd_down，ours-only）→ /delete 全部。
+    幸存子进程（commands.down.cmd_down，ours-only）→ /delete 全部。
     Linux（2026-09-24 暂存档）：只删暂存目录 bok-*.service 副本 + 兼容清扫
     2026-09-20 档落在 app-data/units 的旧副本；系统面（/etc/systemd/system +
     enable 状态）归操作员 root 停用删除（逐字指引见输出，本函数零特权动作）。
@@ -366,7 +366,7 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
         stems = ", ".join(pf.stem for pf in alive)
         print(f"[uninstall] WARNING: schtasks /end 杀不到链式子进程，仍在运行: {stems}"
               " —— best-effort taskkill /T /F（按 pidfile，逐树收割）", file=sys.stderr)
-        core.cmd_down()
+        commands.down.cmd_down()
         print("[uninstall] note: 无 pidfile 记录的任务树成员（如 node_agent 自身）"
               "若仍存活，请按 PID 手工 taskkill——无法按镜像名安全归因")
     for name in names:

@@ -68,7 +68,7 @@ def test_cmd_download_only_filters_table(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
-    rc = bok.models.cmd_download(only={"asr"})
+    rc = bok.commands.download.cmd_download(only={"asr"})
     assert rc == 0
     assert fake.calls == ["Qwen/Qwen3-ASR-1.7B"]  # 只下 asr 一项
 
@@ -78,7 +78,7 @@ def test_cmd_download_only_reports_unconfigured(capsys, monkeypatch, tmp_path: P
     monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
-    rc = bok.models.cmd_download(only={"asr", "mt", "settle"})
+    rc = bok.commands.download.cmd_download(only={"asr", "mt", "settle"})
     out = capsys.readouterr().out
     assert rc == 0
     # 非 mac 表当前无 mt/settle：逐项说明并跳过，不算失败
