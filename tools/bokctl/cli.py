@@ -23,6 +23,7 @@ from bokctl import commands
 # （_COMMANDS 的 commands.X 引用依赖这些绑定）。
 from bokctl.commands import (  # noqa: F401
     catalog,  # noqa: F401
+    demo_setup,  # noqa: F401
     doctor,  # noqa: F401
     down,  # noqa: F401
     download,  # noqa: F401
@@ -36,7 +37,7 @@ from bokctl.commands import (  # noqa: F401
     up,  # noqa: F401
 )
 
-# 14 个子命令 → 实现模块（tts-pregen/tts-mine/clean-testdata 三件共用 misc）。
+# 15 个子命令 → 实现模块（tts-pregen/tts-mine/clean-testdata 三件共用 misc）。
 _COMMANDS: dict = {
     "catalog": commands.catalog,
     "manifest": commands.manifest,
@@ -52,6 +53,7 @@ _COMMANDS: dict = {
     "tts-pregen": commands.misc,
     "prod": commands.prod,
     "setup": commands.setup,
+    "demo-setup": commands.demo_setup,
 }
 
 
@@ -85,6 +87,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "缺省 OFF=既有装机零变化）")
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
+    p_demo = sub.add_parser("demo-setup", help="一键配置演示档(云 ASR/云 LLM/云 TTS/本地 MT)")
+    p_demo.add_argument("--asr-key", default="",
+                        help="豆包新式单 Key(argv 优先;env BOK_DEMO_ASR_KEY;必填)")
+    p_demo.add_argument("--asr-resource-id", default="",
+                        help="豆包资源 ID(env BOK_DEMO_ASR_RESOURCE_ID;缺省=服务端默认)")
+    p_demo.add_argument("--tts-key", default="",
+                        help="MiniMax API Key(argv 优先;env BOK_DEMO_TTS_KEY;必填)")
+    p_demo.add_argument("--deepseek-key", default="",
+                        help="DeepSeek API Key(argv 优先;env BOK_DEMO_DEEPSEEK_KEY;必填)")
+    p_demo.add_argument("--deepseek-base-url", default="",
+                        help="DeepSeek 端点(env BOK_DEMO_DEEPSEEK_BASE_URL;"
+                             "缺省 https://api.deepseek.com/v1)")
+    p_demo.add_argument("--mt-model", default="",
+                        help="B 线 MT 本地模型显式路径(env BOK_DEMO_MT_MODEL;"
+                             "缺省=空走 env 缺省链 :1236 MT2)")
     # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
     args, extra = p.parse_known_args(argv)
     args.extra = list(extra)
