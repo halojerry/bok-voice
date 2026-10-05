@@ -82,7 +82,18 @@ def cmd_serve() -> int:
     desktop_tts_needed = servers._local_tts_needed()[0]
     # 基础口表吃 _desktop_stack_targets()（agent worker 口=BOK_WORKER_PORT 动态；
     # 2026-10-02 审计——旧版硬编码 8081，错开档就绪等待永远打缺省口）。
-    targets = core._desktop_stack_targets()
+    # 云端演示档（2026-10-05 demo-cloud）：_desktop_stack_targets 是静态缺省表
+    # （全本地形状零漂移，表本体不动），姿势过滤只在 serve 调用点做（小 diff 判，
+    # 不新增 helper）——asr=cloud 摘 8787、llm=cloud 摘 1235。
+    _posture = servers._cloud_posture()
+    targets = [
+        p
+        for p in core._desktop_stack_targets()
+        if not (_posture["asr_cloud"] and p == 8787)
+        and not (_posture["llm_cloud"] and p == 1235)
+    ]
+    _ready_asr = "asr=skipped(cloud)" if _posture["asr_cloud"] else "asr=8787"
+    _ready_llm = "llm=skipped(cloud)" if _posture["llm_cloud"] else "llm=1235"
     if desktop_tts_needed:
         targets.insert(2, 8788)
     if servers._realtime_demo_enabled():
@@ -98,7 +109,7 @@ def cmd_serve() -> int:
     # 503，TCP 通≠能干活；这些口的宽松终检同款（见 _serve_ready_probe*）。
     if health._wait_desktop_ready(targets):
         _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-        ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
+        ready = f"[bok] desktop ready: control-plane=8000 {_ready_asr} {_desktop_tts} {_ready_llm}"
         if 1236 in targets:
             ready += " mt=1236"
         print(ready)
@@ -117,7 +128,7 @@ def cmd_serve() -> int:
     still_down = health._ports_down_after_grace(targets, probe=health._serve_ready_probe_relaxed)
     if not still_down:
         _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")
+        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 {_ready_asr} {_desktop_tts2} {_ready_llm}")
         return 0
     print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1

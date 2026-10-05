@@ -32,6 +32,14 @@ def _run_settle_start(monkeypatch, tmp_path):
     model = tmp_path / "settle-model"
     model.mkdir()
     monkeypatch.setenv("BOK_DEV_9B", "1")
+    # 密闭纪律（2026-10-05 demo-cloud 实弹发现）：_start_settle_llm 的云姿势闸
+    # 读真设置库——不打桩则测试结果随机跟随本机 DB 的路由车道面。此处钉全本地。
+    patch_bok(monkeypatch, "_cloud_posture", lambda: {
+        "asr_cloud": False, "asr_why": "",
+        "llm_cloud": False, "llm_why": "",
+        "settle_cloud": False, "settle_why": "",
+        "mt_local": True, "mt_why": "",
+    })
     patch_bok(monkeypatch, "healthy", lambda port: False)
     patch_bok(monkeypatch, "sidecar_python", lambda name: tmp_path / "py")
     patch_bok(monkeypatch, "_apply_mlx_template_fix", lambda py: None)

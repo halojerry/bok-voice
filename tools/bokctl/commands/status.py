@@ -2,7 +2,8 @@
 
 共享面（healthy/CORE_PORTS/_worker_ports/_probe_worker/_provider_health_
 summary/_llm_raw_expected）仍住 bokctl.core，一律穿 ``core.X`` call-time 取
-（patch 缝=模块属性）；本地 TTS 门控穿 ``servers.X``。"""
+（patch 缝=模块属性）；本地 TTS 门控与云端演示档姿势（2026-10-05，云腿
+skipped 语义）穿 ``servers.X``。"""
 from __future__ import annotations
 
 from bokctl import core, paths, servers
@@ -11,11 +12,34 @@ from bokctl import core, paths, servers
 def cmd_status() -> int:
     print(f"app-data: {paths.app_data_dir()}")
     _tts_needed, _tts_why = servers._local_tts_needed()
+    _posture = servers._cloud_posture()
     services = [("web", 3000), *core.CORE_PORTS]
     for name, port in services:
         if name == "tts" and not core.healthy(port) and not _tts_needed:
             # 全云端门控跳过的 :8788 不是故障——如实标 skipped，不骗 DOWN。
             print(f"  {name:<13} :{port:<6} skipped (cloud-only: {_tts_why})")
+            continue
+        if name == "asr" and not core.healthy(port) and _posture["asr_cloud"]:
+            # 云端演示档（2026-10-05 demo-cloud）：云 ASR 腿跳过的 :8787 不是
+            # 故障——如实标 skipped，不骗 DOWN（tts cloud-only 先例同款）。
+            # posture 判本地时 :8787 缺席照旧 DOWN（不豁免）。
+            print(
+                f"  {name:<13} :{port:<6} skipped (cloud: {_posture['asr_why']};"
+                " BOK_LOCAL_ASR=1 强制拉起)"
+            )
+            continue
+        if name == "llm" and not core.healthy(port) and _posture["llm_cloud"]:
+            print(
+                f"  {name:<13} :{port:<6} skipped (cloud: {_posture['llm_why']};"
+                " BOK_LOCAL_LLM=1 强制拉起)"
+            )
+            continue
+        if name == "settle-llm" and not core.healthy(port) and _posture["settle_cloud"]:
+            # 同 llm 行先例(2026-10-05 真栈实弹补:settle 云腿的 :1237 不骗 DOWN)。
+            print(
+                f"  {name:<13} :{port:<6} skipped (cloud: {_posture['settle_why']};"
+                " BOK_LOCAL_LLM=1 强制拉起)"
+            )
             continue
         if name == "llm-raw" and not core.healthy(port) and not core._llm_raw_expected():
             # queue proxy 关（或非 mac）=mlx 直跑 :1235，:1239 结构性缺席——
