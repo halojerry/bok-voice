@@ -7258,7 +7258,20 @@ _SENTENCE_STRONG_PUNCT = "。！？!?"
 _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
-_ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+# 2026-10-06 B 线延迟压刀:常量改 env 可调(缺省 1.5 零漂移)——demo-cloud 实弹
+# 分段账显示 perceived 尾巴(perceived_ms 838→3878 同输入方差)大头是本限速
+# 的排队等待,非模型腿(mt_ms=260 恒定);B 线 _interp_env 收 1.0,A 线不动。
+_SENTENCE_MIN_INTERVAL_S_DEFAULT = 1.5
+
+
+def _sentence_commit_min_interval_s() -> float:
+    """两次句级提交最少间隔(env QWEN3_ASR_COMMIT_MIN_INTERVAL_S,缺省 1.5=
+    旧行为逐字节零漂移;坏值回缺省,负数钳 0)。"""
+    try:
+        return max(0.0, float(os.environ.get("QWEN3_ASR_COMMIT_MIN_INTERVAL_S",
+                                             _SENTENCE_MIN_INTERVAL_S_DEFAULT)))
+    except ValueError:
+        return _SENTENCE_MIN_INTERVAL_S_DEFAULT
 # 子句级提交(B 线同传档,2026-09-16):次级标点也作提交边界——译员按子句跟,
 # 唔等整句讲完才翻。A 线 worker 唔带此 env,客服轮次仍按句。
 _SENTENCE_WEAK_PUNCT = "，、；,;"
@@ -8481,7 +8494,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         - 句段无 ≥2 连续 ASCII 字母/数字 run（单号/WhatsApp 高危 → 整段留给停嘴
           整句兜底，数字句永唔句级提交）；
         - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
-        - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
+        - 限速：距上次提交 < _sentence_commit_min_interval_s() 唔提交（连珠句防机关枪）。
         allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
         末尾（pause≥0.45s 唔使标点都係句边界）。字数门槛比标点路径高
         （_pause_commit_min_chars，默认 10）——微停顿只证明喘气，6-9 字碎片当
@@ -8492,7 +8505,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         返回 (句段文本, 边界后坐标)；数字 run 门不过时继续往后扫也只会带着同一
         run 失败 → 自然落到停嘴兜底。
         """
-        if time.monotonic() - self._last_sentence_commit_at < _ASR_SENTENCE_MIN_INTERVAL_S:
+        if time.monotonic() - self._last_sentence_commit_at < _sentence_commit_min_interval_s():
             return None
         start = self._commit_idx
         if start >= len(text):
