@@ -147,10 +147,10 @@
     {
       "id": "fp-probe-qa-phonetic-cp-taint",
       "publicClass": "other-security",
-      "path_glob": "scripts/probes/probe_qa_phonetic.py",
+      "path_glob": "scripts/archive/probe_qa_phonetic.py",
       "verdict": "false-positive",
       "reason": "『疑似跨文件污点』=env→本机 CP 出站链(BOK_CP_URL/TOKEN 缺省环回,erc.cp_request/urlguard 闸内),payload=探针常量 JSON,无命令/SQL/路径 sink——与 fp-probe-branch-action-cp-taint 同族;扫描器 sink 归因漂到 probe_flow_graph.py:772 _cp(httpx→本机 CP)同族共享形状",
-      "evidence": "scripts/probes/probe_qa_phonetic.py 调用点 :164/:176/:184/:192/:320;scripts/probes/probe_flow_graph.py:772 _cp(httpx.request timeout=15→CP)"
+      "evidence": "scripts/archive/probe_qa_phonetic.py 调用点 :164/:176/:184/:192/:320;scripts/probes/probe_flow_graph.py:772 _cp(httpx.request timeout=15→CP)"
     },
     {
       "id": "fp-import-xkt-qa-cp-taint",

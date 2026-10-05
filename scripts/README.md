@@ -1,17 +1,26 @@
 # scripts/ 索引（G1；G1c 起顶层 .py 清零）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 128 个：`probes/` 54 + `bench/` 21 + `e2e/` 10 + `seed/` 14 + `pipeline/` 11 + `ops/` 10 + `runtime/` 3 + `lib/` 3 + `archive/` 2（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
+> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 129 个：`probes/` 48 + `bench/` 18 + `e2e/` 10 + `seed/` 13 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口；`scripts/ops/import_smoke.py` 逐件装载冒烟（CI ci.yml 常驻步）。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
 | --- | --- | --- | --- | --- |
+| `scripts/archive/acceptance_0913_ghost.py` | 0913 实机验收·幽灵 job 探针(C2)。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/acceptance_0913_scenarios.py` | 0913 实机验收·场景驱动(C1 暂停黑洞 / C3+C4 号长闸与拜拜分流)。 | test_cantonese_terminology.py | 是 | 2026-10-05 |
+| `scripts/archive/asr_whisper_ane_leg.py` | Whisper CoreML(ANE) 档决定性腿：LLM TTFT 三格对照（idle / Metal 循环 / CoreML 循环）。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/probe_e4_timing.py` | E4 时序探针：复现「回复中打断」场景并逐步打点用户轮提交/回复语音时延。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/probe_minimax_emotion_tags.py` | MiniMax 拟声标记 + emotion 探针(2026-09-16):A 线「更像真人」两问实弹验收。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/probe_minimax_speed_ab.py` | MiniMax 语速 A/B 探针(2026-09-12):classic HTTP vs bidi WS 是否真吃 speed。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/probe_mt_lang_validator.py` | B 线 MT 语言校验器**实效探针**(E5 增补验收:量化「它到底多久才响一次」)。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/probe_qa_phonetic.py` | 粤语音系补位层实弹验收探针(2026-09-22)。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/r1_build_gold.py` | R1 真实标注集构建（2026-09-21）。 | 无(手动) | 是 | 2026-10-05 |
+| `scripts/archive/t56r1_probe.py` | T5/T6/R1 联合探针（2026-09-21）。 | 无(手动) | 是 | 2026-10-05 |
 | `scripts/archive/test_deepseek.py` | 经 LiveKit LLM 插件打 DeepSeek 验 key（归档）。 | 无(手动) | 是 | 2026-10-04 |
 | `scripts/archive/test_volcano_v3.py` | 火山 TTS V3 单向流式手动验证（不泄漏密钥，归档）。 | test_cantonese_terminology.py | 是 | 2026-10-04 |
 | `scripts/bench/ab_slot_actor.py` | D1 槽位化 actor 四臂 A/B 台架（2026-10-01，第一性原理重构计划 §三 D1）。 | test_ab_slot_actor.py import / test_ab_slot_actor.py | 是 | 2026-10-04 |
 | `scripts/bench/ab_tts_first_chunk.py` | MiniMax bidi 首 chunk 提前切 —— 耳朵 A/B 样本生成器（2026-09-28）。 | test_cantonese_terminology.py | 是 | 2026-10-04 |
 | `scripts/bench/ab_vad_ten_vs_silero.py` | TEN VAD vs inference.VAD(silero) 语音端点 A/B。 | 无(手动) | 是 | 2026-09-15 |
-| `scripts/bench/asr_whisper_ane_leg.py` | Whisper CoreML(ANE) 档决定性腿：LLM TTFT 三格对照（idle / Metal 循环 / CoreML 循环）。 | 无(手动) | 是 | 2026-10-04 |
 | `scripts/bench/asr_whisper_bench.py` | Whisper vs Qwen3-ASR 对照 bench（腿1 质量 / 腿2 延迟 / 腿3 GPU 争抢）。 | probe_cloud_asr.py import / test_cantonese_terminology.py | 是 | 2026-09-25 |
 | `scripts/bench/bench_9b_direct.py` | 9B 直连 A/B 台架(2026-09-29):同栈 mlx_lm server、同参、独占 GPU、逐模型顺序测。 | 无(手动) | 是 | 2026-10-01 |
 | `scripts/bench/bench_judge_contention.py` | judge 跨进程争用台架（批次0.2 余项，2026-10-03）。 | 无(手动) | 是 | 2026-10-03 |
@@ -25,8 +34,6 @@
 | `scripts/bench/measure_prompt.py` | 逐段量度实际注入 LLM 的 system 体积（KV-cache 前置的验收工具）。 | 3 脚本 import / probe_judge_parity.py | 否 | 2026-09-22 |
 | `scripts/bench/probe_deepseek_cloud.py` | DeepSeek 云端探活（A线优化总计划 · 批次0.5）。 | 无(手动) | 是 | 2026-10-03 |
 | `scripts/bench/probe_minimax_bidi_cold.py` | bidi 冷启动归因探针(2026-09-10)。 | 无(手动) | 是 | 2026-09-11 |
-| `scripts/bench/probe_minimax_emotion_tags.py` | MiniMax 拟声标记 + emotion 探针(2026-09-16):A 线「更像真人」两问实弹验收。 | 无(手动) | 是 | 2026-09-17 |
-| `scripts/bench/probe_minimax_speed_ab.py` | MiniMax 语速 A/B 探针(2026-09-12):classic HTTP vs bidi WS 是否真吃 speed。 | 无(手动) | 是 | 2026-09-12 |
 | `scripts/bench/redteam_probes.py` | Bok CP 认证/节点面红队探针（防御性自检，docs/SECURITY_REDTEAM.md [probe-1..9]）。 | SECURITY_REDTEAM.md | 是 | 2026-10-04 |
 | `scripts/bench/soak_test.py` | A 线长稳 soak（2026-09-07 QA 新增）——渐进泄漏检测。 | 无(手动) | 是 | 2026-09-23 |
 | `scripts/e2e/e2e_barge_in.py` | A 线打断（barge-in）E2E：AI 播报中插话 → 断言打断生效、不哑火、无崩溃。 | 3 脚本 import / test_garbled_reask.py | 是 | 2026-10-02 |
@@ -64,8 +71,6 @@
 | `scripts/pipeline/r2_threshold_refit.py` | V-5 澄清闸阈值 leave-out 重拟合（离线，纯 stdlib）。 | security/mimosa/suppressions.json | 否 | 2026-10-04 |
 | `scripts/pipeline/snippet_seed_mining.py` | E1 snippet 轨首批词表候选挖掘（2026-09-21，vocab-skill 范式）。 | test_snippet_mining_helpers.py / probe_mt_lang_validator.py | 否 | 2026-10-04 |
 | `scripts/pipeline/train_csc_model.py` | CSC 自训训练入口（char-level MacBERT4CSC 微调，2026-09-27）。 | predict_csc_model.py | 否 | 2026-10-02 |
-| `scripts/probes/acceptance_0913_ghost.py` | 0913 实机验收·幽灵 job 探针(C2)。 | 无(手动) | 是 | 2026-09-14 |
-| `scripts/probes/acceptance_0913_scenarios.py` | 0913 实机验收·场景驱动(C1 暂停黑洞 / C3+C4 号长闸与拜拜分流)。 | test_cantonese_terminology.py | 是 | 2026-09-14 |
 | `scripts/probes/probe_8khz_asr.py` | 8kHz 窄带重验探针（spec 2026-09-13 §6 前置门；P1.5 Task 5）。 | test_probe_8khz_asr.py / RUNTIME_TOPOLOGY.md | 是 | 2026-09-15 |
 | `scripts/probes/probe_ambient_keyboard.py` | W2b 思考态键盘环境音探针(2026-09-24)。 | 无(手动) | 是 | 2026-09-26 |
 | `scripts/probes/probe_asr_digits_ab.py` | bf16 vs 8bit 数字回归检查（2026-09-17 ASR 模型档位 A/B 辅助）。 | probe_cloud_asr_ab.py import / probe_cloud_asr_ab.py | 是 | 2026-09-17 |
@@ -79,7 +84,6 @@
 | `scripts/probes/probe_ctx_decode.py` | 上下文长度→decode 吞吐成本微基准(2026-09-24):prompt 1.7k vs 3.2k 的 decode tps。 | 无(手动) | 是 | 2026-09-26 |
 | `scripts/probes/probe_cuda_baseline.py` | CUDA 原型延迟基线探针（spec §9 门禁）：在 CUDA 节点跑与 Mac 侧同口径的 TTFT/ASR 采样出 JSON 基线（Mac 上 --dry-run 只校验参数）。 | SHAPES.md | 是 | 2026-10-04 |
 | `scripts/probes/probe_deepseek_thinking.py` | DeepSeek 官方「思考开关」实测（2026-09-21）。 | 无(手动) | 是 | 2026-09-22 |
-| `scripts/probes/probe_e4_timing.py` | E4 时序探针：复现「回复中打断」场景并逐步打点用户轮提交/回复语音时延。 | 无(手动) | 是 | 2026-09-23 |
 | `scripts/probes/probe_fast_speech.py` | 快语速吃字/回声守卫探针（2026-09-12 Task 2 验收）。 | 3 脚本 import / test_probe_stimulus_tools.py | 是 | 2026-10-01 |
 | `scripts/probes/probe_filler_timing.py` | 垫话时序探针:用户讲完一句后,agent 出声(垫话或回复)必须 <2s。 | LATENCY_BUDGETS.md / AGENTS.md | 是 | 2026-09-23 |
 | `scripts/probes/probe_flow_20rounds.py` | A 线 20 轮粤语全流程实弹探针（FLOW20 验收电池）。 | test_settle_state_assertion.py / test_ab_slot_actor.py | 是 | 2026-09-30 |
@@ -100,13 +104,11 @@
 | `scripts/probes/probe_llm_draft_ab.py` | spec decode 隔离 A/B 探针（2026-09-27，llm_draft 实弹验收）——纯客户端，零进程管理。 | bok.py | 是 | 2026-09-27 |
 | `scripts/probes/probe_llm_stall.py` | 慢速注入诊断探针（2026-09-29 v2 P0.2，纯诊断）。 | 无(手动) | 是 | 2026-09-30 |
 | `scripts/probes/probe_mt_glossary_ab.py` | B 线术语表 A/B/C 三臂实证探针(E5 定案用)。 | 无(手动) | 是 | 2026-09-21 |
-| `scripts/probes/probe_mt_lang_validator.py` | B 线 MT 语言校验器**实效探针**(E5 增补验收:量化「它到底多久才响一次」)。 | 无(手动) | 是 | 2026-09-21 |
 | `scripts/probes/probe_offscript_soak.py` | 话术外问题集锦测试台（2026-09-17）：客户不讲「剧本里的话」时 A 线怎么接。 | 2 脚本 import / test_offscript_report.py | 是 | 2026-10-02 |
 | `scripts/probes/probe_offtopic_recovery.py` | 跑题拉回探针（2026-09-25）：客户中途问流程完全无关的问题，A 线会不会被带飞。 | 无(手动) | 是 | 2026-10-03 |
 | `scripts/probes/probe_polish_model.py` | E7 离线润色面「生成模型待定」A/B 探针（2026-09-21，plan §26.2-E7）。 | polish.py | 是 | 2026-10-04 |
 | `scripts/probes/probe_preemptive.py` | 抢跑（preemptive generation）诊断探针——推长句喂饱 speculative 链。 | RUNTIME_TOPOLOGY.md | 是 | 2026-09-23 |
 | `scripts/probes/probe_qa_hit.py` | QA 快路词库命中率探针:真实转写挖出的问法 vs 现库,报 would-hit 率与 top 未命中。 | 3 脚本 import / test_probe_qa_rotation.py | 是 | 2026-10-04 |
-| `scripts/probes/probe_qa_phonetic.py` | 粤语音系补位层实弹验收探针(2026-09-22)。 | 无(手动) | 是 | 2026-10-04 |
 | `scripts/probes/probe_reply_latency.py` | 真实通话延迟探针：**遮羞布盖住了多少**（2026-09-21）。 | 无(手动) | 是 | 2026-10-03 |
 | `scripts/probes/probe_reply_parity.py` | 回复质量的**三方对照**回放（2026-09-21）：本机 4B vs DeepSeek flash vs v4-pro。 | 无(手动) | 是 | 2026-09-22 |
 | `scripts/probes/probe_reply_quality.py` | 回复质量离线回放探针（2026-09-12 P0「会说话」验收门）。 | 无(手动) | 是 | 2026-09-23 |
@@ -117,7 +119,6 @@
 | `scripts/probes/probe_thin_client_static.py` | 瘦客户端静态探针：钉死「节点托管 UI 的 CP 地址必须在运行时可注入」。 | CI ci.yml / RUNTIME_TOPOLOGY.md | 否 | 2026-10-04 |
 | `scripts/probes/probe_vad_head_syllable.py` | VAD START 前导帧并入会话缓冲 → 号码句头段多解一音（复现探针）。 | test_probe_stimulus.py / e2e_campaign.py | 是 | 2026-09-23 |
 | `scripts/probes/probe_windows_lifecycle.py` | Windows 无头部署生命周期探针（site-delivery Task 2）:down 停止语义 + schtasks 契约。 | schtasks_units.py / bok.py | 是 | 2026-09-17 |
-| `scripts/probes/t56r1_probe.py` | T5/T6/R1 联合探针（2026-09-21）。 | 无(手动) | 是 | 2026-10-04 |
 | `scripts/runtime/mine_qa.py` | 高频问答对挖掘（bok.py tts-mine 执行体；--cluster 走 LLM 同义聚类，与 CP qa_cluster 同源）。 | ★ CP qa_cluster.py 同源 / bok.py tts-mine | 是 | 2026-10-04 |
 | `scripts/runtime/mock_callee.py` | mock SIP 客户(模拟联调档):CP 派生的真语音被叫。 | ★ CP main.py exec / bok.py（进程识别 marker） | 是 | 2026-09-21 |
 | `scripts/runtime/pregen_tts.py` | 离线批量预合成 TTS 本地缓存(bok.py tts-pregen 的执行体,2026-09-08;task-14b 按人设物化)。 | ★ CP pregen.py exec / bok.py tts-pregen | 是 | 2026-10-02 |
@@ -132,6 +133,5 @@
 | `scripts/seed/pad_test_audio.py` | 给测试 WAV 前后补静音（Silero VAD 用）。 | 无(手动) | 否 | 2026-09-05 |
 | `scripts/seed/prep_tts_dataset.py` | 原始客服录音 → Qwen3-TTS SFT 数据集流水线（docs/TTS-SFT-DATA-PREP.md 阶段 C 数据先行）。 | test_prep_tts_dataset.py import / test_prep_tts_dataset.py | 否 | 2026-10-04 |
 | `scripts/seed/prepare_csc_data.py` | 粤语/普通话 CSC（拼写纠错）自训数据挖掘管道（2026-09-27）。 | test_probe_stimulus_tools.py import / CP hotword_mining.py | 否 | 2026-10-04 |
-| `scripts/seed/r1_build_gold.py` | R1 真实标注集构建（2026-09-21）。 | 无(手动) | 是 | 2026-10-04 |
 | `scripts/seed/render_asr_corpus_v2.py` | ASR 评测语料 v2：粤语条目重渲（好音频版，2026-10-03）。 | AGENTS.md | 否 | 2026-10-03 |
 | `scripts/seed/seed_invite_templates.py` | 三语「客服邀约」话术种子（2026-09-24 精炼版）。 | test_branch_syntax_parity.py / prepare_csc_data.py | 是 | 2026-09-26 |
