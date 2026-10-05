@@ -5,11 +5,13 @@
 > 提交，必须同步更新对应段落与 file:line——图先于码，图失配=后来者按错误
 > 模型排障（本仓已有多次「凭旧图找错根因」的教训）。
 >
-> 基线：main tree HEAD `78e17e1`（2026-10-02）。行号是锚不是契约（合流/重构会
-> 漂移）；**以符号名与段落标题为准，行号仅助定位**。agent.py 段的行号按
-> **已提交 HEAD** 标定（本波 S1 的 P0-P3 改动未提交，合流后会整体漂移，
-> 主线合流时按符号名重校）；livekit_plugins.py / fillers.py 段的行号按本波
-> worktree 终态标定。
+> 基线：main tree HEAD `741069b`（2026-10-05，G2 W③ 收官点——agent.py 编排面
+> 自 78e17e1 后未动，行号整体仍按旧基线有效；bok CLI 已拆 tools/bokctl/）。
+> 行号是锚不是契约（合流/重构会漂移）；`file:line` 只作辅助，权威=符号名；
+> 新增段落禁止只用行号；新增行号锚会撑高 check_doc_anchors 基线=CI 红
+> （棘轮门，降基线/放行新增锚须显式 `--update` 重录基线）。
+> agent.py / livekit_plugins.py / fillers.py 段的行号均按**已提交 HEAD** 标定，
+> 失配时按符号名重校。
 > 权威边界：本图描述 A 线（agent worker）。B 线（interpret）、CP（control-plane）
 > 与 LiveKit 框架内部只在与 A 线交界处提及，不展开。
 >
