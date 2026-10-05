@@ -7,6 +7,8 @@ description: 通话质量诊断 playbook。当用户给出 call id（如 call-46
 
 诊断任何"这通电话有问题"的请求。核心方法：**turns 账本 → agent.log 标记窗口 → 离线复算**，三面证据对齐再下结论，不猜。
 
+人类入口 = `docs/RUNBOOK.md`（症状→探针/测试/回退开关 一页表；agent 用本 skill，人从 RUNBOOK 进）。
+
 ## 第 0 步：确认运行代码来源
 
 ```bash
