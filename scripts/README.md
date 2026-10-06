@@ -95,6 +95,7 @@
 | `scripts/probes/probe_interp_continuous.py` | B 线「边说边译」连续语流探针（2026-09-17 长度触发子句提交验收）。 | test_probe_stimulus.py / security/mimosa/suppressions.json | 是 | 2026-09-21 |
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
 | `scripts/probes/probe_interp_late_mic.py` | B 线差分探针:延迟麦克风发布 vs 即时发布(call-72112fd7 复现器)。 | 无(手动) | 是 | 2026-09-30 |
+| `scripts/probes/probe_interp_pause_commit.py` | B 线 vad-pause 提交字数门槛 A/B 探针(2026-10-06 `_pause_commit_min_chars` 评估)——子句+0.7s 真停顿刺激,量译文首声对停顿起点 lag。 | 无(手动) | 是 | 2026-10-06 |
 | `scripts/probes/probe_interpret_latency.py` | B 线同传延迟探针（P1 评测体系,2026-09-16）——逐句感知 lag,版本回归用。 | 2 脚本 import / agent interpret.py | 是 | 2026-09-19 |
 | `scripts/probes/probe_judge_parity.py` | 意图识别（judge）的**三方对照**（2026-09-21）：本机 9B vs DeepSeek flash vs v4-pro。 | 无(手动) | 是 | 2026-09-22 |
 | `scripts/probes/probe_killswitch.py` | 远程停机开关（killswitch）目标语义探针：把「吊销节点=即刻断供云端」的目标契约钉成可跑的红绿基线。 | CI node-handshake.yml / node_agent.py | 是 | 2026-10-04 |
