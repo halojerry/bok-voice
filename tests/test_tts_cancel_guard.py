@@ -269,9 +269,12 @@ def test_bidi_missing_credentials_beep_boots_emitter(monkeypatch, capsys):
     assert any(b != 0 for b in audio), "beep 应係 440Hz 非静音"
 
 
+@pytest.mark.usefixtures("_clean_pool")
 def test_classic_zero_audio_finish_no_runtimeerror(monkeypatch, capsys):
     """classic 档(备档 speech-2.6-turbo 走的路)同款零音频收尾:服务端断连 →
-    垫静音干净完结,任务无异常(旧行为同炸 RuntimeError)。"""
+    垫静音干净完结,任务无异常(旧行为同炸 RuntimeError)。
+    _clean_pool:classic 池是模块级单例——全量跑时此前测试文件可能留活池线,
+    不清则本测自连假 WS 永不被用(recv 挂到超时;单跑绿/全量红的顺序污染)。"""
     monkeypatch.setenv("MINIMAX_WS_MODE", "classic")
     ws = _RecvDieWS([_CONNECTED, _STARTED])
     monkeypatch.setattr("websockets.connect", _FakeConnect([ws]))

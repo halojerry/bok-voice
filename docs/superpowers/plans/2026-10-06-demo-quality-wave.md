@@ -305,6 +305,33 @@ e2e 三语回归不受影响；B 线新语种实弹一通（zh↔ja）出声。
 可拔插，独立 PR）。** 每波独立 PR、全量绿+CI 绿才合、`[SESSION_ID]` 纪律；Mimosa 门
 输出每次提交必读。
 
+## 执行纪要（2026-10-06/07 第一波落地）
+
+第一波六包全落地，session 分支 `session-20261006-233933-0219`（基线 26a6ea6）：
+
+| commit | 内容 |
+|---|---|
+| b6dd12b | 计划档 + env 预注册四键（_FORWARD_ENV 258→262；W3 复用既有 BOK_A_LINE_VOICE_TAGS） |
+| 577f87f | W1g-web：DataStreamError 收线良性噪音降 warn（判据单源；特征短语 livekit-client 全 bundle 唯一构造点） |
+| 1a48690 | W2：四语 18 条入目录+gender 表（缺标即抛）+audition 全量物化 35 mp3（四候选 ID 全存活零替换）+试听吃本地物化+_norm_lang/boost 四语 |
+| e2d8357 | W6 模块：ambience.py（无限迭代器循环+dB 域 duck 轨迹）+三场景种子化资产+manifest |
+| 09de3fc | W3 查因：probe_voice_style_gate（H1 排除/H2 强形式否定/真因=script 线 79%+换气地板够不着+概率产出）+bench_voice_tags_ab（35 条物化 reports/voice-tags-ab/） |
+| efb02b2 | W3 修投：白名单+sighs/chuckle/laughs、换气地板 20→12、NATURALNESS_BLOCK 语境化改版（≤3 枚+标点） |
+| 7b1ae9c | W1c/d/f/g：垫话云车道解禁（BOK_FILLER_CLOUD）、零产出打断落账、deferred abandon（确证点=下一轮非短应承用户轮；嗯/好的豁免；逃生口 BOK_INTERRUPT_INSTANT_ABANDON）、挂断 TEARDOWN_STREAM_FLUSH ≤2s |
+| 8155d43 | W6 接线：agent.py 四挂点（解析/duck 钩子先于 session.start/起播/收摊） |
+| 08119ed | W1a+b：框架取证 tts.py:601 无条件 end_input——零音频收尾垫静音根修（MINIMAX_TTS_ZERO_AUDIO_PAD 打点）+beep 自启真 bug 修+prewarm 并行暖 classic 池线 |
+
+全量 pytest **4842 passed / 4 skipped**（基线 4753，+89 测试）；tsc 绿；web node 套件绿。
+
+**第二波待办**（合流后）：
+- 实弹剧本验收：barge_in 基线不变 + 短应承/假打断连发探针轮 + `MINIMAX_TTS_ZERO_AUDIO_PAD` 频率观测 + `BOK_AMBIENT_SCENE=callcenter` 实弹一通 + 挂断 10 通零 DataStreamError。
+- W2c 后置门：probe_cloud_asr 四语小语料实测（豆包宣发≠实测）。
+- W4：B 线控制台双栏成组+label 统一「翻译」+听对方翻译 toggle（agent 侧 `_apply_track_permissions` 放开 me- 订阅）。
+- W5：声纹锁（默认关，独立 PR）。
+- W3 残留：script/罐头线 79% 出声轮无标记=步文案带标记+重物化，独立票；sighs/chuckle/laughs 人耳终裁（台架已物化）。
+- W1g 残留：`entrypoint did not exit in time` 的 12s close-flush 窗口未动（另一张票）。
+- 候选评估票：audition symlink 在 Next 静态导出的拷贝行为（CI build 裁决，红则改实体拷贝）。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，
