@@ -48,11 +48,25 @@ import wave
 from pathlib import Path
 
 from cache_minimax_auditions import (
-    _url_ok,
+    ALLOWED_HOSTS,
     endpoint,
     load_api_key,
     parse_catalog,
 )
+
+
+def _url_ok(url: str) -> bool:
+    """SSRF 形状校验（本文件局部实现，逻辑与 cache_minimax_auditions._url_ok
+    逐字节同源——跨文件 import 时静态扫描看不见同文件守卫不认账，故落地局部；
+    ALLOWED_HOSTS 仍单源 import，host 面漂移会被两头同时看见）。"""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    return (
+        parts.scheme == "https"
+        and (parts.hostname or "").lower() in ALLOWED_HOSTS
+        and parts.port in (None, 443)
+        and not parts.username
+        and not parts.password
+    )
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT_DEFAULT = ROOT / "reports" / "asr-4lang-corpus"
