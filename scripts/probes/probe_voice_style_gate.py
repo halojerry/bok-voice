@@ -46,6 +46,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -57,6 +58,23 @@ for _p in (ROOT, ROOT / "apps" / "agent", ROOT / "packages" / "core"):
         _sys.path.insert(0, str(_p))
 
 DEFAULT_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bok_voice.db"
+
+# --live 出站 host 白名单（SSRF 护栏，判例=cache_minimax_auditions._url_ok）：
+# 本探针的测量对象=云 a_reply 车道（DeepSeek 产标记率），host 白名单只放官方域
+# ——https、443/缺省口、无 userinfo、拒绝环回/私有/保留地址。DB 路由面可被写面
+# 污染，不过形状校验=拒绝发请求。
+_ALLOWED_LIVE_HOSTS = frozenset({"api.deepseek.com"})
+
+
+def _url_ok(url: str) -> bool:
+    parts = urllib.parse.urlsplit(str(url or ""))
+    return (
+        parts.scheme == "https"
+        and (parts.hostname or "").lower() in _ALLOWED_LIVE_HOSTS
+        and parts.port in (None, 443)
+        and not parts.username
+        and not parts.password
+    )
 
 # 生产同款标记判定面（与 sanitize 白名单同源，外加 pause token 与候选扩容三件）
 _MARK_RE = re.compile(
@@ -217,7 +235,11 @@ _LIVE_PERSONA = "你是集运仓库的客服专员小助手，称呼客户为您
 
 
 def live_fire(settings: dict, prefix: str, n: int, timeout_s: float) -> int:
-    """对 lanes.a_reply 打 n 发（轮转取句），打印标记产出率。key 绝不回显。"""
+    """对 lanes.a_reply 打 n 发（轮转取句），打印标记产出率。key 绝不回显。
+
+    SSRF 护栏（判例=cache_minimax_auditions._url_ok）：base_url 来自 settings DB
+    （可被写面污染），发请求前过 _url_ok 形状校验——仅 https://api.deepseek.com
+    （本探针测量对象=云车道 DeepSeek 产标记率），拒绝环回/私有/保留地址。"""
     from bok_voice_core.deepseek_llm import thinking_extra_body
 
     lanes = (settings.get("routing") or {}).get("lanes") or {}
@@ -227,6 +249,12 @@ def live_fire(settings: dict, prefix: str, n: int, timeout_s: float) -> int:
         print("FAIL: --live 需要 model_routing lanes.a_reply（openai 档）", file=sys.stderr)
         return 2
     base_url, model, key = lane_raw
+    if not _url_ok(base_url):
+        print(
+            f"FAIL: base_url 未过 SSRF 白名单: {base_url}（仅 https://api.deepseek.com）",
+            file=sys.stderr,
+        )
+        return 2
     print(f"[live] base_url={base_url} model={model} key={mask(key)} thinking=disabled(单点契约)")
     body_extra = thinking_extra_body(base_url)  # DeepSeek 端点缺省关思考（单点）
     system = prefix + "\n" + _LIVE_PERSONA
