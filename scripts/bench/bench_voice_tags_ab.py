@@ -42,7 +42,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import ssl
 import sys
@@ -80,8 +79,14 @@ SENTENCES = {
     ("zh", "query"): ("我帮您查一下包裹的到仓状态", "麻烦您提供一下运单号，我这边马上核实"),
     ("cantonese", "empathy"): ("你唔使急，呢件事我哋一定會負責到底", "我即刻幫你登記處理，盡快答覆你"),
     ("cantonese", "query"): ("我幫你查下件包裹到咗未", "唔該畀個運單號我，我即刻幫你核實"),
-    ("en", "empathy"): ("I completely understand your concern", "We will take full responsibility and make this right for you"),
-    ("en", "query"): ("Let me check the arrival status for your package", "Could you please give me the tracking number"),
+    ("en", "empathy"): (
+        "I completely understand your concern",
+        "We will take full responsibility and make this right for you",
+    ),
+    ("en", "query"): (
+        "Let me check the arrival status for your package",
+        "Could you please give me the tracking number",
+    ),
 }
 
 # (variant, 句界插值)——en 侧句号自动换 ". "；joiner 里 {c1}/{c2} 为两小句。

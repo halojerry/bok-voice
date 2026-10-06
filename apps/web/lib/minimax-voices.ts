@@ -12,7 +12,8 @@
  * （既有三语组分组注释转正为 VOICE_GENDER 数据表，缺标=模块加载即抛错）；
  * 日语组收编用户克隆两枚（moss_audio c373f8c3=女 / 10297aea=男，按 CLONE_ASSETS
  * 语义不过期、归入日语组标 clone）； audition 真合成验证（scripts/seed/
- * cache_minimax_auditions.py 全量物化到 assets/minimax-auditions/）：四个候选 ID
+ * cache_minimax_auditions.py 全量物化到 apps/web/public/minimax-auditions/）：
+ * 四个候选 ID
  * `Japanese_efficient_reporter_vv1`/`Japanese_rebellious_youth_vv2`/
  * `Portuguese_Optimisticyouth`/`Portuguese_FunnyGuy` 全部存活入目录（近邻替换
  * 备胎 EnergeticBoy/Jovialman/DependableWoman/OptimisticYouth 未动用）；
@@ -24,7 +25,7 @@
  *
  * 维护提示：
  * - 新增音色 ID 先跑 scripts/seed/cache_minimax_auditions.py 批量试听（对官方 t2a_v2
- *   真合成落 assets/minimax-auditions/，2054 voice-not-exist 当场现形）；该脚本
+ *   真合成落 apps/web/public/minimax-auditions/，2054 voice-not-exist 当场现形）；该脚本
  *   正则解析本文件的数组组（`const X: Array<[string, string]> = [` + `["id", "label"],`）
  *   与导出块的 group→lang 映射（`...组.map(([id, label]) => ({ id, label, lang: "xx" as const })),`）
  *   ——改这里的语法两处必须同步；gender 标注补进 VOICE_GENDER 表。

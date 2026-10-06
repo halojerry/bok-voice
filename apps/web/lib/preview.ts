@@ -48,11 +48,13 @@ export interface PreviewVoiceSpec {
   allowLive?: boolean;
 }
 
-/** 本地物化试听（2026-10-06 W2e）：scripts/seed/cache_minimax_auditions.py 对目录
- *  全量真合成落 assets/minimax-auditions/<voice_id 安全化>.mp3（与脚本 safe_name
- *  同规则：非 [A-Za-z0-9._-] 折叠 _、剥首尾 _），经 apps/web/public/minimax-auditions
- *  符号链接随 UI 同源托管——命中即零云费零延迟；未命中（云端克隆/本地 Qwen 音色/
- *  未物化部署）静默回落 /api/tts/preview 现场合成，行为与旧版逐字节一致。 */
+/** 本地物化试听（2026-10-06 W2e；2026-10-07 CI 修正=真文件直发）：
+ *  scripts/seed/cache_minimax_auditions.py 对目录全量真合成落
+ *  apps/web/public/minimax-auditions/<voice_id 安全化>.mp3（与脚本 safe_name
+ *  同规则：非 [A-Za-z0-9._-] 折叠 _、剥首尾 _），UI 同源静态托管——命中即零云费
+ *  零延迟；未命中（云端克隆/本地 Qwen 音色/未物化部署）静默回落 /api/tts/preview
+ *  现场合成，行为与旧版逐字节一致。（历史：曾用根 assets/ 目录+public 符号链接，
+ *  CP Docker web-build stage 只 COPY apps/web → symlink 悬空 ENOENT，已改真文件。） */
 const AUDITION_BASE = "/minimax-auditions";
 
 function auditionFileName(voice: string): string {

@@ -242,7 +242,6 @@ def live_fire(settings: dict, prefix: str, n: int, timeout_s: float) -> int:
     （本探针测量对象=云车道 DeepSeek 产标记率），拒绝环回/私有/保留地址。"""
     from bok_voice_core.deepseek_llm import thinking_extra_body
 
-    lanes = (settings.get("routing") or {}).get("lanes") or {}
     # routing 里 key 已被 mask——真 key 从 DB 重读（load_settings 只用于展示面）。
     lane_raw = _raw_lane(settings)
     if not lane_raw:
@@ -352,7 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         f"prompt: NATURALNESS_BLOCK injected={asm['block_injected']} prefix_chars={asm['prefix_chars']}"
         f"  breath_inject={asm['breath_inject']}"
     )
-    verdict = "H1 排除（门开、块注入）" if (asm["gate_verdict"] and asm["block_injected"]) else "H1 疑似（门关或块缺席）"
+    _ok = asm["gate_verdict"] and asm["block_injected"]
+    verdict = "H1 排除（门开、块注入）" if _ok else "H1 疑似（门关或块缺席）"
     print(f"VERDICT: {verdict}")
 
     cov = turns_coverage(db, args.since)

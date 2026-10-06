@@ -2,7 +2,7 @@
 """MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。
 
 对 apps/web/lib/minimax-voices.ts 目录里的每只音色，调 MiniMax 官方合成
-t2a_v2 生成一句固定试听文本，落 assets/minimax-auditions/<voice_id 安全化>.mp3
+t2a_v2 生成一句固定试听文本，落 apps/web/public/minimax-auditions/<voice_id 安全化>.mp3
 （同一次批量跑顺带当 2054 voice-not-exist 的体检——新增音色 ID 先跑本脚本）。
 
 - 试听文本按音色语言固定一句（粤/普/英/德/法/日/葡，见 LANG_TEXT；新四语与
@@ -49,7 +49,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG_TS = ROOT / "apps" / "web" / "lib" / "minimax-voices.ts"
-OUT_DIR = ROOT / "assets" / "minimax-auditions"
+# 2026-10-07 CI 修正：物化目录=apps/web/public/minimax-auditions（真文件直发，
+# web 静态导出与 CP Docker web-build stage 均自足——根目录 assets/ 副本与
+# public 符号链接方案在 stage 内悬空 ENOENT，已撤）。
+OUT_DIR = ROOT / "apps" / "web" / "public" / "minimax-auditions"
 SETTINGS_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bok_voice.db"
 
 MODEL = "speech-2.8-hd"
@@ -283,7 +286,9 @@ def synth_mp3(key: str, url: str, voice: str, text: str, speed: float) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="MiniMax 官方试听缓存（目录全量 → assets/minimax-auditions/*.mp3）")
+    ap = argparse.ArgumentParser(
+        description="MiniMax 官方试听缓存（目录全量 → apps/web/public/minimax-auditions/*.mp3）"
+    )
     ap.add_argument("--voice", default="", help="只跑单只音色（完整 ID，或唯一前缀/子串）")
     ap.add_argument("--lang", default="", choices=list(LANGS), help="只跑某语种")
     ap.add_argument("--force", action="store_true", help="已存在也重生成（默认幂等跳过）")
