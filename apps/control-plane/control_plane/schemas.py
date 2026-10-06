@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from bok_voice_core.types import CallMode, CallStatus, Role, SettlementStatus
+from bok_voice_core.types import CallMode
 
 
 class TokenRequest(BaseModel):
@@ -312,10 +312,6 @@ class TransferSipRequest(BaseModel):
     """SIP REFER 试点（W5-T1）：转接目标（坐席手机号 / SIP URI），必填。"""
 
     transfer_to: str = ""
-
-
-class SupervisorCommand(BaseModel):
-    call_id: str
 
 
 class WhatsAppCaptureRequest(BaseModel):

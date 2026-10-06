@@ -125,7 +125,6 @@ DEFAULT_RELEASE_S = 30.0
 LEVEL_HEALTHY = "healthy"
 LEVEL_FAMINE = "famine"
 LEVEL_DOWNGRADED = "downgraded"
-LEVELS: tuple[str, ...] = (LEVEL_HEALTHY, LEVEL_FAMINE, LEVEL_DOWNGRADED)
 
 OVERRIDE_ACTIONS: tuple[str, ...] = (
     "force_downgrade",

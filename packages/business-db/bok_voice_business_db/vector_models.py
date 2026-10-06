@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
 from pgvector.sqlalchemy import Vector
 

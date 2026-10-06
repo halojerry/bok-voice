@@ -982,21 +982,6 @@ class FillerDirector:
             self._last_fire_at = 0.0
             print("BOK_FILLER refund cut_short", flush=True)
 
-    def reset_per_call(self) -> None:
-        self._count = 0
-        self._fired_lines.clear()
-        self._recent.clear()
-        self._key_by_file.clear()
-        self._entry_used.clear()
-        self._interrupt_pending = False
-        self._round_interrupted = False
-        self._hint_pending = ""
-        self._hint_round = ""
-        self._cancel_timer()
-        self._cancel_chain()
-        self._stop_playing()
-        self._handle = None
-
     # ---- 内部 ----
 
     def _cancel_timer(self) -> None:
@@ -1017,7 +1002,7 @@ class FillerDirector:
         """停掉在播垫话(带 0.05s fade)。返回 True=确实停掉了一段在播音频。
 
         返回值只服务 I1 让路观测(on_reply_first_audio 据此决定打不打
-        FILLER_YIELD 行);既有两个调用方(cancel/reset_per_call)忽略返回值,
+        FILLER_YIELD 行);忽略返回值的活调用方只剩 cancel,
         语义逐字节不变。"""
         handle = self._handle
         self._handle = None

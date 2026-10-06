@@ -28,7 +28,6 @@ def worker_port_singleton_guard(port: int, name: str) -> None:
     BOK_WORKER_PORT_GUARD=0 关(诊断用:强制双实例复现 Errno 48 现场时)。
     """
     import os
-    import sys
 
     if os.environ.get("BOK_WORKER_PORT_GUARD", "1") != "1":
         return

@@ -4,7 +4,7 @@ import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 
@@ -21,7 +21,3 @@ def make_engine(url: str | None = None, *, in_memory: bool = False) -> Engine:
 
 def make_session_factory(engine: Engine):
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
-
-
-def get_session(engine: Engine) -> Session:
-    return make_session_factory(engine)()

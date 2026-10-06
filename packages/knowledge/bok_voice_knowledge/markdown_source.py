@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import os
-import urllib.parse
 from pathlib import Path
-from typing import Optional
 
-from bok_voice_core.providers import MarkdownSource
 
 
 class LocalMarkdownSource:

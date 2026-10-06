@@ -11,11 +11,9 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.testdata import is_test_object_name
 from bok_voice_core.types import (
     CallMode,
-    CallSession,
     CallStatus,
     ConversationTemplate,
     ObjectProfile,

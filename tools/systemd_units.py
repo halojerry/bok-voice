@@ -105,7 +105,6 @@ def build_unit(
     extra_env 只放**逐单元相异**的键（如 INTERP_DIRECTION）——共用运行时配置
     一律走 EnvironmentFile，不烘进单元。日志走 journald 缺省（journalctl -u
     <unit>），不写 StandardOutput= 路径。"""
-    slug = unit_name(name)
     env_lines = "".join(
         f"Environment={quote_arg(f'{k}={v}')}\n"
         for k, v in sorted((extra_env or {}).items())

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
 
 from bok_voice_core.context import DefaultContextAssembler
 from bok_voice_core.providers import MarkdownSource, VectorStore

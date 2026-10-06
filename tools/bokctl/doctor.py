@@ -287,8 +287,6 @@ def _swap_used_gb() -> float:
             out = subprocess.run(
                 ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=3
             ).stdout
-            for part in out.split():
-                pass
             m = re.search(r"used\s*=\s*([\d.]+)M", out)
             return float(m.group(1)) / 1024.0 if m else -1.0
         swap = {}
