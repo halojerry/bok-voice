@@ -190,8 +190,11 @@ def test_socket_death_before_first_audio_not_truncated(monkeypatch, capsys):
         ws.server_raise(RuntimeError("boom pre-audio"))
         s.end_input()  # 输入循环收口,_run 才会走到 finalize/PERF
         assert await _wait_for(lambda: s._task.done(), timeout=8), "死亡后流未收尾"
-        # 零音频 → 框架 _main_task 按既有语义抛 APIError(同 test_reconnect_after_2201)
-        assert s._task.exception() is not None
+        # W1a(2026-10-06 demo-quality wave)后:零音频正常收尾经 _minimax_zero_audio_pad
+        # 垫静音把 emitter 正常启动——框架 601 行 end_input 不再炸(旧崩形=
+        # RuntimeError("AudioEmitter isn't started") 上抛 FallbackAdapter 误切
+        # backup 4-7s 黑窗;同翻转见 test_reconnect_after_2201)。
+        assert s._task.exception() is None
         return s
 
     asyncio.run(asyncio.wait_for(run(), timeout=15))

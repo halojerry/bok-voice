@@ -280,8 +280,14 @@ def test_concurrent_prewarm_single_handshake(monkeypatch):
 
 
 def test_bidi_prewarm_first_synthesis_reuses_session(monkeypatch):
-    """默认 bidi：prewarm 预连+task_start；首段合成复用同一连接（0 新握手）。"""
+    """默认 bidi：prewarm 预连+task_start；首段合成复用同一连接（0 新握手）。
+
+    W1b(2026-10-06 demo-quality wave)：prewarm() 另行 fire-and-forget 暖一条
+    classic WS 池线（崩溃切 backup 免 2.5s 冷连）——本测隔离池（文件级 autouse
+    强制 MINIMAX_WS_POOL=1，测内覆写 0 关闸），保持「bidi 会话恰一次握手」的
+    原意；池预热行为由 test_tts_cancel_guard.py 池预热三测钉。"""
     monkeypatch.setenv("MINIMAX_WS_MODE", "bidi")
+    monkeypatch.setenv("MINIMAX_WS_POOL", "0")
     ws = _FakeWS([_CONNECTED, _STARTED])
     fake_connect = _FakeConnect([ws])
     monkeypatch.setattr("websockets.connect", fake_connect)
