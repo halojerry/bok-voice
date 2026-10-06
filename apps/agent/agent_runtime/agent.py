@@ -2963,11 +2963,16 @@ def _endpointing_delays_from_env() -> tuple[float, float]:
 
 
 def _llm_prewarm_local(llm_provider) -> bool:
-    """本地专有预热件（prefix prewarm / 投机预热）的 host 门（2026-10-03 I1c）。
+    """会话首轮「真实前缀预热」（LLM_PREFIX_PREWARM）的本地专属门。
+
+    2026-10-06 云放行后本门只服务 greeting 块的首轮预热（整通一次性、无
+    每通上限护栏）；投机预热（PrefillSpeculator）已改走
+    ``prefill_speculator.lane_for_llm_provider`` 车道判定（DeepSeek 云档 +
+    BOK_PREFILL_SPEC_CLOUD=1 缺省放行,成本护栏云臂专属）,不再经此门。
 
     routing openai 档 = 同款 MlxLlmLLM + 云 base_url——isinstance/hasattr 门
-    放行,但云端没有本地 KV 前缀缓存语义（DeepSeek 侧自动前缀缓存,本地预热
-    请求纯浪费+噪音）。判据=内芯 client base_url 是否本机 loopback
+    放行,但首轮预热是 6k token 级全前缀单发,云端无本地 KV 语义（纯烧钱）。
+    判据=内芯 client base_url 是否本机 loopback
     （_is_local_base_url 同源）;读不到底（替身/嵌入方）=True 保守照旧
     （本地为主,零行为变化）。设置卡 deepseek 档（DeepSeekLLM）不经本门——
     它不是 MlxLlmLLM,既有 isinstance 门已挡。
@@ -4739,24 +4744,40 @@ async def entrypoint(ctx):
     # PrefillSpeculator（2026-09-10 抢跑防抖替代件）：框架抢跑默认关后,由本件
     # 在说话中按稳定前缀做 out-of-band prefill 预热（max_tokens=1 只暖 KV 不出
     # 声）。仅本地 OpenAI 兼容内芯有 prefix_prewarm;快照钩子抓逐字节请求。
+    # 车道判定（2026-10-06 云放行,A 线对偶件）：本机 loopback="local"（I1c 旧
+    # host 门逐字节）;DeepSeek 云端点+BOK_PREFILL_SPEC_CLOUD=1（缺省）="cloud"
+    # ——DeepSeek 服务端自动前缀缓存吃同款 max_tokens=1 预热,真回复命中由既有
+    # LLM_TTFT_MS cached=N/M 直接可见;云档成本护栏（长度/每通上限）收在
+    # prefill_speculator.cloud_budget_verdict（云臂专属）。其余云端点/云开关关
+    # =""（不发预热）。会话首轮真实前缀预热（LLM_PREFIX_PREWARM,见下方 greeting
+    # 块）仍走 _llm_prewarm_local 本地专属,不随本门放行。
     _prefill_spec = None
+    _prefill_lane = ""
     if (
         os.environ.get("BOK_PREFILL_SPEC", "1") == "1"
         and hasattr(llm_provider, "prefix_prewarm")
         and hasattr(llm_provider, "on_request_messages")
-        # host 门（2026-10-03 I1c）:routing openai 档=同款 MlxLlmLLM+云 URL——
-        # 投机预热在云端无 KV 语义,只烧钱增噪;本地逐字节旧行为。
-        and _llm_prewarm_local(llm_provider)
     ):
+        from .prefill_speculator import lane_for_llm_provider
+
+        _prefill_lane = lane_for_llm_provider(llm_provider)
+    if _prefill_lane:
         from .prefill_speculator import PrefillSpeculator
 
-        _prefill_spec = PrefillSpeculator(llm_provider.prefix_prewarm, context_state)
+        _prefill_spec = PrefillSpeculator(
+            llm_provider.prefix_prewarm, context_state, lane=_prefill_lane
+        )
         llm_provider.on_request_messages = _prefill_spec.on_request_messages
         # STT 稳定前缀挂点(Qwen3ASRLiveSTT 实例属性,流发射 PREFLIGHT 时回调);
         # 非流式包装(StreamAdapter)无此通道,预热退化为无原料不接。
         if isinstance(stt_provider, Qwen3ASRLiveSTT):
             stt_provider.stable_prefix_listener = _prefill_spec.on_stable_prefix
-        print("[agent] prefill speculator on (BOK_PREFILL_SPEC=0 关)", flush=True)
+        # lane=local 行逐字节不变（日志口径）；云臂带 lane=cloud 后缀可 grep。
+        _lane_tag = "" if _prefill_lane == "local" else f" lane={_prefill_lane}"
+        print(
+            f"[agent] prefill speculator on{_lane_tag} (BOK_PREFILL_SPEC=0 关)",
+            flush=True,
+        )
     llm_provider = ContextAwareLLM(
         ExprAwareLLM(llm_provider, emotion_state=emotion_state),
         context_state=context_state,

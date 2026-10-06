@@ -21,6 +21,18 @@
 
 开关：BOK_PREFILL_SPEC=1（默认开，0 关）；BOK_PREFILL_SPEC_GAP_MS（同轮两次
 开火最小间隔，默认 600）；BOK_PREFILL_SPEC_MAX（每通轮次开火上限，默认 2）。
+
+云车道（2026-10-06 A 线对偶件）：装配点判 lane="cloud"（DeepSeek 端点 +
+BOK_PREFILL_SPEC_CLOUD=1 缺省，见 prefill_lane_for）时同一形状的 max_tokens=1
+预热请求打向云——DeepSeek 服务端自动前缀缓存（相同前缀 10-15 分钟 TTL 内命中
+价 ~1/10）使真回复命中 cached=N/M（LLM_TTFT_MS 直接可见，无需新打点）。
+BOK_PREFILL_SPEC_CLOUD=0 回旧 host 门逐字节（云档零发射）。云档成本护栏
+（lane=cloud 专属，本地车道零触碰）：prompt 折算字符数 >
+BOK_PREFILL_SPEC_CLOUD_MAX_CHARS（缺省 16000≈4k token；<=0=关）跳过；每通
+开火累计 > BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL（缺省 12；<=0=关）跳过——
+每通上限跨轮累计、new_turn 不归还。既有每轮 2 次/间隔 600ms/busy/F6 门控
+云臂照旧。abort 语义：云请求无 mlx abort 旗（plugins._mlx_abort_on_for 只认
+loopback，云端零注入判例），FINAL 即断=客户端关连接，max_tokens=1 服务端自完。
 """
 
 from __future__ import annotations
@@ -28,25 +40,112 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import Mapping
+from urllib.parse import urlparse
+
+from bok_voice_core.deepseek_llm import is_deepseek_endpoint
 
 from .slot_actor import compose_slot_user_message
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, env: Mapping[str, str] | None = None) -> int:
+    src = os.environ if env is None else env
     try:
-        return int(os.environ.get(name, "") or default)
+        return int(src.get(name, "") or default)
     except ValueError:
         return default
+
+
+# ---- 云车道判定与成本护栏（2026-10-06 A 线对偶件；纯函数，单测直喂）-----------
+
+# 本机 loopback 判据（agent._is_local_base_url / plugins._MLX_LOCAL_HOSTS 同形状;
+# 各处自持 frozenset 字面量,刻意不跨模块 import 防 agent↔本模块环）。
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+_CLOUD_MAX_CHARS_DEFAULT = 16000  # ≈4k token：超过=尾部占比过大，预热无账可算
+_CLOUD_MAX_PER_CALL_DEFAULT = 12  # 云费保险丝：每通累计开火上限
+
+
+def prefill_lane_for(base_url: str, env: Mapping[str, str] | None = None) -> str:
+    """PrefillSpeculator 车道判定："local" | "cloud" | ""（不发预热）。
+
+    - 本机 loopback → "local"（2026-09-10 起的旧 host 门行为逐字节，不看云开关）；
+      base 空 → 同样 "local"（保守照旧——替身/嵌入方零行为变化，旧
+      ``_llm_prewarm_local`` 对空/读不到返 True 同款）；
+    - DeepSeek 云端点（``is_deepseek_endpoint`` 单点识别，勿复制其逻辑）且
+      BOK_PREFILL_SPEC_CLOUD=1（缺省；任何非 "1" 值=回旧 host 门逐字节）→
+      "cloud"；
+    - 其余云端点（非 DeepSeek）→ ""（旧 host 门挡下）。
+    """
+    base = str(base_url or "")
+    try:
+        host = (urlparse(base).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - 坏 base=非本地，落云端分支
+        host = ""
+    if not base or host in _LOCAL_HOSTS:
+        return "local"
+    src = os.environ if env is None else env
+    if str(src.get("BOK_PREFILL_SPEC_CLOUD", "1") or "").strip() != "1":
+        return ""
+    if is_deepseek_endpoint(base):
+        return "cloud"
+    return ""
+
+
+def lane_for_llm_provider(llm_provider) -> str:
+    """装配点入口：读内芯 ``_client.base_url`` 后转 ``prefill_lane_for``。
+
+    读不到底（替身/嵌入方）→ "local"（旧 ``_llm_prewarm_local`` 保守 True 同款，
+    本地为主零行为变化）。
+    """
+    try:
+        base = str(
+            getattr(getattr(llm_provider, "_client", None), "base_url", "") or ""
+        )
+    except Exception:  # noqa: BLE001 - 读不到=保守 local
+        return "local"
+    return prefill_lane_for(base)
+
+
+def cloud_budget_verdict(
+    total_chars: int, cloud_fires: int, env: Mapping[str, str] | None = None
+) -> tuple[bool, str]:
+    """云档成本护栏（纯函数）：返回 (放行?, 拦截原因)——本地车道不经此函数。
+
+    - 长度护栏：prompt 折算字符数 > BOK_PREFILL_SPEC_CLOUD_MAX_CHARS（缺省
+      16000≈4k token）→ skip——预热只对「静态前缀+早期稳定前缀」有账可算，
+      尾部过长时 miss 面随体积涨，烧的是真金；
+    - 每通上限：BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL（缺省 12）——跨轮累计、
+      new_turn 不归还（与每轮 2 次的轮内预算不同层）；
+    - 两键 <=0 =关该护栏（0=关，与 FINAL_QUIET_MS/GAP_MS 同款读法）；非整数
+      回缺省（_env_int 纪律）。
+    """
+    max_chars = _env_int(
+        "BOK_PREFILL_SPEC_CLOUD_MAX_CHARS", _CLOUD_MAX_CHARS_DEFAULT, env
+    )
+    if max_chars > 0 and total_chars > max_chars:
+        return False, "max_chars"
+    max_fires = _env_int(
+        "BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL", _CLOUD_MAX_PER_CALL_DEFAULT, env
+    )
+    if max_fires > 0 and cloud_fires >= max_fires:
+        return False, "max_per_call"
+    return True, ""
 
 
 class PrefillSpeculator:
     """会话级（每通电话一个）。全部入口幂等、异常吞掉——绝不影响主链路。"""
 
-    def __init__(self, prewarm, context_state) -> None:
+    def __init__(self, prewarm, context_state, lane: str = "local") -> None:
         # prewarm: async (messages: list[dict]) -> None——MlxLlmLLM.prefix_prewarm
         # （client read=30s，fire-and-forget 不阻塞任何人）。
         self._prewarm = prewarm
         self._ctx = context_state
+        # 车道（2026-10-06 云放行）：装配点 lane_for_llm_provider 判定；
+        # "cloud" 臂加成本护栏+lane=cloud 打点，"local" 逐字节旧行为。
+        self._lane = str(lane or "local")
+        # 云档每通开火累计（new_turn 不归还——与 _turn_fires 的轮内预算不同层）。
+        self._cloud_fires = 0
         self._last_request: list[dict] | None = None
         self._reply_text: str | None = None
         # F6 稳定性门（2026-09-28）：快照时刻的 context revision。真请求落地时尾部
@@ -169,6 +268,20 @@ class PrefillSpeculator:
             msgs.append({"role": "assistant", "content": self._reply_text})
         msgs.append({"role": "user", "content": user_content})
 
+        # 云档成本护栏（lane=cloud 专属，本地车道零触碰）：长度+每通上限一次判。
+        # 拦截发生在状态提交前——不烧 _turn_fires/去重态/间隔时间戳。
+        if self._lane == "cloud":
+            total_chars = sum(len(str(m.get("content") or "")) for m in msgs)
+            _ok, _why = cloud_budget_verdict(total_chars, self._cloud_fires)
+            if not _ok:
+                if _dbg:
+                    print(
+                        f"BOK_PREFILL_SPEC skip cloud_budget why={_why} chars={total_chars}",
+                        flush=True,
+                    )
+                return
+            self._cloud_fires += 1
+
         self._last_prefix = text
         self._last_fire_ts = time.monotonic()
         self._turn_fires += 1
@@ -177,8 +290,11 @@ class PrefillSpeculator:
     # ------------------------------------------------------------------ 执行
     async def _fire(self, msgs: list[dict], prefix_chars: int) -> None:
         try:
+            # lane=cloud 后缀（2026-10-06 云放行）：local 行逐字节不变（RUNBOOK
+            # 日志口径不动），云臂可 grep「fire lane=cloud」对账每通云预热次数。
+            _lane_tag = "" if self._lane == "local" else f" lane={self._lane}"
             print(
-                f"BOK_PREFILL_SPEC fire chars={prefix_chars} msgs={len(msgs)}",
+                f"BOK_PREFILL_SPEC fire{_lane_tag} chars={prefix_chars} msgs={len(msgs)}",
                 flush=True,
             )
             await self._prewarm(msgs)
