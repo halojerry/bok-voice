@@ -1,7 +1,7 @@
 # scripts/ 索引（G1；G1c 起顶层 .py 清零）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 132 个：`probes/` 49 + `bench/` 19 + `e2e/` 10 + `seed/` 14 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
+> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 134 个：`probes/` 50 + `bench/` 19 + `e2e/` 10 + `seed/` 15 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口；`scripts/ops/import_smoke.py` 逐件装载冒烟（CI ci.yml 常驻步）。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
@@ -80,7 +80,7 @@
 | `scripts/probes/probe_cache_discipline.py` | 缓存纪律探针（2026-09-21 讨论稿 §46 配套）：只打本机诊断端点，核对每轮 LLM 请求的 cached 占比与尾部字节。 | LINUX_NODE_TEST_RUNBOOK.md / AGENTS.md | 是 | 2026-09-22 |
 | `scripts/probes/probe_campaign_schedule.py` | 战役调度循环集成探针（2026-09-17 campaign-scheduling-dashboard Task 3）。 | 无(手动) | 是 | 2026-09-18 |
 | `scripts/probes/probe_cantonese_digits.py` | TTS 粤语数字读音探针：合成并(可选)ASR 回读,定位 0-9 / 尾号读法错误。 | 无(手动) | 是 | 2026-09-05 |
-| `scripts/probes/probe_cloud_asr.py` | 云 ASR 直连探针（A线优化总计划 · 批次0.6b）。 | agent doubao_asr.py / test_doubao_asr.py | 是 | 2026-10-03 |
+| `scripts/probes/probe_cloud_asr.py` | 云 ASR 直连探针（A线优化总计划 · 批次0.6b；W2c 加 de/fr/ja/pt 四语折叠判定+数字序列分，三语口径不动）。 | agent doubao_asr.py / test_doubao_asr.py | 是 | 2026-10-06 |
 | `scripts/probes/probe_cloud_asr_ab.py` | 云端 Qwen3-ASR-Flash（阿里云百炼 DashScope）vs 本地 sidecar 同音频 A/B 探针。 | test_cantonese_terminology.py | 是 | 2026-09-17 |
 | `scripts/probes/probe_ctx_decode.py` | 上下文长度→decode 吞吐成本微基准(2026-09-24):prompt 1.7k vs 3.2k 的 decode tps。 | 无(手动) | 是 | 2026-09-26 |
 | `scripts/probes/probe_cuda_baseline.py` | CUDA 原型延迟基线探针（spec §9 门禁）：在 CUDA 节点跑与 Mac 侧同口径的 TTFT/ASR 采样出 JSON 基线（Mac 上 --dry-run 只校验参数）。 | SHAPES.md | 是 | 2026-10-04 |
@@ -138,4 +138,5 @@
 | `scripts/seed/prep_tts_dataset.py` | 原始客服录音 → Qwen3-TTS SFT 数据集流水线（docs/TTS-SFT-DATA-PREP.md 阶段 C 数据先行）。 | test_prep_tts_dataset.py import / test_prep_tts_dataset.py | 否 | 2026-10-04 |
 | `scripts/seed/prepare_csc_data.py` | 粤语/普通话 CSC（拼写纠错）自训数据挖掘管道（2026-09-27）。 | test_probe_stimulus_tools.py import / CP hotword_mining.py | 否 | 2026-10-04 |
 | `scripts/seed/render_asr_corpus_v2.py` | ASR 评测语料 v2：粤语条目重渲（好音频版，2026-10-03）。 | AGENTS.md | 否 | 2026-10-03 |
+| `scripts/seed/render_asr_corpus_4lang.py` | 四语（de/fr/ja/pt）豆包 ASR 实测语料渲染（W2c，2026-10-06）：MiniMax 云 TTS×客服六句型/语→16k wav+manifest（reports/asr-4lang-corpus，gitignored），供 probe_cloud_asr --corpus 放行/限缩判定。 | probe_cloud_asr.py / cache_minimax_auditions.py（护栏+目录单源 import） | 是 | 2026-10-06 |
 | `scripts/seed/seed_invite_templates.py` | 三语「客服邀约」话术种子（2026-09-24 精炼版）。 | test_branch_syntax_parity.py / prepare_csc_data.py | 是 | 2026-09-26 |

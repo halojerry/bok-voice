@@ -13,15 +13,16 @@ manifest.json 参考文本）上直连评估两家云 ASR，并与本地 Qwen3-A
   MiniMax：MINIMAX_API_KEY，缺省回读 bok_voice.db global_settings.tts_json.api_key
         （bench_minimax_bidi.py 先例）
 
-指标：CER（zh/粤 字符级、en 词级；中文数字与全角数字归一到 ASCII 数字后比）、
-首结果延迟（首条非空文本，自首个音频包发出起算）、最终延迟、数字串逐位正确率、
-关键词命中（原字样）。报告写 reports/cloud-asr/<ts>.json。
+指标：CER（zh/粤/ja 字符级、en/de/fr/pt 词级；中文数字与全角数字归一到 ASCII 数字后比）、
+四语折叠判定（W2c：de/fr/pt casefold+去变音符+空白归一、ja 剥空白/标点，精确或
+difflib≥0.8 折过；三语既有口径不动）、首结果延迟（首条非空文本，自首个音频包发出起算）、
+最终延迟、数字串逐位正确率、关键词命中（原字样）。报告写 reports/cloud-asr/<ts>.json。
 
 用法：
   DOUBAO_API_KEY=... \
     .venv312/bin/python scripts/probes/probe_cloud_asr.py \
     --engine doubao|minimax|local|all --endpoint bigmodel \
-    [--corpus <dir>] [--langs cantonese,zh,en] [--limit N] [--pace fast|realtime]
+    [--corpus <dir>] [--langs cantonese,zh,en,de,fr,ja,pt] [--limit N] [--pace fast|realtime]
 """
 from __future__ import annotations
 # --- scripts import bootstrap (G1) ---
@@ -36,6 +37,7 @@ for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
 
 import argparse
 import asyncio
+import difflib
 import gzip
 import json
 import os
@@ -43,6 +45,7 @@ import re
 import sqlite3
 import struct
 import time
+import unicodedata
 import uuid
 import wave
 from pathlib import Path
@@ -69,7 +72,16 @@ _VENDOR_LANG = {
     "cantonese": {"minimax": "yue", "volc": "yue-CN"},
     "zh": {"minimax": "zh", "volc": "zh-CN"},
     "en": {"minimax": "en", "volc": "en-US"},
+    # 2026-10-06 W2c 四语实测扩（de/fr/ja/pt；标签只进厂商接口，语料=
+    # reports/asr-4lang-corpus，渲染见 scripts/seed/render_asr_corpus_4lang.py）
+    "de": {"minimax": "de", "volc": "de-DE"},
+    "fr": {"minimax": "fr", "volc": "fr-FR"},
+    "ja": {"minimax": "ja", "volc": "ja-JP"},
+    "pt": {"minimax": "pt", "volc": "pt-BR"},
 }
+# 四语折叠判定语种集（norm/fold/cer 新分支只吃这四语，三语既有口径零触碰）。
+_LANGS_4 = ("de", "fr", "ja", "pt")
+_FOLD_RATIO_MIN = 0.8  # 精确不中时 difflib 相似度放行门（de/fr/pt/ja 同阈值）
 
 # ---- 火山 SAUC 二进制帧（V3 协议族；官方 demo protocol.py 语义） ----
 MSG_FULL_CLIENT_REQ = 0b0001
@@ -159,6 +171,46 @@ _CN_DIGITS = {"零": "0", "〇": "0", "一": "1", "二": "2", "两": "2", "三":
               "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
 _EN_DIGIT_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4",
                    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+# 四语数字词归一（casefold+去变音符后的形态；fünf→funf、três→tres）。W2c。
+_DIGIT_WORDS_4 = {
+    "de": {"null": "0", "eins": "1", "zwei": "2", "drei": "3", "vier": "4",
+           "funf": "5", "sechs": "6", "sieben": "7", "acht": "8", "neun": "9"},
+    "fr": {"zero": "0", "un": "1", "deux": "2", "trois": "3", "quatre": "4",
+           "cinq": "5", "six": "6", "sept": "7", "huit": "8", "neuf": "9"},
+    "pt": {"zero": "0", "um": "1", "dois": "2", "tres": "3", "quatro": "4",
+           "cinco": "5", "seis": "6", "sete": "7", "oito": "8", "nove": "9"},
+}
+# 日语标点/空白（折句读；长音符 ー 是词的一部分，不剥）。
+_JA_NOISE_RE = re.compile(r"[\s、。！？，．：；「」『』（）・…―～〜“”‘’]")
+
+
+def _deaccent_fold(s: str) -> str:
+    """去变音符+casefold（NFKD 分解后剥组合符；é→e、ü→u、ß→ss）。"""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s.casefold())
+                   if not unicodedata.combining(ch))
+
+
+def norm_text_4(s: str, lang: str) -> str:
+    """四语归一（W2c 折叠口径）：de/fr/pt=casefold+去变音符+非字母数字折空白+
+    数字词归一+空白归一；ja=空白/标点剥离+汉字·全角数字归 ASCII。双侧同构。"""
+    s = (s or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if lang == "ja":
+        s = "".join(_CN_DIGITS.get(ch, ch) for ch in s)
+        return _JA_NOISE_RE.sub("", s)
+    s = _deaccent_fold(s)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    words = _DIGIT_WORDS_4[lang]
+    s = re.sub(r"\b(" + "|".join(words) + r")\b", lambda m: words[m.group(1)], s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def fold4_hit(ref: str, hyp: str, lang: str) -> tuple[bool, float]:
+    """四语折叠判定：归一后精确，或 difflib 相似度 ≥0.8 折过。返回 (hit, ratio)。"""
+    r, h = norm_text_4(ref, lang), norm_text_4(hyp, lang)
+    if not r:
+        return (not h), 0.0
+    ratio = 1.0 if r == h else difflib.SequenceMatcher(None, r, h).ratio()
+    return ratio >= _FOLD_RATIO_MIN, round(ratio, 3)
 
 
 def norm_text(s: str, lang: str) -> str:
@@ -168,6 +220,8 @@ def norm_text(s: str, lang: str) -> str:
     if lang in ("zh", "cantonese"):
         s = "".join(_CN_DIGITS.get(ch, ch) for ch in s)
         return _CJK_PUNCT.sub("", s)
+    if lang in _LANGS_4:
+        return norm_text_4(s, lang)  # W2c 四语（de/fr/pt 折变音符+数字词、ja 剥空白）
     s = s.lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     # 数字词归一（five five two… ↔ 552…），CER 与数字串比对同步受益
@@ -190,11 +244,11 @@ def levenshtein(a: list, b: list) -> int:
 
 
 def cer(ref: str, hyp: str, lang: str) -> float:
-    """zh/粤=字符级 CER；en=词级 WER。"""
+    """zh/粤/ja=字符级 CER；en/de/fr/pt=词级 WER（四语先折变音符/数字词再比）。"""
     r, h = norm_text(ref, lang), norm_text(hyp, lang)
     if not r:
         return 0.0 if not h else 1.0
-    if lang == "en":
+    if lang in ("en", "de", "fr", "pt"):
         ru = r.split(" ")
         hu = h.split(" ") if h else []
         return levenshtein(ru, hu) / len(ru)
@@ -212,6 +266,21 @@ def digit_acc(hyp: str, target: str, lang: str) -> float:
         matches = sum(1 for i in range(common) if run[i] == target[i])
         best = max(best, matches / max(1, len(target)))
     return round(best, 3)
+
+
+def digit_seq_acc(hyp: str, target: str, lang: str) -> float:
+    """四语数字序列分（W2c）：归一后剥空白取全部数字按序连串与目标逐位比。
+
+    逐位口播场景（de/fr/pt 数字词、ja 顿号逐位）若 ASR 不做连写 ITN，run 级
+    digit_acc 只认单连串会系统性低估（"8 4 1 …" 每串 1 位 → ≤1/len）；本口径
+    只要求全部数字按序正确。三语行不产此键，既有口径不受扰。
+    """
+    seq = "".join(re.findall(r"\d+", re.sub(r"\s+", "", norm_text(hyp, lang))))
+    if not seq:
+        return 0.0
+    common = min(len(seq), len(target))
+    matches = sum(1 for i in range(common) if seq[i] == target[i])
+    return matches / max(1, len(target))
 
 
 # ---- 豆包直连 ----
@@ -389,14 +458,21 @@ def agg(rows: list[dict], key: str | None) -> dict:
         return {}
     digits = [r for r in got if r.get("digits")]
     kws = [r for r in got if r.get("keywords")]
+    folds = [r for r in got if "fold_hit" in r]  # W2c 四语折叠判定（三语行无此键不受影响）
     firsts = sorted(r["first_text_ms"] for r in got if r.get("first_text_ms"))
-    return {
+    out = {
         "n": len(got),
         "mean_cer": round(sum(r["cer"] for r in got) / len(got), 3),
         "digit_exact": f"{sum(1 for r in digits if r.get('digit_acc') == 1.0)}/{len(digits)}" if digits else "-",
         "keyword_hits": f"{sum(1 for r in kws if r.get('keyword_hit'))}/{len(kws)}" if kws else "-",
         "first_ms_p50": firsts[len(firsts) // 2] if firsts else None,
     }
+    if folds:
+        out["fold_hits"] = f"{sum(1 for r in folds if r['fold_hit'])}/{len(folds)}"
+    seqs = [r for r in got if "digit_seq_acc" in r]
+    if seqs:
+        out["digit_seq_exact"] = f"{sum(1 for r in seqs if r['digit_seq_acc'] == 1.0)}/{len(seqs)}"
+    return out
 
 
 def main() -> int:
@@ -498,8 +574,13 @@ def main() -> int:
                 continue
             if r.get("text"):
                 r["cer"] = round(cer(it["text"], r["text"], it["lang"]), 3)
+                if it["lang"] in _LANGS_4:
+                    # W2c 四语折叠判定（精确或 difflib≥0.8）；三语既有口径不加此键
+                    r["fold_hit"], r["fold_ratio"] = fold4_hit(it["text"], r["text"], it["lang"])
                 if it.get("digits"):
                     r["digit_acc"] = digit_acc(r["text"], it["digits"], it["lang"])
+                    if it["lang"] in _LANGS_4:
+                        r["digit_seq_acc"] = round(digit_seq_acc(r["text"], it["digits"], it["lang"]), 3)
                 if it.get("keywords"):
                     hn = norm_text(r["text"], it["lang"])
                     r["keyword_hit"] = all(norm_text(k, it["lang"]) in hn
@@ -507,7 +588,9 @@ def main() -> int:
         rows.append(row)
         # 逐条打印
         brief = " | ".join(
-            f"{eng}: cer={r.get('cer')} first={r.get('first_text_ms')}ms final={r.get('final_ms')}ms"
+            f"{eng}: cer={r.get('cer')}"
+            + (f" fold={r.get('fold_hit')}({r.get('fold_ratio')})" if r.get("fold_hit") is not None else "")
+            + f" first={r.get('first_text_ms')}ms final={r.get('final_ms')}ms"
             f"{' ERR=' + str(r.get('error') or r.get('err_code')) if r.get('error') or r.get('err_code') else ''}"
             for eng, r in (("dd", row.get("doubao")), ("mm", row.get("minimax")),
                            ("lc", row.get("local"))) if r
@@ -515,13 +598,16 @@ def main() -> int:
         preview = (row.get("doubao") or row.get("minimax") or row.get("local") or {}).get("text", "")[:48]
         print(f"[{it['id']}] {brief} | {preview!r}", flush=True)
 
-    # 汇总
+    # 汇总（三语键序恒在前=旧报告逐字节稳定；四语等新语种按首现序追加）
     summary: dict = {}
     for eng in ("doubao", "minimax", "local"):
         eng_rows = [{**r, **r[eng]} for r in rows if r.get(eng)]
         if not eng_rows:
             continue
-        summary[eng] = {lg: agg(eng_rows, lg) for lg in ("cantonese", "zh", "en")}
+        lang_keys = ["cantonese", "zh", "en"]
+        lang_keys += [lg for lg in dict.fromkeys(r.get("lang") for r in eng_rows)
+                      if lg not in lang_keys]
+        summary[eng] = {lg: agg(eng_rows, lg) for lg in lang_keys}
         summary[eng]["all"] = agg(eng_rows, None)
     run["summary"] = summary
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
