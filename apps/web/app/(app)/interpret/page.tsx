@@ -17,13 +17,23 @@ import { buildVoiceSelectOptions } from "@/lib/voice-options";
  * 结束时 settle → 总结/知识沉淀复用 A 线。
  */
 
-const LANGS = [
+/** 源语（讲话方的 ASR 输入侧）：豆包 SAUC 实测只认三语——W2c 实测判决
+ * （2026-10-07，reports/cloud-asr/ 留档）：豆包 seedasr 2.0 对 de/fr/ja/pt
+ * 24/24 折叠 MISS（输出=中英混杂幻觉或空串，nostream 显式 language 标签
+ * 同样 0/21=模型本身不行）。ASR 不认的方向不做（Ethan 裁定口径）。 */
+const SOURCE_LANGS = [
   { value: "zh", label: "普通话" },
   { value: "cantonese", label: "粤语" },
   { value: "en", label: "English" },
-  // 2026-10-06 W2 四语扩容（demo-quality-wave §W2c）：MT=DeepSeek 任意对；
-  // TTS=MiniMax 四语目录（lib/minimax-voices.ts）。ASR 侧豆包海外语种实测放行前
-  // 先跑 scripts/probes/probe_cloud_asr.py 四语小语料（宣发≠实测）。
+];
+
+/** 目标语（译文 TTS 出声侧）：七语全放——MT=DeepSeek 任意对、TTS=MiniMax
+ * 四语目录（lib/minimax-voices.ts，audition 真合成验证）。即「我讲普通话、
+ * 对方听到德语」今天就是好的；坏的只是对方讲德语（ASR 输入侧）。
+ * 四语双向放行候选=按语种分 ASR 车道（MiniMax ASR 四语 24/24 满分，但它是
+ * VAD 切段伪流式无热词，见 2026-10-03 评估）——独立评估票，未开。 */
+const TARGET_LANGS = [
+  ...SOURCE_LANGS,
   { value: "de", label: "德语" },
   { value: "fr", label: "法语" },
   { value: "ja", label: "日语" },
@@ -122,7 +132,7 @@ export default function InterpretPage() {
                 setMyVoice(""); // 语言换了,音色目录跟着换,旧选择重置
               }}
             >
-              {LANGS.map((l) => (
+              {SOURCE_LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
                 </option>
@@ -139,7 +149,7 @@ export default function InterpretPage() {
                 setOtherVoice("");
               }}
             >
-              {LANGS.map((l) => (
+              {TARGET_LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
                 </option>
