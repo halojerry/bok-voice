@@ -13,6 +13,15 @@
  *   房只挂 trans- 轨);我方=听对方麦克风原声(me 渲染器,me 房唯一远端音频),
  *   rev 译文纯字幕零 TTS——同传台姿势:听原声+看译文。双输出档:「对方扬声器」
  *   =译文指到朝向对方的音箱,「我方扬声器」=对方原声指到我方耳机/音箱。
+ * - 字幕双栏成组(2026-10-07 W4a):我方列/对方列,列头承担归属;栏内「原文+其
+ *   翻译」成对渲染(pairSubtitles 纯函数,node 单测),行标统一「原文/翻译」,
+ *   大字幕窗同构;在途原文/孤儿译文单独渲染不丢。
+ * - 「听对方听到的翻译」开关(2026-10-07 W4b,默认关):开=把 fwd 译文轨
+ *   (trans-<对方语言>,对方耳机里那份)也接进我方扬声器,与我方听到的原声叠加;
+ *   订阅级控制——关=对该轨 setSubscribed(false) 连帧都不拉(与旧行为等价),
+ *   开=订阅后经 me 路 AudioContext 放音,届时半双工 watcher 自动暂让我方麦
+ *   (与对方侧 othHeld 同款防串译闸)。agent 侧 _apply_track_permissions 已放开
+ *   me- 对该轨的订阅权(订阅≠自动播,deliver 端收听不受影响)。
  * - 自动半双工(默认开):我方译文出声时自动暂让对方麦克风——共享扬声器外放,
  *   对方麦会拾到译文原声,不暂让会把译文再翻译一遍(串译死循环)。
  * - 离开 = 结束我方连接 + hangup 整个 call(两个 interpreter 与对象端一起被踢)。
@@ -61,7 +70,16 @@ import {
   type AudioDeviceInfo,
 } from "@/lib/audio";
 
-const LANG_SHORT: Record<string, string> = { zh: "中", cantonese: "粤", en: "EN" };
+// W2(2026-10-06)四语扩容:de/fr/ja/pt 入短名表——语言对行/列头不再出现裸字符串。
+const LANG_SHORT: Record<string, string> = {
+  zh: "中",
+  cantonese: "粤",
+  en: "EN",
+  de: "德",
+  fr: "法",
+  ja: "日",
+  pt: "葡",
+};
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：设备/路由失败不再静默。
 const log = startTrace({ operation: "web.interpret-console" });
@@ -554,6 +572,25 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       log.warn("persist hear-orig pref failed", { err: e instanceof Error ? e.message : String(e) });
     }
   }, []);
+  // 「听对方听到的翻译」(2026-10-07 W4b,默认关):开=把 fwd 译文轨(trans-<对方
+  // 语言>,对方耳机里那份)也接进我方扬声器。持久化 bok_interp_hear_their_trans,
+  // 缺值=关(与 hearOrig 缺值=开相反:这是加听感,不是基线听感)。
+  const [hearTheirTrans, setHearTheirTransState] = useState(() => {
+    try {
+      return localStorage.getItem("bok_interp_hear_their_trans") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setHearTheirTrans = useCallback((v: boolean) => {
+    setHearTheirTransState(v);
+    try {
+      localStorage.setItem("bok_interp_hear_their_trans", v ? "1" : "0");
+    } catch (e) {
+      /* 隐私模式等场景持久化失败不阻功能 */
+      log.warn("persist hear-their-trans pref failed", { err: e instanceof Error ? e.message : String(e) });
+    }
+  }, []);
   useEffect(() => {
     if (!meConnected) return;
     const want = (track: RemoteTrack, participant: RemoteParticipant) =>
@@ -579,6 +616,56 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meRoom, meConnected, callId, hearOrig]);
+
+  // fwd 译文轨订阅控制(2026-10-07 W4b):开关直接驱动对该轨的 setSubscribed——
+  // 关=连帧都不拉(半双工 watcher 挂不到轨、meHeld 不触发=与旧行为等价);
+  // 开=订阅到达后经 TrackSubscribed 接进 me 路 AudioContext(我方扬声器)。
+  // agent 侧已放开 me- 对该轨的订阅权;未放开前 setSubscribed(true) 会被服务端
+  // 静默拒绝(isSubscribed 恒 false),开关开不出声=可自诊断的部署态。
+  useEffect(() => {
+    if (!meConnected) return;
+    const fwdName = `trans-${otherLang}`;
+    const isFwd = (pub: RemoteTrackPublication) => String(pub.trackName ?? "") === fwdName;
+    const onSub = (track: RemoteTrack, pub: RemoteTrackPublication) => {
+      if (!isFwd(pub) || !hearTheirTrans) return;
+      if (!track.mediaStreamTrack) return;
+      wlog("their_trans_elem", { route: "ctx", out: (meOutIdRef.current || savedOutputDevice("me") || "default").slice(0, 12) });
+      getRouter("me").add(track.sid, track.mediaStreamTrack);
+    };
+    const onUnsub = (track: RemoteTrack) => getRouter("me").remove(track.sid);
+    const align = (pub: RemoteTrackPublication) => {
+      if (!isFwd(pub) || pub.isSubscribed === hearTheirTrans) return;
+      wlog("their_trans_sub", { want: hearTheirTrans });
+      try {
+        pub.setSubscribed(hearTheirTrans);
+      } catch (e) {
+        log.warn("their-trans setSubscribed failed", { err: e instanceof Error ? e.message : String(e) });
+      }
+    };
+    // TrackPublished 回调=(publication, participant)(RoomEventCallbacks 类型口径;
+    // events.d.ts 头部示例注释写的 (track, publication, …) 是错的):监听挂载后
+    // fwd agent 才发轨的时序靠它补闸。
+    const onPublished = (pub: RemoteTrackPublication) => align(pub);
+    meRoom.on(RoomEvent.TrackSubscribed, onSub);
+    meRoom.on(RoomEvent.TrackUnsubscribed, onUnsub);
+    meRoom.on(RoomEvent.TrackPublished, onPublished);
+    // 补扫:监听挂载晚于发布(fwd agent 晚连上)或开关翻转时,对齐在房轨。
+    for (const p of meRoom.remoteParticipants.values()) {
+      for (const pub of p.trackPublications.values()) {
+        if (!isFwd(pub as RemoteTrackPublication)) continue;
+        align(pub as RemoteTrackPublication);
+        const t = pub.track;
+        if (t && hearTheirTrans && t.mediaStreamTrack) getRouter("me").add(t.sid, t.mediaStreamTrack);
+        else if (!hearTheirTrans) getRouter("me").remove(pub.trackSid); // 关=摘掉在播译文
+      }
+    }
+    return () => {
+      meRoom.off(RoomEvent.TrackSubscribed, onSub);
+      meRoom.off(RoomEvent.TrackUnsubscribed, onUnsub);
+      meRoom.off(RoomEvent.TrackPublished, onPublished);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meRoom, meConnected, otherLang, hearTheirTrans, getRouter]);
 
   // ---- 对象连接(纯手动 Room:麦克风收音 + 译文放音) ----
   useEffect(() => {
@@ -1013,6 +1100,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         setOutputMode={setOutputMode}
         hearOrig={hearOrig}
         setHearOrig={setHearOrig}
+        hearTheirTrans={hearTheirTrans}
+        setHearTheirTrans={setHearTheirTrans}
         leave={leave}
       />
     </AgentSessionProvider>
@@ -1101,6 +1190,9 @@ type LiveProps = {
   /** 听对方原声总开关:开=像直接通话(默认),关=纯字幕同传。 */
   hearOrig: boolean;
   setHearOrig: (v: boolean) => void;
+  /** 听对方听到的翻译(W4b):开=fwd 译文轨也进我方扬声器(默认关,订阅级控制)。 */
+  hearTheirTrans: boolean;
+  setHearTheirTrans: (v: boolean) => void;
   leave: () => void;
 };
 
@@ -1133,6 +1225,83 @@ function SessionClock({ startedAt }: { startedAt: number | null }) {
     <span>
       {hh}:{mm}:{ss}
     </span>
+  );
+}
+
+/** 双栏字幕的成组气泡(W4a):行标(原文/翻译)出泡外小字;翻译行缩进+描边与原文
+ * 区分;色按列分——我方列青软底、对方列灰底(沿用旧 chat 的按侧配色)。 */
+function SubBubble({
+  label,
+  mine,
+  accent,
+  children,
+}: {
+  label: string;
+  mine: boolean;
+  accent?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={`flex flex-col ${accent ? "pl-3" : ""}`}>
+      <span
+        className={`mb-0.5 px-1 font-mono text-[10px] font-bold uppercase tracking-wide ${
+          accent ? "text-(--live)" : "text-muted-foreground"
+        }`}
+      >
+        {label}
+      </span>
+      <div
+        className={`max-w-[95%] rounded-2xl px-3 py-2 text-[13px] leading-relaxed ${
+          mine ? "bg-(--live-soft) text-(--live-ink)" : "bg-muted text-(--foreground)"
+        } ${accent ? "border border-(--card-border)" : ""}`}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** 双栏字幕单列(W4a):列头承担归属(我方/对方 + 语言短名),栏内按 pairSubtitles
+ * 的组序渲染——原文在上、其翻译紧随;空栏画占位,不藏列(列的存在感=归属锚)。 */
+function SubColumn({
+  title,
+  langShort,
+  groups,
+  mine,
+}: {
+  title: string;
+  langShort: string;
+  groups: SubGroup[];
+  mine: boolean;
+}) {
+  return (
+    <section className="flex min-w-0 flex-col gap-2">
+      <div className="flex items-center gap-1.5 px-1">
+        <span className="font-mono text-[11px] font-bold uppercase tracking-wide text-muted-foreground">{title}</span>
+        <span className="rounded-full border border-(--card-border) px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+          {langShort}
+        </span>
+      </div>
+      {groups.length === 0 && (
+        <div className="rounded-2xl border border-dashed border-(--card-border) px-3 py-3 text-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+          —
+        </div>
+      )}
+      {groups.map((g) => (
+        <div key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`} className="flex flex-col gap-2">
+          {g.src && (
+            <SubBubble label="原文" mine={mine}>
+              {g.src.text}
+            </SubBubble>
+          )}
+          {g.dsts.map((d) => (
+            <SubBubble key={`d${d.idx}`} label="翻译" mine={mine} accent>
+              {d.text}
+            </SubBubble>
+          ))}
+        </div>
+      ))}
+    </section>
   );
 }
 
@@ -1211,14 +1380,14 @@ function ConsoleLive(p: LiveProps) {
       window.removeEventListener("mouseup", up);
     };
   }, [popOpen]);
-  const popRows = useMemo(() => {
-    const out: { who: Bubble; text: string }[] = [];
-    for (const t of trimmed.slice(-60)) {
+  const popGroups = useMemo(() => {
+    const out: Array<{ who: Bubble; text: string; idx: number }> = [];
+    trimmed.slice(-60).forEach((t, i) => {
       const w = whoIs(t, p.room, p.myLang, p.otherLang);
-      if (popScope !== "both" && w.flow !== popScope) continue;
-      out.push({ who: w, text: stripVoiceTags(String(t.text ?? "")) });
-    }
-    return out.slice(-6); // 追帧:只留最新 6 行,旧的让位
+      if (popScope !== "both" && w.flow !== popScope) return;
+      out.push({ who: w, text: stripVoiceTags(String(t.text ?? "")), idx: i });
+    });
+    return pairSubtitles(out).slice(-3); // 追帧:只留最新 3 组(原文+其翻译),旧的让位
   }, [trimmed, p.room, p.myLang, p.otherLang, popScope]);
   // 逐句翻译延迟(对方→我):原文行到达 → 其后第一条 rev 译文字幕的差值。
   // 口径注:rev 译文字幕≈MT 完成时刻(纯字幕无音频输出);fwd 译文字幕被
@@ -1267,6 +1436,22 @@ function ConsoleLive(p: LiveProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const offset = transcriptions.length - items.length;
+  // 字幕行→成组(W4a 双栏成组的单一数据源):流向筛选+清空裁剪后按 whoIs 归属,
+  // 再交 pairSubtitles(纯函数,node 单测)成组。字幕卡与大字幕窗同构同源。
+  const subRows = useMemo(() => {
+    const out: Array<{ who: Bubble; text: string; idx: number }> = [];
+    items.forEach((t, i) => {
+      const idx = offset + i;
+      if (idx < clearedCount) return;
+      const who = whoIs(t, p.room, p.myLang, p.otherLang);
+      if (filter !== "both" && who.flow !== filter) return;
+      out.push({ who, text: stripVoiceTags(String(t.text ?? "")), idx });
+    });
+    return out;
+  }, [items, offset, clearedCount, filter, p.room, p.myLang, p.otherLang]);
+  const subGroups = useMemo(() => pairSubtitles(subRows), [subRows]);
+  const myGroups = useMemo(() => subGroups.filter((g) => g.side === "right"), [subGroups]);
+  const otherGroups = useMemo(() => subGroups.filter((g) => g.side === "left"), [subGroups]);
   // ---- 翻译状态滚动窗(2026-10-02 刀3,R2 状态说真话) ----
   // 旧「同传服务=出译中」由累计 dstCount>0 驱动=第一次出译后闩死、永不再回待命。
   // 新口径:近 30s 到达的译文字幕 >0(或正在出声)才算「出译中」,30s 无新译文回「待命」。
@@ -1651,6 +1836,18 @@ function ConsoleLive(p: LiveProps) {
             />
             <span>听对方原声:开=像直接通话(译文叠加在原声上);关=纯字幕同传,只看「对方→我」字幕不出原声</span>
           </label>
+          <label className="flex items-start gap-2 text-xs leading-relaxed">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={p.hearTheirTrans}
+              onChange={(e) => p.setHearTheirTrans(e.target.checked)}
+            />
+            <span>
+              听对方听到的翻译:开=我方译文也进我方扬声器,和对方耳机里那份完全一致(默认关)。
+              外放建议保持自动半双工,播报期间我方麦自动暂让防串译
+            </span>
+          </label>
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>
             清空字幕
           </button>
@@ -1694,35 +1891,38 @@ function ConsoleLive(p: LiveProps) {
           </div>
         </div>
         <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
-          {items.length === 0 && (
+          {subGroups.length === 0 && (
             <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
               等说话…开口即译
             </div>
           )}
-          {items.map((t, i) => {
-            const idx = offset + i;
-            if (idx < clearedCount) return null;
-            const who = whoIs(t, p.room, p.myLang, p.otherLang);
-            if (filter !== "both" && who.flow !== filter) return null;
-            // Elements Conversation 形态：气泡化，我方右/对方左；色按 side 分——
-            // 我方（我方说的+发给我方的译文）青软底，对方（对方说的+发对方的译文）
-            // 灰底；角色标签出泡外 muted 小字。归属判定（whoIs）与文本处理零变化。
-            const mine = who.side === "right";
-            return (
-              <div key={`${who.text}-${idx}`} className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
-                <span className="mb-0.5 px-1 font-mono text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
-                  {who.text}
-                </span>
-                <div
-                  className={`max-w-[85%] rounded-2xl px-3 py-2 text-[13px] leading-relaxed ${
-                    mine ? "bg-(--live-soft) text-(--live-ink)" : "bg-muted text-(--foreground)"
-                  }`}
-                >
-                  {stripVoiceTags(String(t.text ?? ""))}
-                </div>
-              </div>
-            );
-          })}
+          {/* W4a 双栏成组(2026-10-07):我方列/对方列,列头承担归属(行标只剩
+              原文/翻译);每栏内「原文气泡 + 其翻译气泡」成组,在途原文/孤儿译文
+              单独渲染不丢。流向筛选=选列(rev=对方列,fwd=我方列,both=双栏)。 */}
+          <div
+            className={
+              filter === "both"
+                ? "grid flex-1 items-start gap-4 md:grid-cols-2"
+                : "mx-auto flex w-full flex-1 flex-col gap-4 xl:max-w-3xl"
+            }
+          >
+            {filter !== "fwd" && (
+              <SubColumn
+                title="对方"
+                langShort={LANG_SHORT[p.otherLang] ?? p.otherLang}
+                groups={otherGroups}
+                mine={false}
+              />
+            )}
+            {filter !== "rev" && (
+              <SubColumn
+                title="我方"
+                langShort={LANG_SHORT[p.myLang] ?? p.myLang}
+                groups={myGroups}
+                mine
+              />
+            )}
+          </div>
         </div>
         {holdBusy && (
           <p className="shrink-0 text-[11px] text-amber-700">
@@ -1799,15 +1999,27 @@ function ConsoleLive(p: LiveProps) {
             </button>
           </div>
           <div className="flex min-h-[140px] flex-col gap-3">
-            {popRows.length === 0 && (
+            {popGroups.length === 0 && (
               <div className="py-6 text-center text-white/40">等说话…开口即译</div>
             )}
-            {popRows.map(({ who, text }, i) => (
-              <div key={`${i}-${text.slice(0, 12)}`} className="leading-snug" style={{ fontSize: popFont }}>
-                <span className={`mr-2 font-mono text-sm ${who.flow === "rev" ? "text-sky-300" : "text-emerald-300"}`}>
-                  {who.text}
-                </span>
-                {text}
+            {/* W4a 同构成组:原文行(白/50 标)+其翻译行(标按流向配色),与主字幕卡
+                同一 pairSubtitles 数据形状;黑底字幕机本色不变。 */}
+            {popGroups.map((g) => (
+              <div key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`} className="leading-snug">
+                {g.src && (
+                  <div style={{ fontSize: popFont }}>
+                    <span className="mr-2 font-mono text-sm text-white/50">原文</span>
+                    {g.src.text}
+                  </div>
+                )}
+                {g.dsts.map((d) => (
+                  <div key={`d${d.idx}`} style={{ fontSize: popFont }}>
+                    <span className={`mr-2 font-mono text-sm ${g.flow === "rev" ? "text-sky-300" : "text-emerald-300"}`}>
+                      翻译
+                    </span>
+                    {d.text}
+                  </div>
+                ))}
               </div>
             ))}
           </div>
@@ -1818,6 +2030,7 @@ function ConsoleLive(p: LiveProps) {
 }
 
 type Bubble = {
+  /** 行标(W4a 统一):原文行=「原文」、译文行=「翻译」;归属由列头承担。 */
   text: string;
   side: "left" | "right";
   kind: "src" | "dst";
@@ -1843,11 +2056,12 @@ type TextStreamEntry = {
 
 /** 字幕归属（照抄 interpret 页 subtitleLabel 的解析，另给译文标注听众端）：
  * 人端 identity=原文说话方;agent 转写看 lk.transcribed_track_id——指向人端轨=原文,
- * 指向 agent 自己的 trans-<lang> 轨=译文。译文听众 = 该目标语言那一端。 */
+ * 指向 agent 自己的 trans-<lang> 轨=译文。行标统一「原文/翻译」(W4a 2026-10-07:
+ * 删 译文·X/同传/我方说的/对方说的——归属由双栏列头 我方/对方 承担)。 */
 function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string): Bubble {
   const id = String(t.participantInfo?.identity ?? "");
-  if (id.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src", flow: "fwd", lang: myLang };
-  if (id.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src", flow: "rev", lang: otherLang };
+  if (id.startsWith("me-")) return { text: "原文", side: "right", kind: "src", flow: "fwd", lang: myLang };
+  if (id.startsWith("other-")) return { text: "原文", side: "left", kind: "src", flow: "rev", lang: otherLang };
   const trackSid = t.streamInfo?.attributes?.["lk.transcribed_track_id"] ?? "";
   if (trackSid) {
     const pools = [room.remoteParticipants.values(), [room.localParticipant].values()];
@@ -1856,20 +2070,64 @@ function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string
         for (const pub of Object.values(participant.trackPublications ?? {})) {
           if (pub?.trackSid !== trackSid) continue;
           const owner = String(participant.identity ?? "");
-          if (owner.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src", flow: "fwd", lang: myLang };
-          if (owner.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src", flow: "rev", lang: otherLang };
+          if (owner.startsWith("me-")) return { text: "原文", side: "right", kind: "src", flow: "fwd", lang: myLang };
+          if (owner.startsWith("other-")) return { text: "原文", side: "left", kind: "src", flow: "rev", lang: otherLang };
           const name = String(pub.trackName ?? "");
           if (name.startsWith("trans-")) {
             const lang = name.slice("trans-".length);
-            const ear = LANG_SHORT[lang] ?? lang;
-            return { text: `译文·${ear}`, side: lang === myLang ? "right" : "left", kind: "dst", flow: lang === myLang ? "rev" : "fwd", lang };
+            return { text: "翻译", side: lang === myLang ? "right" : "left", kind: "dst", flow: lang === myLang ? "rev" : "fwd", lang };
           }
         }
       }
     }
   }
-  return { text: "同传", side: "left", kind: "dst", flow: "rev", lang: myLang };
+  return { text: "翻译", side: "left", kind: "dst", flow: "rev", lang: myLang };
 }
+
+// ==== interp-subtitles (pure; extracted & node-tested by test/interp-subtitles.test.mjs) ====
+
+type SubLine = { text: string; idx: number };
+
+type SubGroup = {
+  side: "left" | "right";
+  flow: "rev" | "fwd";
+  /** 原文行;null=孤儿译文(窗口裁剪切掉原文/清空残留),单独渲染不丢。 */
+  src: SubLine | null;
+  /** 该原文的翻译行(同侧连到的 dst 都归此组;通常 1 条,多句拆译则多条)。 */
+  dsts: SubLine[];
+};
+
+/**
+ * 双栏成组配对(W4a 2026-10-07 纯函数):同方向内按时间序「原文行 + 紧随其后的
+ * 其翻译行」成组。流向与列 1:1(rev=对方列/fwd=我方列),每侧维护一个开口组:
+ * src 开组(开口组已在则先冲账=在途原文没有翻译也照渲染不丢);dst 归入开口组
+ * (同侧连到的多条 dst 都算它的译文,agent 逐句出译时同源多句不散组);没有开口
+ * 组的 dst=孤儿译文,单独成组不丢。末尾冲账两侧开口组。
+ * 输入须已按流向筛过(成组绝不跨流向),行序=时间序;输出顺序保证同列内保序。
+ * export 仅为 node 单测转译入口(test/interp-subtitles.test.mjs),无页面消费者。
+ */
+export function pairSubtitles(
+  rows: Array<{ who: { kind: "src" | "dst"; side: "left" | "right"; flow: "rev" | "fwd" }; text: string; idx: number }>,
+): SubGroup[] {
+  const out: SubGroup[] = [];
+  const open: { left: SubGroup | null; right: SubGroup | null } = { left: null, right: null };
+  for (const r of rows) {
+    const side = r.who.side;
+    if (r.who.kind === "src") {
+      if (open[side]) out.push(open[side]);
+      open[side] = { side, flow: r.who.flow, src: { text: r.text, idx: r.idx }, dsts: [] };
+    } else if (open[side] && open[side].flow === r.who.flow) {
+      open[side].dsts.push({ text: r.text, idx: r.idx });
+    } else {
+      out.push({ side, flow: r.who.flow, src: null, dsts: [{ text: r.text, idx: r.idx }] });
+    }
+  }
+  if (open.left) out.push(open.left);
+  if (open.right) out.push(open.right);
+  return out;
+}
+
+// ==== end interp-subtitles ====
 
 /**
  * 监听一个房间的 trans-* 译文音轨出声,出声(含 600ms 余量)期间 setHeld(true)。

@@ -2024,6 +2024,11 @@ async def entrypoint(ctx) -> None:
 
     # 「我方输出=对方听到的内容」:本 agent 的译文轨只授权 deliver 端订阅。
     # 发布者单方声明即生效;新发布轨/新加入参与者默认无权限 → 幂等重设三处触发。
+    # W4b(2026-10-07 demo-quality-wave):fwd 方向(speaker_role=me)额外放开 listen
+    # 侧(me- 译员座)对本 agent 译文轨(trans-<对方语言>)的**订阅权**——控制台
+    # 「听对方听到的翻译」开关要拉这条轨。订阅≠自动播:放开只是权限,是否出声由
+    # 前端路由决定(默认关=连订阅都不拉);deliver 端收听不受影响。rev 方向**不**
+    # 对称放开——other- 订 rev 轨=对方听到自己话的译文(回声),无产品诉求。
     def _apply_track_permissions() -> None:
         try:
             lp = room.local_participant
@@ -2034,17 +2039,28 @@ async def entrypoint(ctx) -> None:
             ]
             if not sids:
                 return
-            lp.set_track_subscription_permissions(
-                allow_all_participants=False,
-                participant_permissions=[
+            perms = [
+                rtc.ParticipantTrackPermission(
+                    participant_identity=deliver_identity,
+                    allow_all=False,
+                    allowed_track_sids=sids,
+                )
+            ]
+            note = ""
+            if speaker_role == "me":
+                perms.append(
                     rtc.ParticipantTrackPermission(
-                        participant_identity=deliver_identity,
+                        participant_identity=listen_identity,
                         allow_all=False,
                         allowed_track_sids=sids,
                     )
-                ],
+                )
+                note = f" (+{listen_identity} hear-their-trans)"
+            lp.set_track_subscription_permissions(
+                allow_all_participants=False,
+                participant_permissions=perms,
             )
-            print(f"[interp] audio tracks {sids} -> only {deliver_identity}", flush=True)
+            print(f"[interp] audio tracks {sids} -> {deliver_identity}{note}", flush=True)
         except Exception as exc:  # pragma: no cover - 权限失败退化为全场可听(不阻翻译)
             print(f"[interp] track permissions failed: {exc!r}", flush=True)
 
