@@ -138,10 +138,32 @@ async def make_call(prefix: str) -> tuple[str, rtc.Room, rtc.AudioSource, bytear
         json={"name": f"边角客服{prefix}", "language": "cantonese", "tone": "礼貌专业"},
         timeout=10,
     ).json()
+    # 模板必填闸（BOK_REQUIRE_TEMPLATE 默认开）:显式绑粤语正牌模板——判据镜像
+    # e2e_barge_in（语言匹配+剔 e2e/probe 名，env 覆盖口 EDGE_TEMPLATE_ID）。
+    # 旧版裸建通话在闸默认开后 400「实时通话必须绑定话术模板」(2026-10-07 实证)。
+    tpl_id = os.environ.get("EDGE_TEMPLATE_ID", "").strip()
+    if not tpl_id:
+        tpls = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001",
+            headers=_CP_HEADERS,
+            timeout=10,
+        ).json()
+        tpls = tpls if isinstance(tpls, list) else tpls.get("items") or tpls.get("templates") or []
+        tpl = next(
+            (t for t in tpls
+             if str(t.get("language")) == "cantonese"
+             and "e2e" not in str(t.get("name", "")).lower()
+             and "probe" not in str(t.get("name", "")).lower()),
+            None,
+        )
+        tpl_id = str(tpl.get("id") or "") if tpl else ""
+    if not tpl_id:
+        raise SystemExit("模板闸:无可用粤语模板——请设 EDGE_TEMPLATE_ID 或先建模板")
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         headers=_CP_HEADERS,
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
+              "template_id": tpl_id,
               "mode": "live", "direction": "webrtc", "language": "cantonese"},
         timeout=10,
     ).json()
