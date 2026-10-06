@@ -892,8 +892,10 @@ def test_set_enabled_none_follows_env_gate(tmp_path, monkeypatch):
 
 
 def test_cloud_auto_gate_wired_in_agent():
-    """源级 pin：装配点按 a_reply 路由自动关垫话（云档）+ env 双向覆盖在场。"""
+    """源级 pin：W1c（2026-10-06）云车道垫话门解禁——装配点走纯函数
+    _filler_cloud_gate，默认云车道也 arm，"0" 回旧 auto-off，双向打点在场。"""
     src = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
-    assert "_filler.set_enabled(False)" in src
-    assert "_filler.set_enabled(True)" in src
-    assert "filler auto-off (cloud a_reply lane)" in src
+    assert "_filler_cloud_gate(" in src
+    assert 'os.environ.get("BOK_FILLER_CLOUD", "").strip()' in src
+    assert "[agent] filler armed (cloud lane, BOK_FILLER_CLOUD=1)" in src
+    assert "[agent] filler auto-off (cloud lane, BOK_FILLER_CLOUD=0)" in src
