@@ -44,14 +44,29 @@ export interface PreviewVoiceSpec {
   sample_rate?: number;
   /** QA 词条 id：给了先取 /api/qa/{id}/canned-audio 录音缓存（零云费），404/失败降级。 */
   cannedEntryId?: string;
-  /** 现场合成烧云配额仅主管；false 且缓存不可用时抛错（不烧云）。默认 true。 */
+  /** 现场合成烧云配额仅主管；false 且缓存/本地物化都不可用时抛错（不烧云）。默认 true。 */
   allowLive?: boolean;
 }
 
+/** 本地物化试听（2026-10-06 W2e；2026-10-07 CI 修正=真文件直发）：
+ *  scripts/seed/cache_minimax_auditions.py 对目录全量真合成落
+ *  apps/web/public/minimax-auditions/<voice_id 安全化>.mp3（与脚本 safe_name
+ *  同规则：非 [A-Za-z0-9._-] 折叠 _、剥首尾 _），UI 同源静态托管——命中即零云费
+ *  零延迟；未命中（云端克隆/本地 Qwen 音色/未物化部署）静默回落 /api/tts/preview
+ *  现场合成，行为与旧版逐字节一致。（历史：曾用根 assets/ 目录+public 符号链接，
+ *  CP Docker web-build stage 只 COPY apps/web → symlink 悬空 ENOENT，已改真文件。） */
+const AUDITION_BASE = "/minimax-auditions";
+
+function auditionFileName(voice: string): string {
+  const safe = String(voice).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return `${safe || "voice"}.mp3`;
+}
+
 /**
- * 取试听音频 Blob：缓存优先（cannedEntryId → 罐头 wav）→ 现场合成
- * （POST /api/tts/preview）。全部 fetch 带 authHeaders（auth-on 附 Bearer）；
- * 返回 Blob，播放与 objectURL 回收交给调用方（通常配 playAudioBlob）。
+ * 取试听音频 Blob：QA 罐头缓存（cannedEntryId）→ 本地物化试听（目录音色，
+ * 零云费）→ 现场合成（POST /api/tts/preview）。fetch 带 authHeaders 的仅 CP 面
+ * （罐头）；本地物化是 UI 同源静态文件不带鉴权头。返回 Blob，播放与 objectURL
+ * 回收交给调用方（通常配 playAudioBlob）。
  */
 export async function previewVoice(spec: PreviewVoiceSpec): Promise<Blob> {
   const allowLive = spec.allowLive !== false;
@@ -61,6 +76,14 @@ export async function previewVoice(spec: PreviewVoiceSpec): Promise<Blob> {
       if (res.ok) return await res.blob();
     } catch {
       /* 网络失败等同缺料，照降级 */
+    }
+  }
+  if (spec.voice) {
+    try {
+      const res = await fetch(`${AUDITION_BASE}/${auditionFileName(spec.voice)}`);
+      if (res.ok) return await res.blob();
+    } catch {
+      /* 本地物化缺席（未物化/非同源托管），照走现场合成 */
     }
   }
   if (!allowLive) throw new Error("需要主管权限现场合成");

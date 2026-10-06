@@ -64,6 +64,7 @@ class WatchdogTimeoutError(RuntimeError):
 # 独立立法;2026-09-27 意图闸默认翻启 "1"、QA 复核仍默认 "0")。缺 sidecar=
 # fail-open 结构性零退化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env。
 from .fillers import FillerDirector, derive_context_bucket, intent_category_hint
+from .ambience import AmbienceLoopPlayer, resolve_scene
 from .laya_judge import (
     build_qa_state,
     decide_qa_match,
@@ -1713,6 +1714,29 @@ def _late_answer_dedup_verdict(
     return best >= sim_threshold, best
 
 
+def _filler_cloud_gate(filler_env: str, cloud_lane: bool, cloud_env: str = "") -> tuple[bool | None, str]:
+    """W1c 垫话云车道门（2026-10-06 demo-quality wave，纯函数单测用）。
+
+    旧档（2026-10-03）云 a_reply 车道 auto-off——实弹翻案（call-6a8133f6 三轮
+    重问全哑）：云档一轮 commit_to_audio≈2.0s > 客户耐心，生成空窗无垫话遮蔽
+    =死寂直接诱发连环重问。现在云车道默认也 arm（``BOK_FILLER_CLOUD`` 默认
+    "1"；"0" 回旧 auto-off），配额/冷却/让路政策全部现成。优先序：
+    ① ``BOK_FILLER`` 显式 "1"/"0"（强制开/关，实例覆盖）
+    ② 云车道 × ``BOK_FILLER_CLOUD``（默认 arm；"0"=旧 auto-off）
+    ③ 本地车道不触碰实例（返回 None=沿用模块 env 缺省，逐字节旧行为）。
+    返回 (enabled, reason)；enabled=None 表示不调 set_enabled。"""
+    env = str(filler_env or "").strip()
+    if env == "1":
+        return True, "env-forced-on"
+    if env == "0":
+        return False, "env-forced-off"
+    if cloud_lane:
+        if str(cloud_env or "").strip() == "0":
+            return False, "cloud-auto-off"
+        return True, "cloud-armed"
+    return None, "local-default"
+
+
 def _wire_llm_fallback(raw_llm, lang: str) -> bool:
     """把通话语言兜底直念文本注入 LLM **raw 内芯**(2026-09-17 RC1,纯函数可单测)。
 
@@ -1796,6 +1820,70 @@ def _storm_on_turn(state: dict, now: float, *, quiet_s: float, max_rounds: int) 
     if rounds >= 3 and rounds % 2 == 1:
         return "ack"
     return "silent"
+
+
+# ---- W1f 打断四分法（2026-10-06 demo-quality wave）：短应承判据 ----
+# 客户附和（嗯/好的/ok）不是打断——「打断确证才弃流」的豁免面。词面 zh/canto/en
+# 收全，一律小写、去标点/空白后整串匹配；全部 ≤4 内容字符（超长=真内容轮，
+# 宁可多答不误弃）。归一形态入表（"OK."→"ok"、"嗯嗯。"→"嗯嗯"）。
+_BACKCHANNEL_PUNCT = " \t\r\n。，、；：！？!?,.;:~·…-—_()（）[]{}【】「」『』<>《》\"'‘’“”*#@&+/\\|=⋯"
+_USER_BACKCHANNEL_WORDS: frozenset[str] = frozenset({
+    # 普通话
+    "嗯", "嗯嗯", "嗯呐", "噢", "噢噢", "哦", "哦哦", "喔", "喔喔",
+    "好", "好的", "好吧", "好呀", "好啊", "好嘞", "好啦", "好咧", "好的好的",
+    "对", "对的", "对啊", "对呀", "是", "是的", "是啊", "是呀",
+    "明", "明白", "明白了", "明白啦", "知道", "知道了", "知道啦", "知道喇",
+    "了解", "了解了", "收到", "嗯好的", "是的呢",
+    # 粤语
+    "係", "係嘅", "係呀", "係啦", "好嘅", "好呀", "知啦", "明呀", "噢好",
+    # 英文（≤4 归一字符）
+    "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "fine", "isee",
+})
+
+
+def _backchannel_norm(text: str) -> str:
+    """短应承归一：剥空白与中英标点 + casefold（纯函数，单测用）。"""
+    return "".join(
+        ch for ch in str(text or "").casefold() if not ch.isspace() and ch not in _BACKCHANNEL_PUNCT
+    )
+
+
+def _is_user_backchannel(text: str) -> bool:
+    """W1f 短应承判据（纯函数，单测用）：归一后 ≤4 内容字符且命中应承词表。
+
+    客户在附和不是在抢话——打断确证点（on_user_turn_completed）见此词即不
+    abandon 在途 LLM 流（官方 resume_false_interruption 恢复播报有内容可续，
+    或等下一轮真内容再确证）。判据保守：词表外/超长一律算真内容轮。"""
+    norm = _backchannel_norm(text)
+    if not norm or len(norm) > 4:
+        return False
+    return norm in _USER_BACKCHANNEL_WORDS
+
+
+async def _await_data_stream_flush(tasks, timeout_s: float = 2.0) -> tuple[bool, int, int]:
+    """W1g-agent 挂断顺序化（2026-10-06 demo-quality wave）：等在途房间数据流
+    任务收尾，上限 timeout_s，超时取消残留强退。
+
+    病灶：entrypoint 被 job teardown 强杀时在途 transcription stream_text
+    （垫话字幕等）半开——agent 参与者断线后浏览器侧 DataStreamError 直接源头，
+    且 `entrypoint did not exit in time, cancelling` ×42/晚。返回
+    (ok, waited_ms, n)；ok=False=超时档。纯 asyncio 零 livekit 依赖，单测直接
+    喂伪任务。一切等待都有界，绝不挂死。"""
+    pending = [t for t in tasks if not t.done()]
+    n = len(pending)
+    t0 = time.monotonic()
+    ok = True
+    if pending:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=timeout_s
+            )
+        except Exception:  # noqa: BLE001 - 超时（或取消传播）=强退档
+            ok = False
+            for _t in pending:
+                if not _t.done():
+                    _t.cancel()
+    return ok, int((time.monotonic() - t0) * 1000), n
 
 
 def _digit_confirm_line(lang: str) -> str:
@@ -3920,6 +4008,41 @@ async def entrypoint(ctx):
     _reply_partial: dict = {"text": ""}
     # B3 连环打断风暴:滚动窗打断时刻 + 静听模式截止时刻。
     _storm: dict = {"ts": [], "active_until": 0.0, "rounds": 0}
+    # W1f deferred abandon(2026-10-06 demo-quality wave):打断确证才弃流——
+    # 打断瞬间只登记待弃流(假打断/短应承窗内在途 LLM 流保活,官方
+    # resume_false_interruption 恢复播报时有内容可续);确证点(下一轮非短应承
+    # 用户轮/会话收尾)经 _flush_deferred_abandon 统一结清。逃生口
+    # BOK_INTERRUPT_INSTANT_ABANDON=1 回旧「打断瞬间即 abandon」档(逐字节)。
+    # at=挂账时刻(观测面);streams 持流对象强引用,新轮流接管槽位后旧引用仍
+    # 可安全 abandon(幂等)。
+    _deferred_abandon: dict = {"streams": [], "at": 0.0}
+    # W1g-agent 挂断顺序化(2026-10-06):在途房间数据流任务池(垫话字幕
+    # stream_text 等)——session 关闭后、退房前 TEARDOWN_STREAM_FLUSH ≤2s 统一
+    # 收口,半开流不再泄给浏览器(DataStreamError 根修的 agent 侧一半)。
+    _data_stream_tasks: set = set()
+
+    async def _flush_deferred_abandon(reason: str) -> None:
+        """W1f 确证点统一结清:逐流 abandon(幂等),限时 2s/流,失败唔阻确认路径。"""
+        if not _deferred_abandon["streams"]:
+            return
+        _armed = list(_deferred_abandon["streams"])
+        _deferred_abandon["streams"] = []
+        _deferred_abandon["at"] = 0.0
+        for _fs in _armed:
+            try:
+                await asyncio.wait_for(_fs.abandon(), timeout=2.0)
+                print(f"[agent] deferred abandon flushed reason={reason} (call {room_name})", flush=True)
+            except Exception as exc:  # noqa: BLE001 - 弃流失败唔阻确证路径
+                print(f"[agent] deferred abandon failed reason={reason}: {exc!r} (call {room_name})", flush=True)
+
+    def _spawn_data_stream(coro) -> None:
+        """W1g-agent:数据流任务入池(强引用+自动出池);无事件循环=丢弃(测试态)。"""
+        try:
+            _t = asyncio.create_task(coro)
+        except RuntimeError:
+            return
+        _data_stream_tasks.add(_t)
+        _t.add_done_callback(_data_stream_tasks.discard)
     # A3 饿死兜底(2026-09-13,call-909744db「太长啦」3 连轮 sentences=0
     # canceled=1 只闻垫话):连续 2 个用户轮之间零 assistant 输出(含 say/QA/
     # LLM 任何形态)→ 第 3 轮跳过完整生成,直念 ≤15 字短承接+StopResponse,
@@ -4911,6 +5034,19 @@ async def entrypoint(ctx):
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
+    # W6 场景底噪(2026-10-06 demo-quality wave):可拔插全程环境音轨(office/
+    # callcenter/car 三档),与垫话共用同一 BackgroundAudioPlayer out-of-band 轨;
+    # BOK_AMBIENT_SCENE 缺省 none=零行为(resolve_scene 宽容:未知/资产缺失=None)。
+    # 播放器在 session 起来后创建(见 _bg_audio.start 之后);duck 绑定走
+    # agent_state_changed(speaking 避让 -12dB/200ms 平滑,停嘴回涨),钩子先于
+    # session.start 注册(与 _on_partial_gate 同规,免错过初始 speaking 转换)。
+    _ambience_scene = resolve_scene(os.environ.get("BOK_AMBIENT_SCENE", "").strip().lower())
+    _ambience: AmbienceLoopPlayer | None = None
+    if _ambience_scene is not None:
+        print(
+            f"[agent] ambience scene resolved: {_ambience_scene.get('scene')} (BOK_AMBIENT_SCENE)",
+            flush=True,
+        )
     # 垫话补物化执行体(task-14a):消费整段合成流(音频丢弃)——CachedTTS 未命中
     def _filler_caption(text: str) -> None:
         # F4(2026-09-11 用户点名「垫话字幕要出来」):out-of-band 音轨不入 chat_ctx
@@ -4941,8 +5077,11 @@ async def entrypoint(ctx):
             await w.aclose()
             print(f"BOK_FILLER caption published sid={track_sid} text={text!r}", flush=True)
 
+        # W1g-agent(2026-10-06):字幕 stream_text 归入数据流池(_data_stream_tasks)
+        # ——挂断顺序化(TEARDOWN_STREAM_FLUSH ≤2s)统一收口,不再混入结算 gather;
+        # 半开的 transcription 流正是浏览器 DataStreamError 的直接源头。
         try:
-            _spawn_report(_pub())
+            _spawn_data_stream(_pub())
         except Exception:  # noqa: BLE001 - 字幕失败零影响垫话
             pass
 
@@ -5049,19 +5188,24 @@ async def entrypoint(ctx):
         # 真答案已在路上就不再补垫话。裸 provider/无缓存形态无此口=None=旧门。
         reply_pending_provider=getattr(tts_provider, "reply_stream_pending_since", None),
     )
-    # 云档免垫话（2026-10-03，Ethan 全云实弹判定「太顺滑、垫音多余」）：a_reply
-    # 走云档（openai 路由）时垫话默认关——垫话本是盖本地 LLM 首 token 慢窗的；
-    # 云档真答案 56ms-1.6s 即到，垫话=抢在答案前的一声多余语气（call-94b9ba9d
-    # 实弹：4 发全被 FILLER_YIELD/refund 收走）。本地档保持开；显式覆盖
-    # BOK_FILLER=0 全关 / =1 强制开（A/B 用）。只动本实例评估口，零全局态。
+    # 云档垫话门（W1c，2026-10-06 demo-quality wave 翻案）：旧档云 a_reply
+    # 车道 auto-off——call-6a8133f6 实弹（三轮重问全哑）定性「云档 2s 生成空窗
+    # 无遮蔽=死寂诱发连环重问」。现在云车道默认也 arm（BOK_FILLER_CLOUD 默认
+    # "1"），垫话配额/冷却/让路政策全部现成；"0" 回旧 auto-off。BOK_FILLER
+    # 显式 1/0 仍最高优先（A/B 用）。决策收进纯函数 _filler_cloud_gate（单测）；
+    # 只动本实例评估口，零全局态。
     _filler_env = os.environ.get("BOK_FILLER", "").strip()
-    if _filler_env == "1":
-        _filler.set_enabled(True)
-    elif _filler_env == "0":
-        _filler.set_enabled(False)
-    elif _a_reply_route.provider == PROVIDER_OPENAI:
-        _filler.set_enabled(False)
-        print("[agent] filler auto-off (cloud a_reply lane)", flush=True)
+    _filler_on, _filler_reason = _filler_cloud_gate(
+        _filler_env,
+        _a_reply_route.provider == PROVIDER_OPENAI,
+        os.environ.get("BOK_FILLER_CLOUD", "").strip(),
+    )
+    if _filler_on is not None:
+        _filler.set_enabled(_filler_on)
+    if _filler_reason == "cloud-auto-off":
+        print("[agent] filler auto-off (cloud lane, BOK_FILLER_CLOUD=0)", flush=True)
+    elif _filler_reason == "cloud-armed":
+        print("[agent] filler armed (cloud lane, BOK_FILLER_CLOUD=1)", flush=True)
     # 垫话开播 → 看门狗一次性顺延(RC3,2026-09-17):垫话 out-of-band 出声框架
     # 不可见(不入 speech 队列、无首音频信号),watchdog 不拆弹——「垫话盖耳+
     # 系统慢」轮被 4s 闸误伤(50 轮开火 14 次、多次掐掉在途真回复)。回调在
@@ -5836,6 +5980,13 @@ async def entrypoint(ctx):
         _reply_done_event.set()
 
         async def _close():
+            # W1f:会话收尾=弃流挂账的最后确证点——待弃流在此结清,僵尸解码
+            # 不跨通残留(job 进程一通一命,进程内状态本会随之湮灭,显式收口
+            # 只是让服务端早放槽)。失败唔阻结算。
+            try:
+                await _flush_deferred_abandon("close")
+            except Exception:  # noqa: BLE001
+                pass
             # DR 指标收尾(契约 §1):停后台批循环 + 扫尾 flush 余样 + 关上报客户端
             # ——尽力而为、全吞错,绝不因上报拖住结算/收线。
             try:
@@ -6661,6 +6812,15 @@ async def entrypoint(ctx):
                 # W-GATE:纯丢弃轮无 item 可报 → 直接放行让位 judge
                 _reply_done_event.set()
                 raise StopResponse()
+            # ---- W1f 打断确证点(2026-10-06 demo-quality wave)----
+            # 走到这里=本轮是真实用户内容(纯回声/热词 dump/空轮等假轮上游已
+            # StopResponse=假打断永不触发弃流)。挂账中的待弃流在此结清——但
+            # 短应承(嗯/好的/ok)豁免:客户在附和不抢话,在途流保活(官方
+            # resume_false_interruption 恢复播报有内容可续),下一轮真内容再
+            # 确证。escape hatch=见 _deferred_abandon 声明处。W-GATE 语义不动:
+            # 置位(本段 speech 已终结)与弃流时点解耦,只推迟 abandon 不推迟 W-GATE。
+            if _deferred_abandon["streams"] and not _is_user_backchannel(user_text):
+                await _flush_deferred_abandon("turn-confirmed")
             # 垫话罐头匹配的口粮(2026-09-13 实机实证):旧版只在 has_steps 块内
             # 赋值 → 无模板通话(E2E 腿)last_user_text 恒空,匹配层饿死
             # (BOK_FILLER_MATCH miss best=0.00)。无条件赋值——纯字段,无模板零副作用。
@@ -8639,6 +8799,20 @@ async def entrypoint(ctx):
 
         session.on("agent_state_changed", _on_spec_state)
 
+    if _ambience_scene is not None:
+        def _on_ambience_state(ev) -> None:
+            # W6 duck:AI speaking=底噪避让 -12dB(增益轨迹 ~200ms 平滑收敛),
+            # listening=回涨;thinking(LLM 生成未出声)不避让。高频翻转无害。
+            if _ambience is None:
+                return
+            state = str(getattr(ev, "new_state", "") or "")
+            if state == "speaking":
+                _ambience.set_ducked(True)
+            elif state == "listening":
+                _ambience.set_ducked(False)
+
+        session.on("agent_state_changed", _on_ambience_state)
+
     # ---- B4 打断轮补账 + B3 风暴计数(2026-09-17,注册须先于 session.start)----
     # 被打断的回复不出 conversation_item_added → turns 表零记录,连环打断现场
     # 无法从账本重建(agent-2 盘点缺口#4)。speech_created 给出每段 speech 的
@@ -8715,11 +8889,11 @@ async def entrypoint(ctx):
                         await _ledger_ack_line("storm-ack", _storm_line)
                     except Exception as exc:  # noqa: BLE001 - 让路语失败唔阻静听
                         print(f"[storm] ack say failed: {exc!r}", flush=True)
-                # B4:被打断且回复已有部分文本 → 补记 gen=interrupted 行。
-                if (
-                    partial
-                    and os.environ.get("BOK_INTERRUPT_LEDGER", "1") == "1"
-                ):
+                # B4:被打断轮补记 gen=interrupted 行。W1d(2026-10-06 demo-quality
+                # wave)补洞:零产出(未开播即被掐、tee/guard 缓冲全空)轮此前不落账
+                # → turns 对账低估回复数、诊断少证据(观测洞,计划 §0.1)。现在
+                # 零文本也落一条(transcript 空,provider=interrupted)。
+                if os.environ.get("BOK_INTERRUPT_LEDGER", "1") == "1":
                     try:
                         _ip_ms = int((time.monotonic() - _t0) * 1000)
                         await cp.add_turn(
@@ -8731,7 +8905,8 @@ async def entrypoint(ctx):
                             started_ms=_ip_ms, ended_ms=_ip_ms,
                         )
                         print(
-                            f"[agent] interrupted reply ledgered chars={len(partial)} (call {room_name})",
+                            f"[agent] interrupted reply ledgered chars={len(partial)}"
+                            f"{'' if partial else ' (zero-output)'} (call {room_name})",
                             flush=True,
                         )
                     except Exception as exc:  # noqa: BLE001 - 账本失败唔阻通话
@@ -8756,8 +8931,19 @@ async def entrypoint(ctx):
                 # 无首token僵尸正是主体,故本块移出 partial 门。时序门保下一轮
                 # 新流永不误杀(取样点=_watch 入口 _interrupt_at,非收场 now)。
                 # 纯超时 drain(机器慢)语义不变。BOK_INTERRUPT_REAP=0 关。
+                # 【W1f deferred abandon(2026-10-06 demo-quality wave)】弃流从
+                # 「打断瞬间」推迟到「打断确证」(默认):此刻只挂账(
+                # _deferred_abandon),确证点=下一轮非短应承用户轮/会话收尾。
+                # 假打断(resume_false_interruption ≤1s 停嘴恢复)与短应承
+                # (嗯/好的/ok)窗内在途流保活——旧档连假打断都熔断,恢复了个空
+                # =哑窗放大器(Family A)。逃生口 BOK_INTERRUPT_INSTANT_ABANDON=1
+                # 回旧「打断瞬间即 abandon」档(逐字节)。时序门照旧在挂账时
+                # 应用(创建晚于打断时刻的新流绝不入账)。
                 if os.environ.get("BOK_INTERRUPT_REAP", "1") == "1":
                     _abandoned_ids: set[int] = set()
+                    _instant_abandon = (
+                        os.environ.get("BOK_INTERRUPT_INSTANT_ABANDON", "0") == "1"
+                    )
                     for _reap_layer in ("_last_guard_stream", "_last_reply_stream"):
                         _reap_stream = getattr(llm_provider, _reap_layer, None)
                         if _reap_stream is None:
@@ -8766,15 +8952,23 @@ async def entrypoint(ctx):
                             _fs = _find_abandonable_stream(_reap_stream, _interrupt_at)
                             if _fs is not None and id(_fs) not in _abandoned_ids:
                                 _abandoned_ids.add(id(_fs))
-                                try:
-                                    await _fs.abandon()
+                                if _instant_abandon:
+                                    try:
+                                        await _fs.abandon()
+                                        print(
+                                            f"[agent] interrupted stream abandoned (server aborted, instant) layer={_reap_layer} (call {room_name})",
+                                            flush=True,
+                                        )
+                                    except Exception as exc:  # noqa: BLE001 - 弃流失败唔阻打断路径
+                                        print(
+                                            f"[agent] interrupted abandon failed layer={_reap_layer}: {exc!r} (call {room_name})",
+                                            flush=True,
+                                        )
+                                else:
+                                    _deferred_abandon["streams"].append(_fs)
+                                    _deferred_abandon["at"] = _interrupt_at
                                     print(
-                                        f"[agent] interrupted stream abandoned (server aborted) layer={_reap_layer} (call {room_name})",
-                                        flush=True,
-                                    )
-                                except Exception as exc:  # noqa: BLE001 - 弃流失败唔阻打断路径
-                                    print(
-                                        f"[agent] interrupted abandon failed layer={_reap_layer}: {exc!r} (call {room_name})",
+                                        f"[agent] interrupt abandon deferred (await confirm) layer={_reap_layer} (call {room_name})",
                                         flush=True,
                                     )
                             elif _fs is None:
@@ -8838,6 +9032,26 @@ async def entrypoint(ctx):
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] background audio start failed, filler off: {exc!r}", flush=True)
             _bg_audio = None
+    # W6 底噪起播:垫话轨在场+场景已解析才创建(共用同一 out-of-band 混音器);
+    # 资产缺失/起播失败=响亮日志零行为,唔阻通话。duck 钩子已先于 session.start
+    # 注册(见 _on_ambience_state),创建后状态翻转即生效。
+    if _bg_audio is not None and _ambience_scene is not None:
+        try:
+            _ambience = AmbienceLoopPlayer(
+                _bg_audio, entry=_ambience_scene, call_label=room_name
+            )
+            _ambience.start()
+            if _ambience.running:
+                print(
+                    f"[agent] ambience started scene={_ambience_scene.get('scene')} "
+                    f"gain={_ambience.gain_db}dB (duck on speaking) (call {room_name})",
+                    flush=True,
+                )
+            else:
+                _ambience = None
+        except Exception as exc:  # noqa: BLE001 - 底噪失败唔阻通话
+            print(f"[agent] ambience start failed, off: {exc!r}", flush=True)
+            _ambience = None
     _log_stage("session_started")
 
     if not agent.paused:
@@ -8882,6 +9096,24 @@ async def entrypoint(ctx):
         await closed.wait()
     finally:
         watch_task.cancel()
+        # W1g-agent 挂断顺序化(2026-10-06 demo-quality wave):session 关闭后、
+        # 退房(job teardown)前,先等在途房间数据流(垫话字幕 stream_text 等)
+        # 收尾——半开的 transcription 流=浏览器 DataStreamError 直接源头、
+        # entrypoint 被强杀=半开流泄给房间。上限 2s,超时取消强退,绝不挂死。
+        _ds_ok, _ds_waited, _ds_n = await _await_data_stream_flush(
+            _data_stream_tasks, timeout_s=2.0
+        )
+        print(
+            f"TEARDOWN_STREAM_FLUSH {'ok' if _ds_ok else 'timeout'} "
+            f"waited_ms={_ds_waited} n={_ds_n} (call {room_name})",
+            flush=True,
+        )
+        # W6 底噪收摊(先于垫话轨 aclose:停的是同一混音器上的自有流)。
+        if _ambience is not None:
+            try:
+                _ambience.stop()
+            except Exception:  # noqa: BLE001
+                pass
         # 垫话 out-of-band 音轨收摊(取消在播任务+取消发布);失败唔阻结算。
         if _bg_audio is not None:
             try:

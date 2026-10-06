@@ -284,3 +284,37 @@ def test_breath_inject_disabled_gate_no_inject(monkeypatch):
     tr = make_tts_voice_style_transform(False)
     out = _drain(tr, [_LONG1 + "。" + _NEXT + "。"])
     assert "(breath)" not in out and "(emm)" not in out
+
+
+# ------------------------------------------------ W3 扩容（2026-10-06 sighs/chuckle/laughs + 换气地板 20→12）
+
+
+def test_whitelist_extended_three_tags():
+    """白名单扩三件：sanitize 归一保留、strip 剥除（B 线 _VOICE_TAG_RE 同源词表）。"""
+    from agent_runtime.voice_style import VOICE_TAG_WHITELIST, sanitize_speech_text, strip_voice_style
+
+    assert {"sighs", "chuckle", "laughs"} <= VOICE_TAG_WHITELIST
+    text = "不好意思让您久等了(sighs)我马上帮您查"
+    kept = sanitize_speech_text(text)
+    assert "(sighs)" in kept and "不好意思" in kept
+    assert "(sighs)" not in strip_voice_style(text)
+    # 全角括号归一（4B 偶发形态）同受白名单
+    assert "(chuckle)" in sanitize_speech_text("好的（chuckle）没问题")
+
+
+def test_breath_floor_default_12(monkeypatch):
+    """换气地板缺省 12（W3 实测定档）：14 字非末句触发；旧缺省 20 恒够不着。"""
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    sent14 = "这个订单的赔付记录我帮您查过了呀。"  # 14 字正文
+    out = _drain(tr, [sent14, _NEXT + "。"])
+    assert out.count("(breath)") == 1
+
+
+def test_naturalness_block_w3_wording():
+    """prompt 块 W3 改版锚：上下文选标记+每轮≤3+整通≤6+标点语气+短回应不放。"""
+    from agent_runtime.voice_style import NATURALNESS_BLOCK
+
+    for needle in ("(sighs)", "(chuckle)", "(laughs)", "……", "最多 3 个标记", "最多 6 次", "第一个字之前"):
+        assert needle in NATURALNESS_BLOCK, needle
+    assert "最多用 2 个标记" not in NATURALNESS_BLOCK

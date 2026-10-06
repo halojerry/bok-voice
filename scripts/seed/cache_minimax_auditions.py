@@ -2,11 +2,12 @@
 """MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。
 
 对 apps/web/lib/minimax-voices.ts 目录里的每只音色，调 MiniMax 官方合成
-t2a_v2 生成一句固定试听文本，落 assets/minimax-auditions/<voice_id 安全化>.mp3
+t2a_v2 生成一句固定试听文本，落 apps/web/public/minimax-auditions/<voice_id 安全化>.mp3
 （同一次批量跑顺带当 2054 voice-not-exist 的体检——新增音色 ID 先跑本脚本）。
 
-- 试听文本按音色语言固定三句（粤/普/英各一句，见 LANG_TEXT），语速与生产
-  同规则（zh/粤 1.2、en 1.0，与 CP /api/tts/preview、gen_filler_assets 同源）；
+- 试听文本按音色语言固定一句（粤/普/英/德/法/日/葡，见 LANG_TEXT；新四语与
+  web previewSampleText 同句），语速与生产同规则（zh/粤 1.2、其余 1.0，与
+  CP /api/tts/preview、gen_filler_assets 同源）；
 - 目录来源=TS 文件本身（正则解析数组组 + 导出块 group→lang 映射），不复制
   清单，杜绝两处漂移——改 TS 数组语法（`["id", "label"],`）两处必须同步；
 - 凭据运行期从 settings DB 读（global_settings.tts_json.api_key，只读打开），
@@ -48,7 +49,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG_TS = ROOT / "apps" / "web" / "lib" / "minimax-voices.ts"
-OUT_DIR = ROOT / "assets" / "minimax-auditions"
+# 2026-10-07 CI 修正：物化目录=apps/web/public/minimax-auditions（真文件直发，
+# web 静态导出与 CP Docker web-build stage 均自足——根目录 assets/ 副本与
+# public 符号链接方案在 stage 内悬空 ENOENT，已撤）。
+OUT_DIR = ROOT / "apps" / "web" / "public" / "minimax-auditions"
 SETTINGS_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bok_voice.db"
 
 MODEL = "speech-2.8-hd"
@@ -62,13 +66,19 @@ INTL_BASE = "https://api.minimax.chat"
 T2A_PATH = "/v1/t2a_v2"
 ALLOWED_HOSTS = frozenset({"api.minimax.cn", "api.minimax.chat"})
 
-LANGS = ("cantonese", "zh", "en")
+# 2026-10-06 W2 四语扩容（德/法/日/葡，demo-quality-wave §0.2）：语种面跟目录走。
+LANGS = ("cantonese", "zh", "en", "de", "fr", "ja", "pt")
 
 # 每语种一句固定试听文本（同一份音频供 web/运维批量试听，免每次现烧云配额）。
+# 新四语与 web lib/voice-options.ts previewSampleText 同句（试听=目录同源口径）。
 LANG_TEXT = {
     "cantonese": "你好，我係 Bok 客服。唔該想問下，我件貨而家到咗未呀？可以幫我查下進度嘛？",
     "zh": "你好，我是 Bok 客服。请问有什么可以帮您？",
     "en": "Hello, this is the Bok assistant. How can I help you today?",
+    "de": "Hallo, ich helfe Ihnen gern weiter.",
+    "fr": "Bonjour, je vais vous aider.",
+    "ja": "こんにちは、ご案内いたします。",
+    "pt": "Olá, como posso ajudar?",
 }
 
 
@@ -276,7 +286,9 @@ def synth_mp3(key: str, url: str, voice: str, text: str, speed: float) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="MiniMax 官方试听缓存（目录全量 → assets/minimax-auditions/*.mp3）")
+    ap = argparse.ArgumentParser(
+        description="MiniMax 官方试听缓存（目录全量 → apps/web/public/minimax-auditions/*.mp3）"
+    )
     ap.add_argument("--voice", default="", help="只跑单只音色（完整 ID，或唯一前缀/子串）")
     ap.add_argument("--lang", default="", choices=list(LANGS), help="只跑某语种")
     ap.add_argument("--force", action="store_true", help="已存在也重生成（默认幂等跳过）")

@@ -1,7 +1,8 @@
 """A 线说话自然度（voice style）管线 —— MiniMax 2.8 语气标记 + 停顿标记。
 
 阶段 1·P1 人感包（2026-09-25）：LLM 在 prompt 引导下少量输出官方语气标记
-（Ethan 拍板六标记：clear-throat/inhale/breath/coughs/emm/exhale）与停顿
+（初始六件 clear-throat/inhale/breath/coughs/emm/exhale；2026-10-06 W3 扩
+sighs/chuckle/laughs 三件，Ethan 裁定每轮上限 2→3+标点语气）与停顿
 标记 `<#0.3#>`；合成层（speech-2.8-hd/turbo）把它们渲染成真声/真停顿。
 
 四条铁律（单测钉死）：
@@ -26,9 +27,11 @@ import re
 import unicodedata
 from typing import AsyncIterable
 
-# 官方六标记（Ethan 2026-09-24 拍板；仅 speech-2.8-hd / 2.8-turbo 支持）
+# 官方标记白名单（2026-09-24 拍板六件 + 2026-10-06 W3 扩三件 sighs/chuckle/laughs
+# ——B 线 interpret.py _VOICE_TAG_RE 已核实官方支持；A/B 台架物化 reports/voice-tags-ab/
+# 待人耳终裁。仅 speech-2.8-hd / 2.8-turbo 支持）
 VOICE_TAG_WHITELIST: frozenset[str] = frozenset(
-    {"clear-throat", "inhale", "breath", "coughs", "emm", "exhale"}
+    {"clear-throat", "inhale", "breath", "coughs", "emm", "exhale", "sighs", "chuckle", "laughs"}
 )
 
 # 括号 token：ASCII + 全角括号，内容不含嵌套括号
@@ -78,11 +81,14 @@ def breath_inject_enabled() -> bool:
 
 
 def _breath_min_sent_chars() -> int:
-    """触发阈值：句正文 ≥N 字（默认 20≈4s 语流）才在句界换气。"""
+    """触发阈值：句正文 ≥N 字才在句界换气（默认 12——2026-10-06 W3 实测定档：
+    【回复长度】铁律（两句≤40 字）下 llm 轮非末句最长 16 字，旧缺省 20 字地板
+    恒够不着=换气注入概率≈0；12 吃住绝大多数非末句。probe_voice_style_gate.py
+    --live 可复测产标记率）。"""
     try:
-        return max(0, int(os.environ.get("BOK_BREATH_SENT_CHARS", "20")))
+        return max(0, int(os.environ.get("BOK_BREATH_SENT_CHARS", "12")))
     except Exception:  # noqa: BLE001 - 坏值回默认
-        return 20
+        return 12
 
 
 def _has_whitelist_tag(text: str) -> bool:
@@ -293,11 +299,10 @@ def make_tts_voice_style_transform(enabled: bool):
 # ---------------------------------------------------------------------------
 
 NATURALNESS_BLOCK = """【说话自然度】
-想让语气更像真人，可以遵守下面几条：
-- 讲完一个较长的句子、要接着讲下一句时，可以在句号后换一口气：加 (breath)，例如：「这个订单的赔付记录我帮您查过了。(breath)接下来给您讲三种方案。」。
-- 要查询或查找信息时，可以在句读之后加 (emm)，例如：「您稍等，(emm)我帮您查一下」。
-- 停顿标记 <#0.3#> 可以插在两个短句中间，例如：「您先别急<#0.3#>我马上帮您看」。
-- (inhale) 用在开始回答一个较长问题之前；其余声音标记（如 (clear-throat)、(exhale)、(coughs)）不要主动使用。
-- 开场和应承可以换着说法，不要每轮同一句开头。
-- 说错了就直接重新说一遍正确的，不用道歉也不用解释。
-纪律：回复的第一个字之前不要放任何标记或停顿；每轮回复最多用 2 个标记，其中换气 (breath) 优先；整通电话最多用 4 次；拿不准就不用；标记只是给语音系统的，客户听到的是自然的声音。"""
+结合对话语境（客户的情绪、正在谈的事）让语气更像真人，遵守下面几条：
+- 每轮回复通常在第一句讲完之后放 1 个声音标记，让语句有呼吸感；拿不准就不放。
+- 按语境选标记：安抚、致歉、共情用 (sighs) 或 (breath)；查询、思考用 (emm)；客户轻松满意用 (chuckle)；客户讲到有趣的事可以跟着 (laughs)。
+- 例：「查到了，您的订单已经到香港仓。(breath)接下来给您讲怎么安排派送。」；「您稍等，(emm)我帮您查一下」；「您先别急<#0.3#>我马上帮您看」。
+- 自然的标点也是语气：迟疑用 ……，强调用 ！，反问用 ？，按语境放心用。
+- 纪律：回复的第一个字之前不要放任何标记或停顿；每轮回复最多 3 个标记；整通电话最多 6 次；短回应（客户只说了一两个词或数字时）不放标记；其余标记（(clear-throat)、(exhale)、(coughs)、(inhale)）不要主动使用；标记只是给语音系统的，客户听到的是自然的声音。
+- 开场和应承可以换着说法，不要每轮同一句开头。说错了就直接重新说一遍正确的，不用道歉也不用解释。"""

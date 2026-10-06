@@ -4070,6 +4070,14 @@ class MiniMaxTTS(tts.TTS):
             if not self._api_key() or not self._resolve_voice():
                 return False
             if self._ws_mode() == "bidi":
+                # W1b(2026-10-06):bidi 主档也并行暖 1 条 classic 池连接——主档
+                # 异常切 FallbackAdapter backup(classic 档)时 pool=hit 免冷握手段
+                #(实弹 fresh ws_connect_ms≈2468ms,是切换黑窗 4-7s 的主成分)。
+                # fire-and-forget:绝不阻塞本预热;池深仍 1、单飞幂等
+                #(_minimax_pool_schedule 自带在飞/已有连接去重);纯快路径,失败
+                # 静默,合成取唔到池照旧流内自连。沿用 BOK_TTS_PREWARM +
+                # MINIMAX_WS_POOL 双闸(经 _minimax_pool_enabled)。
+                _minimax_pool_schedule(self._endpoint_ws(), self._api_key())
                 return await self._bidi_session().prewarm_wait()
             return await _minimax_pool_prewarm(self._endpoint_ws(), self._api_key())
         except asyncio.CancelledError:
@@ -4711,14 +4719,36 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
         # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
         self._emitted_beep = True
-        sr = self._tts_.sample_rate
-        n = int(sr * 0.4)
-        pcm = bytearray()
-        for i in range(n):
-            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
-            pcm += v.to_bytes(2, "little", signed=True)
-        output_emitter.push(bytes(pcm))
-        output_emitter.flush()
+        # W1a(2026-10-06):beep 自己先 initialize+start_segment(_qwen3_tts_beep
+        # 同款修法)——旧行为 push 喺未启动 emitter 上抛 "AudioEmitter isn't
+        # started" 被外层 except 吞掉,beep 从未播出且 _run 以零音频正常返回,
+        # 框架收尾 end_input 再炸一次(生产崩形,见 _minimax_zero_audio_pad)。
+        if _minimax_emitter_unstarted(output_emitter):
+            try:
+                output_emitter.initialize(
+                    request_id="minimax-tts-beep",
+                    sample_rate=self._tts_.sample_rate,
+                    num_channels=self._tts_.num_channels,
+                    mime_type="audio/pcm",
+                    stream=True,
+                )
+                output_emitter.start_segment(segment_id="minimax-tts-beep")
+            except Exception:  # noqa: BLE001 - 已启动竞态:照旧直推
+                pass
+        try:
+            sr = self._tts_.sample_rate
+            n = int(sr * 0.4)
+            pcm = bytearray()
+            for i in range(n):
+                v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+                pcm += v.to_bytes(2, "little", signed=True)
+            output_emitter.push(bytes(pcm))
+            output_emitter.flush()
+            output_emitter.end_segment()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - beep 尽力而为,唔好踩成新崩溃源
+            print("MINIMAX_TTS_BEEP_FAIL", repr(exc), flush=True)
 
     async def _run(self, output_emitter):
         import websockets
@@ -5115,10 +5145,19 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(recv_task, timeout=15)
                 except Exception:
                     pass
+            # W1a(2026-10-06):零音频正常收尾(服务端哑火/连接死亡)垫 ~20ms 静音
+            # 把 emitter 正常启动——防框架 SynthesizeStream._main_task 收尾
+            # end_input() 在未启动 emitter 上炸 RuntimeError 经 __anext__ 上抛 →
+            # FallbackAdapter 误切 backup(崩形与修法见 _minimax_zero_audio_pad)。
+            if not init_done:
+                await _minimax_zero_audio_pad(self._tts_, output_emitter, stream=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print("MINIMAX_TTS_WS_ERR", repr(exc), flush=True)
+            # W1a:吞异常收尾同样唔可以零音频返回(同上,防框架 end_input 炸)。
+            if not init_done:
+                await _minimax_zero_audio_pad(self._tts_, output_emitter, stream=True)
         finally:
             # 停看门狗:closed_ws 此前从未被 set(死代码),且 stall_task 从不 cancel
             # ——barge-in 提前结束流后看门狗存活,4s 后重开 WS 重发文本,孤儿合成
@@ -5529,14 +5568,36 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
         # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
         self._emitted_beep = True
-        sr = self._tts_.sample_rate
-        n = int(sr * 0.4)
-        pcm = bytearray()
-        for i in range(n):
-            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
-            pcm += v.to_bytes(2, "little", signed=True)
-        output_emitter.push(bytes(pcm))
-        output_emitter.flush()
+        # W1a(2026-10-06):beep 自己先 initialize+start_segment(_qwen3_tts_beep
+        # 同款修法)——旧行为 push 喺未启动 emitter 上抛 "AudioEmitter isn't
+        # started" 被外层 except 吞掉,beep 从未播出且 _run 以零音频正常返回,
+        # 框架收尾 end_input 再炸一次(生产崩形,见 _minimax_zero_audio_pad)。
+        if _minimax_emitter_unstarted(output_emitter):
+            try:
+                output_emitter.initialize(
+                    request_id="minimax-tts-beep",
+                    sample_rate=self._tts_.sample_rate,
+                    num_channels=self._tts_.num_channels,
+                    mime_type="audio/pcm",
+                    stream=True,
+                )
+                output_emitter.start_segment(segment_id="minimax-tts-beep")
+            except Exception:  # noqa: BLE001 - 已启动竞态:照旧直推
+                pass
+        try:
+            sr = self._tts_.sample_rate
+            n = int(sr * 0.4)
+            pcm = bytearray()
+            for i in range(n):
+                v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+                pcm += v.to_bytes(2, "little", signed=True)
+            output_emitter.push(bytes(pcm))
+            output_emitter.flush()
+            output_emitter.end_segment()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - beep 尽力而为,唔好踩成新崩溃源
+            print("MINIMAX_TTS_BEEP_FAIL", repr(exc), flush=True)
 
     @staticmethod
     def _cancel_wait_s() -> float:
@@ -6203,6 +6264,14 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             flush=True,
                         )
 
+                # W1a(2026-10-06):零音频正常收尾(服务端哑火/连接死亡/守卫无文本/
+                # 打断竞态下输入通道先闭)垫 ~20ms 静音把 emitter 正常启动——防框架
+                # SynthesizeStream._main_task 收尾 end_input() 在未启动 emitter 上
+                # 炸 RuntimeError 经 __anext__ 上抛 → FallbackAdapter 误切 backup
+                #(崩形与修法见 _minimax_zero_audio_pad)。任务已被 cancel 时走
+                # CancelledError 分支 raise(消费者本就见 StopAsyncIteration),唔经此。
+                if not init_done:
+                    await _minimax_zero_audio_pad(self._tts_, output_emitter, stream=True)
                 _print_perf_summary()
             except asyncio.CancelledError:
                 # 打断(barge-in):通知服务端丢弃缓冲/停合成,连接保留给下一轮。
@@ -6221,9 +6290,15 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     f"pushed={int(bool(state.get('sent_any')))} (interrupted)",
                     flush=True,
                 )
+                # 保持 re-raise:任务以 cancelled 收场时框架 __anext__ 走
+                # task.cancelled() 分支回 StopAsyncIteration=消费者视角干净收尾,
+                # 绝唔触框架 end_input();吞掉反而令 _run「正常返回」+零音频=崩形本体。
                 raise
             except Exception as exc:
                 print("MINIMAX_TTS_BIDI_ERR", repr(exc), flush=True)
+                # W1a:吞异常收尾同样唔可以零音频返回(同上,防框架 end_input 炸)。
+                if not init_done:
+                    await _minimax_zero_audio_pad(self._tts_, output_emitter, stream=True)
             finally:
                 for task in (resend_task, recv_task, stall_task):
                     if task:
@@ -6325,6 +6400,54 @@ async def _minimax_http_synth(
             await asyncio.sleep(0.5 * (attempt + 1))
     print("MINIMAX_TTS_ERROR", repr(last_exc), flush=True)
     return False
+
+
+def _minimax_emitter_unstarted(output_emitter) -> bool:
+    """AudioEmitter 是否仍未 initialize（W1a,2026-10-06）。
+
+    框架 SynthesizeStream._main_task 喺 `_run` 正常返回后**无条件**调
+    ``output_emitter.end_input()``（livekit-agents 1.8.2 tts.py:601），emitter
+    未启动就抛 RuntimeError("AudioEmitter isn't started")（tts.py:1008-1010）。
+    `_started` 系框架私有态，此处只读判断；判不了（属性缺席）按已启动处理
+    （保守：宁可唔补也绝不二次 initialize 撞 "already started"）。
+    """
+    return not bool(getattr(output_emitter, "_started", True))
+
+
+async def _minimax_zero_audio_pad(tts_: "MiniMaxTTS", output_emitter, *, stream: bool) -> None:
+    """零音频兜底段（W1a,2026-10-06）：首音频尚未产出即收尾时垫 ~20ms 静音。
+
+    生产崩形（2026-09-22 ×342 / 09-23 ×912 / 10-06 ×9）：打断/服务端哑火/连接
+    死亡（2201、recv-exc）令流喺「零音频」下**正常返回**→ 框架 end_input() 喺
+    未启动 emitter 上炸 → 异常经 SynthesizeStream.__anext__ 上抛 →
+    FallbackAdapter 误判主档死亡「switching to next TTS」→ backup 冷连
+    （实测 ws_connect_ms≈2468）= 4-7s 黑窗，主档被无谓下线。
+    修法=收尾前把 emitter 正常启动（initialize + 静音段）——workaround：框架
+    锁版 1.8.2 唔改，官方无「跳过 end_input」开关。打点 MINIMAX_TTS_ZERO_AUDIO_PAD
+    供观测。已启动则跳过；全程尽力而为，绝不 raise。
+    """
+    if not _minimax_emitter_unstarted(output_emitter):
+        return
+    try:
+        print("MINIMAX_TTS_ZERO_AUDIO_PAD", flush=True)
+        output_emitter.initialize(
+            request_id="minimax-tts-zero-audio-pad",
+            sample_rate=tts_.sample_rate,
+            num_channels=tts_.num_channels,
+            mime_type="audio/pcm",
+            stream=stream,
+        )
+        if stream:
+            output_emitter.start_segment(segment_id="minimax-tts-zero-audio-pad")
+        n = max(1, int(tts_.sample_rate * 0.02))
+        output_emitter.push(bytes(n * tts_.num_channels * 2))
+        output_emitter.flush()
+        if stream:
+            output_emitter.end_segment()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 兜底段尽力而为,唔好踩成新崩溃源
+        print("MINIMAX_TTS_ZERO_AUDIO_PAD_FAIL", repr(exc), flush=True)
 
 
 class _MiniMaxTTSStream(tts.ChunkedStream):
@@ -6533,14 +6656,35 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
         # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
         # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
         self._emitted_beep = True
-        sr = self._tts_.sample_rate
-        n = int(sr * 0.4)
-        pcm = bytearray()
-        for i in range(n):
-            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
-            pcm += v.to_bytes(2, "little", signed=True)
-        output_emitter.push(bytes(pcm))
-        output_emitter.flush()
+        # W1a(2026-10-06):beep 自己先 initialize(_qwen3_tts_beep 同款修法)——
+        # 旧行为 push 喺未启动 emitter 上抛 "AudioEmitter isn't started" 被外层
+        # except 吞掉,beep 从未播出且 _run 以零音频正常返回,框架 ChunkedStream.
+        # _main_task 收尾 end_input 再炸一次(生产崩形,见 _minimax_zero_audio_pad)。
+        # ChunkedStream 口径 stream=False(无 segment,同 _minimax_http_synth)。
+        if _minimax_emitter_unstarted(output_emitter):
+            try:
+                output_emitter.initialize(
+                    request_id="minimax-tts-beep",
+                    sample_rate=self._tts_.sample_rate,
+                    num_channels=self._tts_.num_channels,
+                    mime_type="audio/pcm",
+                    stream=False,
+                )
+            except Exception:  # noqa: BLE001 - 已启动竞态:照旧直推
+                pass
+        try:
+            sr = self._tts_.sample_rate
+            n = int(sr * 0.4)
+            pcm = bytearray()
+            for i in range(n):
+                v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+                pcm += v.to_bytes(2, "little", signed=True)
+            output_emitter.push(bytes(pcm))
+            output_emitter.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - beep 尽力而为,唔好踩成新崩溃源
+            print("MINIMAX_TTS_BEEP_FAIL", repr(exc), flush=True)
 
 
 _QWEN3_TTS_PRESETS = frozenset(

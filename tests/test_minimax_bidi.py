@@ -309,8 +309,11 @@ def test_reconnect_after_2201(monkeypatch):
         s1.push_text("你好。")
         s1.end_input()
         await _wait_for(lambda: s1._task.done(), timeout=10)
-        # 2201 后本流失败(零音频 → 框架 AudioEmitter 未启动,同 classic 语义)
-        assert s1._task.done() and s1._task.exception() is not None
+        # 2201 零音频收尾(W1a,2026-10-06):垫静音干净完结,任务无异常——
+        # 旧行为任务带 RuntimeError("AudioEmitter isn't started")(框架
+        # _main_task 收尾 end_input 在未启动 emitter 上炸)→ FallbackAdapter
+        # 误判主档死亡切 backup 冷连=4-7s 黑窗(生产崩形)。
+        assert s1._task.done() and s1._task.exception() is None
 
         # 下一个流(下一轮对话):自动全新重连,task_start + 完整重放输入
         s2 = tts.stream()

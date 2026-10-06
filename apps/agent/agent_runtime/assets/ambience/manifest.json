@@ -1,0 +1,25 @@
+{
+  "scenes": [
+    {
+      "scene": "office",
+      "file": "office.wav",
+      "loop_s": 40.0,
+      "gain_db": -28.0,
+      "license": "procedural-generated (seeded)"
+    },
+    {
+      "scene": "callcenter",
+      "file": "callcenter.wav",
+      "loop_s": 40.0,
+      "gain_db": -28.0,
+      "license": "procedural-generated (seeded)"
+    },
+    {
+      "scene": "car",
+      "file": "car.wav",
+      "loop_s": 40.0,
+      "gain_db": -28.0,
+      "license": "procedural-generated (seeded)"
+    }
+  ]
+}

@@ -759,6 +759,15 @@ _FORWARD_ENV = (
     # —— B 线 interim 投机翻译（2026-10-06）：prewarm-and-confirm 总闸（缺省开，
     #    0=旧路径逐字节；B 线 worker 专属，_interp_env 透传白名单同键） ——
     "BOK_INTERP_SPEC_MT",
+    # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
+    #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
+    "BOK_FILLER_CLOUD",
+    #    W1f 打断四分法逃生口（默认 0=打断确证才弃流；1 回旧「打断瞬间即 abandon」档）——
+    "BOK_INTERRUPT_INSTANT_ABANDON",
+    #    W6 全程场景底噪（none 缺省 / office / callcenter / car，可拔插循环音轨）——
+    "BOK_AMBIENT_SCENE",
+    #    W5 声纹锁通话对象（默认 0 关；enrollment+VAD 段相似度 pre-ASR 门）——
+    "BOK_SPEAKER_LOCK",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV

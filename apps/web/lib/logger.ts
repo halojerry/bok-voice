@@ -89,6 +89,40 @@ const GLOBAL_TRACE_ID = "trc-global-fallback";
 const RESIZE_OBSERVER_NOISE_RE = /resizeobserver loop/i;
 const RESIZE_OBSERVER_NOISE_TAG = "noise:resize-observer";
 
+/**
+ * livekit-client 收线良性噪音（2026-10-06 W1g）：挂断时 agent 参与者的 transcription
+ * 数据流（lk.transcription）尚未发完——livekit-client 的
+ * Room.handleParticipantDisconnected →
+ * IncomingDataStreamManager.validateParticipantHasNoActiveDataStreams 对半开流构造
+ * DataStreamError(AbnormalEnd)，经全局兜底打进 console.error → Next dev overlay 全屏红。
+ * 收线时这是正常副产品，非业务故障：命中即降 warn——不进 error 通道（不 console.error、
+ * 不触发 error 上报），warn 留痕可回查。
+ *
+ * 判据（或）：error.name === "DataStreamError"，或 message 含特征短语。该短语在
+ * livekit-client 全 bundle 仅收线校验这一处构造点；其余 DataStreamError 变体
+ * （Incomplete/DecodeFailed/HandlerAlreadyRegistered 等）message 各不相同，语义也仍是
+ * 单条数据流传输层错误（至多丢一条字幕，非页面级/业务故障）。
+ */
+const DATA_STREAM_BENIGN_NAME = "DataStreamError";
+const DATA_STREAM_BENIGN_PHRASE = "unexpectedly disconnected in the middle of sending data";
+const DATA_STREAM_BENIGN_TAG = "benign:agent-disconnect-mid-data-stream";
+
+/** 良性收线噪音判据（duck typing：容忍跨 realm/重复打包的 Error 子类）。 */
+export function isBenignDataStreamError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { name?: unknown; message?: unknown };
+  if (e.name === DATA_STREAM_BENIGN_NAME) return true;
+  return typeof e.message === "string" && e.message.includes(DATA_STREAM_BENIGN_PHRASE);
+}
+
+/** 序列化 JSON 行版判据（defaultWrite 只见行串）：error.name 字段或 message 特征短语。 */
+function isBenignDataStreamLine(line: string): boolean {
+  return (
+    line.includes(DATA_STREAM_BENIGN_PHRASE) ||
+    line.includes(`"name":"${DATA_STREAM_BENIGN_NAME}"`)
+  );
+}
+
 /** 命中即整值掩码的敏感键（大小写不敏感，子串匹配）。 */
 const SENSITIVE_KEY_RE =
   /(pass(word|wd)?|pwd|secret|token|api[-_]?key|apikey|authorization|auth|cookie|credential|private[-_]?key|access[-_]?key|cvv|cvc|card[-_]?num(ber)?|credit[-_]?card|ssn|id[-_]?number|phone|mobile|email)/i;
@@ -181,6 +215,13 @@ export interface ConfigureLoggerOptions {
 }
 
 function defaultWrite(level: LogLevel, line: string): void {
+  if (level === "error" && isBenignDataStreamLine(line)) {
+    // 良性收线噪音兜底：任何 logger.error 通道带入的 DataStreamError 都不进
+    // console.error（Next dev overlay 全屏红）——降 warn，行首加 benign 标记，
+    // JSON 行本体保持完整可解析。其余错误路径逐字节不变。
+    console.warn(`[bok] benign: agent disconnect mid-data-stream (call teardown) ${line}`);
+    return;
+  }
   if (level === "error") console.error(line);
   else if (level === "warn") console.warn(line);
   else if (level === "debug") console.debug(line);
@@ -737,6 +778,18 @@ export function installGlobalHandlers(
         });
         return;
       }
+      // 收线良性噪音第二类（agent 断线半开数据流，判据见 DATA_STREAM_BENIGN_PHRASE 注）：
+      // 降 warn 不进 error 通道，其余错误路径零变化。event.error 缺席时按 message 兜底。
+      if (isBenignDataStreamError(event.error) || msg.includes(DATA_STREAM_BENIGN_PHRASE)) {
+        globalFallbackLogger().warn("window.onerror (benign: agent disconnect mid-data-stream, call teardown)", {
+          tag: DATA_STREAM_BENIGN_TAG,
+          message: msg,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+        });
+        return;
+      }
       const err =
         event.error instanceof Error
           ? event.error
@@ -748,6 +801,13 @@ export function installGlobalHandlers(
       });
     };
     installed.onUnhandledRejectionDom = (event: PromiseRejectionEvent): void => {
+      // 同款良性收线噪音：半开流错误也经 stream controller.error() 走 promise 拒绝面。
+      if (isBenignDataStreamError(event.reason)) {
+        globalFallbackLogger().warn("unhandledrejection (benign: agent disconnect mid-data-stream, call teardown)", {
+          tag: DATA_STREAM_BENIGN_TAG,
+        });
+        return;
+      }
       globalFallbackLogger().error("unhandledrejection", event.reason ?? new Error("unknown rejection"));
     };
     win.addEventListener("error", installed.onWindowError as (ev: never) => void);

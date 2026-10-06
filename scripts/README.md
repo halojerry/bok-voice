@@ -1,7 +1,7 @@
 # scripts/ 索引（G1；G1c 起顶层 .py 清零）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 129 个：`probes/` 48 + `bench/` 18 + `e2e/` 10 + `seed/` 13 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
+> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 132 个：`probes/` 49 + `bench/` 19 + `e2e/` 10 + `seed/` 14 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口；`scripts/ops/import_smoke.py` 逐件装载冒烟（CI ci.yml 常驻步）。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
@@ -25,6 +25,7 @@
 | `scripts/bench/bench_9b_direct.py` | 9B 直连 A/B 台架(2026-09-29):同栈 mlx_lm server、同参、独占 GPU、逐模型顺序测。 | 无(手动) | 是 | 2026-10-01 |
 | `scripts/bench/bench_judge_contention.py` | judge 跨进程争用台架（批次0.2 余项，2026-10-03）。 | 无(手动) | 是 | 2026-10-03 |
 | `scripts/bench/bench_minimax_bidi.py` | MiniMax bidi 直连台架(2026-09-29,Ethan「查官方文档,是不是我们配置有问题」)。 | test_cantonese_terminology.py / test_bidi_head_flush.py | 是 | 2026-10-03 |
+| `scripts/bench/bench_voice_tags_ab.py` | A 线语气标记 ±对照真合成台架（2026-10-06）——3 语×2 句×5 变体(plain/breath/emm/sighs/pause)×2 档,人耳 A/B 用,sighs 扩白名单听证。 | 无(手动) / test_scripts_index.py | 是 | 2026-10-06 |
 | `scripts/bench/e4_frequency_scan.py` | E4 改口检测真实频次扫描（只读、可重跑、纯 stdlib）。 | 无(手动) | 否 | 2026-10-04 |
 | `scripts/bench/gpu_contention_probe.py` | GPU 同卡争抢微基准（B 机 CUDA 节点，2026-09-24 D 项归因）。 | asr_whisper_bench.py / asr_whisper_ane_leg.py | 是 | 2026-09-25 |
 | `scripts/bench/load_audio_concurrency.py` | 音频链路并发压测：4 路真实通话（各自 call/token/房间）同时进行 3 轮对话。 | security/mimosa/suppressions.json / AGENTS.md | 是 | 2026-10-04 |
@@ -119,6 +120,7 @@
 | `scripts/probes/probe_smart_turn.py` | smart-turn v3.2 (CPU int8 ONNX, 8.7MB) 三语 finished/unfinished 探针。 | test_cantonese_terminology.py | 是 | 2026-09-15 |
 | `scripts/probes/probe_thin_client_static.py` | 瘦客户端静态探针：钉死「节点托管 UI 的 CP 地址必须在运行时可注入」。 | CI ci.yml / RUNTIME_TOPOLOGY.md | 否 | 2026-10-04 |
 | `scripts/probes/probe_vad_head_syllable.py` | VAD START 前导帧并入会话缓冲 → 号码句头段多解一音（复现探针）。 | test_probe_stimulus.py / e2e_campaign.py | 是 | 2026-09-23 |
+| `scripts/probes/probe_voice_style_gate.py` | A 线语气管线装配决策离线复现（2026-10-06 云档哑火查因）——resolved model/门 verdict/NATURALNESS_BLOCK 注入+turns 覆盖面;`--live N` 实弹测标记率。 | 无(手动) / test_scripts_index.py | 是 | 2026-10-06 |
 | `scripts/probes/probe_windows_lifecycle.py` | Windows 无头部署生命周期探针（site-delivery Task 2）:down 停止语义 + schtasks 契约。 | schtasks_units.py / bok.py | 是 | 2026-09-17 |
 | `scripts/runtime/mine_qa.py` | 高频问答对挖掘（bok.py tts-mine 执行体；--cluster 走 LLM 同义聚类，与 CP qa_cluster 同源）。 | ★ CP qa_cluster.py 同源 / bok.py tts-mine | 是 | 2026-10-04 |
 | `scripts/runtime/mock_callee.py` | mock SIP 客户(模拟联调档):CP 派生的真语音被叫。 | ★ CP main.py exec / bok.py（进程识别 marker） | 是 | 2026-09-21 |
@@ -126,6 +128,7 @@
 | `scripts/seed/build_asr_variants.py` | 离线构建 ASR 音近变体词表资产(2026-09-27)。 | asr_polish.py | 否 | 2026-10-04 |
 | `scripts/seed/cache_minimax_auditions.py` | MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。 | minimax-voices.ts | 是 | 2026-10-03 |
 | `scripts/seed/gen_filler_assets.py` | 垫话音频资产生成器(2026-09-10 拍板,spec 讨论见会话)。 | agent fillers.py / test_speed_unification.py | 是 | 2026-10-04 |
+| `scripts/seed/gen_ambience.py` | W6 场景底噪资产生成器(2026-10-06):三场景无缝循环 wav+manifest,种子化确定性合成。 | agent ambience.py / test_ambience.py | 是 | 2026-10-06 |
 | `scripts/seed/gen_route_gates.py` | 生成 security/route-gates.json：枚举 CP 全部 FastAPI 路由 + 源码闸标记提取。 | test_route_gate_coverage.py | 否 | 2026-09-23 |
 | `scripts/seed/import_xkt_qa.py` | 惜客通 tbl_ai_knowledge.json → Bok qa_entries 导入器(spec §6,2026-09-17)。 | test_import_xkt_qa.py import / test_import_xkt_qa.py | 是 | 2026-10-04 |
 | `scripts/seed/load_compliant_templates.py` | 装载三语合规话术（data/templates/hegui-*.json → CP /api/templates）。 | test_compliant_templates.py | 是 | 2026-10-03 |

@@ -41,7 +41,7 @@ import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provi
 import { api, postBlob, postJson } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import { wlog, wlogBindCall } from "@/lib/weblog";
-import { startTrace } from "@/lib/logger";
+import { isBenignDataStreamError, startTrace } from "@/lib/logger";
 import { playAudioBlob } from "@/lib/preview";
 import {
   deviceRoleIssues,
@@ -1285,10 +1285,20 @@ function ConsoleLive(p: LiveProps) {
     const arr = dstArrivalsRef.current;
     const now = Date.now();
     let added = 0;
-    for (let i = dstSeenRef.current; i < total; i++) {
-      if (whoIs(transcriptions[i], p.room, p.myLang, p.otherLang).kind !== "dst") continue;
-      arr.push(now);
-      added += 1;
+    // W1g 防御兜底(2026-10-06):挂断时 agent 在 lk.transcription 半开数据流中断线,
+    // livekit 对该流收束 DataStreamError——消费循环遇之只记一笔跳过(收线正常副产品),
+    // 其余异常照抛。
+    try {
+      for (let i = dstSeenRef.current; i < total; i++) {
+        if (whoIs(transcriptions[i], p.room, p.myLang, p.otherLang).kind !== "dst") continue;
+        arr.push(now);
+        added += 1;
+      }
+    } catch (e) {
+      if (!isBenignDataStreamError(e)) throw e;
+      dstSeenRef.current = total;
+      wlog("interp_stream_benign", { note: "agent disconnect mid-data-stream (call teardown)" });
+      return;
     }
     dstSeenRef.current = total;
     if (added) {

@@ -8,6 +8,13 @@ drain 对已打断轮继续交付晚到答案=重复交付（17:28:08）。
 不变量：打断=答案过时=abandon()（force abort 服务端+熔断 drain/regen 交付）；
 纯超时（机器慢、答案仍相关）drain 语义零变化。时序门（``_bok_created`` 早于
 打断时刻）保下一轮新流永不误杀。
+
+W1f（2026-10-06 demo-quality wave）修订：abandon 默认从「打断瞬间」推迟到
+「打断确证」（下一轮非短应承用户轮/会话收尾）——假打断/短应承窗内在途流
+保活（resume_false_interruption 恢复播报有内容可续）。逃生口
+``BOK_INTERRUPT_INSTANT_ABANDON=1`` 回本档「打断瞬间即 abandon」逐字节行为。
+两臂接线见 ``test_source_pins_deferred_abandon_default_and_escape`` 与
+tests/test_interrupt_deferred_abandon.py。
 """
 
 from __future__ import annotations
@@ -246,11 +253,30 @@ def test_interrupt_time_sampled_at_watch_entry_not_after_handle():
 
 
 def test_source_pins_interrupt_abandon_wiring():
-    # 源级 pin:打断分支必须调 abandon（防未来重构静默脱线——wave-13 同文件
-    # 并行撞车教训的终态复验形态）。
+    # 源级 pin:打断分支必须保留 abandon 接线(W1f 起为逃生口档,默认 deferred
+    # ——防未来重构静默脱线,wave-13 同文件并行撞车教训的终态复验形态)。
     agent_src = (_REPO / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
     lp_src = (_REPO / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
     assert "_find_abandonable_stream(_reap_stream, _interrupt_at)" in agent_src
     assert "await _fs.abandon()" in agent_src
     assert "async def abandon(self)" in lp_src
     assert "LLM_LATE_ANSWER dropped" in lp_src
+
+
+def test_source_pins_deferred_abandon_default_and_escape():
+    """W1f(2026-10-06 demo-quality wave)两臂源级 pin:默认 deferred + 逃生口。
+
+    默认(BOK_INTERRUPT_INSTANT_ABANDON 缺省 "0"):打断只挂账
+    _deferred_abandon,确证点(下一轮非短应承用户轮/会话收尾)统一 flush——
+    假打断/短应承窗内在途流保活(resume_false_interruption 恢复播报有内容可续)。
+    "1"=回旧「打断瞬间即 abandon」档(await _fs.abandon())。"""
+    src = (_REPO / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    # 逃生口:默认 "0"(deferred),"1" 才即时弃流。
+    assert 'os.environ.get("BOK_INTERRUPT_INSTANT_ABANDON", "0") == "1"' in src
+    assert "if _instant_abandon:" in src
+    # 默认臂:挂账不入账流由确证点结清。
+    assert '_deferred_abandon["streams"].append(_fs)' in src
+    assert 'await _flush_deferred_abandon("turn-confirmed")' in src
+    assert 'await _flush_deferred_abandon("close")' in src
+    # 确证判据=短应承豁免(非短应承才 flush)。
+    assert "not _is_user_backchannel(user_text)" in src
