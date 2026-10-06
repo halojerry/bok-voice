@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import uuid
-from typing import Optional
 
 
 class InMemoryVectorStore:

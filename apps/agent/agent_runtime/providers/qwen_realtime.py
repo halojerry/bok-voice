@@ -76,7 +76,6 @@ from openai.types.realtime import (
 from livekit import rtc
 from livekit.plugins.openai.realtime.realtime_model import (
     NUM_CHANNELS,
-    SAMPLE_RATE as OUTPUT_SAMPLE_RATE,  # 24kHz pcm16——DashScope 输出写死，不从事件读
     RealtimeModel as _OpenAIRealtimeModel,
     RealtimeSession as _OpenAIRealtimeSession,
     process_base_url,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import difflib
 import json
 import os
@@ -12,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping
 from urllib.parse import urlparse
 
 # DeepSeek 端点的思考开关契约(判据/意图判据换云时缺省关思考,否则小 max_tokens
@@ -30,9 +29,7 @@ from bok_voice_core.flow_graph import (
 from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI, resolve_route
 # W4-T2 意向规则评估(挂断 disposition 覆盖+intent_code;共享契约主会话写死,只消费)
 from bok_voice_core.intent_rules import eval_intent_rules
-from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
-from bok_voice_core.types import CallMode
 # E1 snippet 后置轨 + E2 热词泄漏清洗(2026-09-21,A 线 ASR 终稿消费点):两个
 # 纯函数模块只出确定性文本处理(移植规格见 docs/superpowers/plans/2026-09-21-
 # a-line-speed-asr-decision-verification.md §26.2-E1/E2);装配编译/每轮消费/
@@ -50,10 +47,6 @@ from bok_voice_core.snippets import rules_for_lang as _rules_for_lang
 # 实测),数字 run/热词/verdict 旁路才是主护栏(判据实现见该模块 docstring)。
 from bok_voice_core.turn_quality import band_from_confidence, looks_garbled
 
-from .plugins.context import ContextInjector
-from .plugins.knowledge import KnowledgePlugin
-from .plugins.settlement import SettlementTrigger
-from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 # DR 容灾+可观测(契约 §1,2026-10-01):worker 四 kind 指标批量上报 CP——
 # 通道/节流/吞错纪律全在模块内,agent 侧只做采样与生命周期挂线。
@@ -81,7 +74,6 @@ from .laya_judge import (
     recent_turn_pairs
 )
 from .qa_gate import (
-    QaIndex,
     pick_rotation_member,
     qa_exclude_reason as _qa_exclude_reason,
     qa_fastpath_enabled,
@@ -2513,8 +2505,7 @@ def _hotword_echo_guard_enabled() -> bool:
 
 
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
-from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
-from .providers.livekit_plugins import _parse_vocab_terms, _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
+from .providers.livekit_plugins import _parse_vocab_terms, _vocab_echo_guard  # noqa: E402
 from .providers.livekit_plugins import strip_tail_anchor_text as _strip_tail_anchor_text  # noqa: E402
 
 
@@ -3507,18 +3498,6 @@ def _sidecar_base_url(cfg_base: str, env_name: str, default: str) -> str:
     return os.environ.get(env_name, default)
 
 
-def build_dummy_manifest(*, session_id: str, account_id: str, object_id: str, persona_id: str, mode: str = "simulation") -> dict:
-    manifest = select_session_manifest(
-        session_id=session_id,
-        account_id=account_id,
-        object_id=object_id,
-        persona_id=persona_id,
-        mode=CallMode(mode),
-        providers={"vad": "silero", "asr": "qwen3_asr", "llm": "mlx", "tts": "qwen3_tts"},
-    )
-    return manifest.__dict__
-
-
 def _instructions(
     *,
     persona: dict | None,
@@ -3577,7 +3556,7 @@ def _instructions(
 
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
-    from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
+    from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
     # R3 Sentry:worker 进程内初始化(SDK 集成挂 ASGI 无关的纯 capture 面;
@@ -3792,17 +3771,15 @@ async def entrypoint(ctx):
         CONFIRM,
         DEFER,
         FAREWELL,
-        OBJECTION,
         QUESTION,
         REFUSE,
         REPEAT,
         UNCLEAR,
         detect_whatsapp_signal,
-        extract_call_facts,
         extract_fact_updates,
         judge_confirm_advance_allowed,
     )
-    from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
+    from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE
     from .flow import channel_from_text, wa_confirm_advance_allowed
 
     flow_ctrl = FlowController.from_template(template, object_card)
@@ -3852,7 +3829,6 @@ async def entrypoint(ctx):
     from .providers.livekit_plugins import (  # DeepSeekLLM 已在 entrypoint 头部导入(3574),此处不重复
         FakeLiveKitSTT,
         FakeLiveKitTTS,
-        FakeLiveKitVAD,
         MiniMaxTTS,
         MlxLlmLLM,
         PinnedLanguageState,

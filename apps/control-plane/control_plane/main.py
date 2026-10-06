@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -41,7 +41,7 @@ from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.urlguard import UrlGuardError, assert_public_http_url
 from bok_voice_core.qa_text import mine_qa_pairs
-from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
+from bok_voice_core.types import CallMode, CallStatus, Role, TurnEvent
 # M-22③(2026-09-23 修复波#4):steps_json 分支行内部指令保存校验(教练文案进
 # 罐头挡在写入口);动作前缀镜像件+检测判据在 canned_guard。
 from bok_voice_core.canned_guard import (
@@ -59,8 +59,7 @@ from bok_voice_knowledge.knowledge import DefaultKnowledgeService
 from bok_voice_knowledge.markdown_source import LocalMarkdownSource
 from bok_voice_knowledge.vector_store import InMemoryVectorStore
 from bok_voice_business_db.vector_store import SqlVectorStore
-from bok_voice_obs.audit import AuditEvent, AuditStore, audit_store
-from bok_voice_obs.context import get_correlation
+from bok_voice_obs.audit import AuditStore, audit_store
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 from bok_voice_obs.provider_health import scan_provider_health
@@ -4466,7 +4465,6 @@ def get_call_metrics(call_id: str, request: Request) -> dict:
     """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
     _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
-    import statistics as _stats
 
     turns = _repo().get_turns(call_id)
     lat = sorted(t.latency_ms for t in turns if t.latency_ms)
@@ -4800,7 +4798,6 @@ async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict
             # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
             # ——写失败只告警不阻结算。
             try:
-                from bok_voice_business_db.models import UsageRecord
 
                 # P1-A：跨「主列 + per-worker 历史列」逐份累加 llm_usage.total_tokens
                 # （B 线双 worker 各一份；单份旧数据行为不变）。坏 report 只丢该份不炸。

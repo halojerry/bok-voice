@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from bok_voice_core.context import DefaultContextAssembler
 from bok_voice_core.types import ContextBundle, SessionManifest

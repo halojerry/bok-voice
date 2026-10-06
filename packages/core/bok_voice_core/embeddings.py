@@ -89,7 +89,6 @@ class MlxEmbedding:
         model = self._load()
         vecs = model.embed(list(texts))
         try:
-            import mlx.core as mx
 
             return [list(map(float, v)) for v in vecs]
         except Exception:  # pragma: no cover
