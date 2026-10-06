@@ -22,6 +22,7 @@ Qwen3-ASR(源语言钉死) + 翻译 LLM(Hy-MT2 MT 小模型 :1236 逐句无状�
 from __future__ import annotations
 
 import asyncio
+import difflib
 import inspect
 import json
 import math
@@ -32,12 +33,13 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
+# 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+
 # B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
 # 能/不能边界(治 en↔zh/cantonese 的脚本级错语言;测不出 zh↔cantonese)。
 from bok_voice_core.mt_lang_check import language_match_score, looks_like_language
-# 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
-from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -1106,6 +1108,267 @@ def _lag_turn_timing(rec: tuple[float, int, int], now: float, t0: float) -> tupl
     )
 
 
+# —— B 线 interim 投机翻译(prewarm-and-confirm,2026-10-06) -------------------
+# Ethan 指令:A/B 线都要吃 interim 流喂 LLM,B 线反应必须快过 A 线。目标:译文
+# 首声从「segment-end + MT 往返 + TTS 首包」压到「final 即声」——MT+合成在
+# 说话期间预付。姿势=**只预热不出声**(错译文出声比慢更糟,无早期播放):
+#   ① detector 吃 interim 流(doubao=段内累积全文;qwen 本地=句级提交后的未提交
+#      尾巴——坐标系差异经「候选身份变化=稳定性重计」天然消化),识别末个稳定
+#      子句 span(边界标点收尾+内容 ≥6 字+跨 ≥2 次 interim 不变或 ≥500ms);
+#   ② 开火→后台同款 _mt_once 翻译该 span,译文经 tts_provider.synthesize 全量
+#      排干成 PCM 持在 held slot(不进 say 队列,零播放);
+#   ③ final 到达:归一前缀比对(≥0.85)——HIT=held PCM 走 session.say(text,
+#      audio=frames) 零合成直播(qa_gate 罐头低 TTFT 车同款,agent.py say_cached
+#      同构),余段进 _src_q 正常管线;MISS=弃 slot(cancel 在途 MT:本地车道
+#      aclose 经 _attach_mlx_abort 即 POST /v1/abort,云端 openai 车道无补丁
+#      =纯丢弃),正常路径原样走。
+# kill-switch ``BOK_INTERP_SPEC_MT``(默认 1;0=旧路径逐字节,interim 照旧丢弃、
+# final 照旧整句入队)。护栏:真车道忙(FIFO 非空/真 MT 在途/背压摘译 pending)
+# 一律不开火;每段 ≤2 次;再开火须比上次 span 长 ≥6 字;数字串 span(≥4 位 run,
+# 镜像 flow._digit_runs_in 族口径)永不投机(号码高危)。
+_SPEC_KILL_SWITCH_ENV = "BOK_INTERP_SPEC_MT"
+_SPEC_CLAUSE_BOUNDARY = "，、；,;。？！.!?"
+_SPEC_DIGIT_RUN_RE = re.compile(r"[0-9一二三四五六七八九零]{4,}")
+# 归一化口径:剥标点/空白/全半角差异,留 \w+CJK(镜像 agent._ticket_norm)——
+# 前缀比对与切点锚都跑在这层,ASR 对标点的增删不改判定。
+_SPEC_NORM_RE = re.compile(r"[^\w\u4e00-\u9fff]+")
+_SPEC_CONFIRM_SIM = 0.85  # final 与投机 span 的归一前缀相似度门
+
+
+def _spec_mt_enabled() -> bool:
+    """投机翻译总闸(默认开;0=旧路径逐字节)。"""
+    return os.environ.get(_SPEC_KILL_SWITCH_ENV, "1") == "1"
+
+
+def _spec_norm(text: str) -> str:
+    """投机比对归一化(纯函数):剥标点/空白,小写,留 word 字符+CJK。"""
+    return _SPEC_NORM_RE.sub("", str(text or "")).lower()
+
+
+def _spec_clause_prefix(text: str) -> str | None:
+    """text 中「最后一个子句边界标点」收尾的前缀(纯函数);无边界=None。"""
+    cut = max((text.rfind(ch) for ch in _SPEC_CLAUSE_BOUNDARY), default=-1)
+    if cut < 0:
+        return None
+    return text[: cut + 1]
+
+
+def _spec_content_chars(text: str) -> int:
+    """span 内容字数(纯函数):剥边界标点/空白后的长度(字数闸口径)。"""
+    return len(_SPEC_NORM_RE.sub("", str(text or "")))
+
+
+def _spec_prefix_split(final_text: str, span: str) -> tuple[float, str]:
+    """final 与投机 span 的前缀比对(纯函数):返回 (相似度, 余段)。
+
+    相似度=difflib ratio(span 归一, final 归一同长头部)——ASR 对 span 内个别字
+    的修正在门(≥0.85)内容忍;切点锚=归一字符等长消费(逐 raw 字符数归一存活位),
+    修正不改切点位置;切点后挂着的边界标点/空白一并吞进 span 侧(余段从下一
+    个归一存活字符起)。final 归一不足 span 长度 → 相似度照算但余段恒空
+    (len 门兜底),调用方按 MISS 处理。"""
+    nf, ns = _spec_norm(final_text), _spec_norm(span)
+    if not ns:
+        return 0.0, ""
+    head = nf[: len(ns)]
+    sim = difflib.SequenceMatcher(a=ns, b=head).ratio()
+    if sim < _SPEC_CONFIRM_SIM or len(nf) < len(ns):
+        # 不过门:余段不可信(切点没锚住),恒空——调用方按 MISS 处理。
+        return sim, ""
+    consumed = 0
+    for i, ch in enumerate(final_text):
+        if _spec_norm(ch):
+            consumed += 1
+            if consumed >= len(ns):
+                j = i + 1
+                while j < len(final_text) and not _spec_norm(final_text[j]):
+                    j += 1
+                return sim, final_text[j:].strip()
+    return sim, ""  # 不可达(len 门已保证),防御
+
+
+class _SpecMtDetector:
+    """interim 稳定子句检测器(纯同步状态机,单测直喂;时钟可注入)。
+
+    候选=interim 文本里「最后边界标点收尾的前缀」;同一候选跨 ≥2 次 interim
+    不变(或首见后 ≥0.5s)判稳定。开火后记账 last_spec,再开火须比它长 ≥6 字
+    (doubao 累积流=同段渐进;本地尾巴流=候选身份变化即稳定性重计,天然防
+    坐标系切换误开火)。每段预算 reset_segment 清——final 到达即切段。"""
+
+    MIN_CLAUSE_CHARS = 6
+    REFIRE_GROWTH_CHARS = 6
+    MAX_PER_SEGMENT = 2
+    STABLE_SIGHTINGS = 2
+    STABLE_S = 0.5
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._cand = ""
+        self._seen = 0
+        self._since = 0.0
+        self._last_spec = ""
+        self._fires = 0
+
+    def feed(self, text: str, *, now: float | None = None) -> str | None:
+        """吃一条 interim(已去重),返回应投机的 span 或 None。``now`` 供单测
+        免真钟(缺省读构造时钟)。"""
+        text = str(text or "").strip()
+        if not text:
+            return None
+        cand = _spec_clause_prefix(text)
+        if cand is None or _spec_content_chars(cand) < self.MIN_CLAUSE_CHARS:
+            return None
+        if _SPEC_DIGIT_RUN_RE.search(cand):
+            return None  # 号码高危:数字串 span 永不投机(镜像 flow 数字 run 族)
+        ts = float(self._clock()) if now is None else float(now)
+        if cand != self._cand:
+            self._cand, self._seen, self._since = cand, 1, ts
+        else:
+            self._seen += 1
+        if self._seen < self.STABLE_SIGHTINGS and (ts - self._since) < self.STABLE_S:
+            return None
+        if self._fires >= self.MAX_PER_SEGMENT:
+            return None
+        if len(cand) - len(self._last_spec) < self.REFIRE_GROWTH_CHARS:
+            return None
+        self._last_spec = cand
+        self._fires += 1
+        return cand
+
+    def reset_segment(self) -> None:
+        """final 到达切段:候选/预算/last_spec 全清。"""
+        self._cand = ""
+        self._seen = 0
+        self._since = 0.0
+        self._last_spec = ""
+        self._fires = 0
+
+
+class _SpecMtHold:
+    """投机持有槽:在途任务 + 就绪的 (src, text, pcm)——只预热不出声的载体。"""
+
+    __slots__ = ("task", "src", "text", "pcm")
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+        self.src = ""
+        self.text = ""
+        self.pcm = b""
+
+
+class _SpecMtController:
+    """B 线 interim 投机翻译控制器(prewarm-and-confirm;每方向一个)。
+
+    骨架=detector(稳定子句) + held slot(在途 MT/TTS) + final 确认。真件
+    (MT/TTS/say/队列/账本)全部经构造注入——entrypoint 组装真件,单测喂 fake;
+    ``enabled=False``(kill-switch=0 或 text-only 方向)全入口零动作=旧路径。"""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        detector: _SpecMtDetector,
+        hold: _SpecMtHold,
+        run_spec: Callable,
+        busy_gate: Callable[[], bool],
+        say_cached: Callable,
+        enqueue: Callable[[str], None],
+        log: Callable[[str], None] = print,
+    ) -> None:
+        self._enabled = enabled
+        self._detector = detector
+        self.hold = hold
+        self._run_spec = run_spec  # async (span) -> (text, pcm);空=投机未成
+        self._busy_gate = busy_gate  # () -> bool:True=真车道忙,不开火
+        self._say_cached = say_cached  # (final_src, text, pcm) -> None(异常上抛)
+        self._enqueue = enqueue  # (rest) -> None:余段入 FIFO+记账
+        self._log = log
+
+    # ---- interim 入口 -----------------------------------------------------
+    def on_interim(self, text: str) -> None:
+        if not self._enabled or self._busy_gate():
+            return
+        span = self._detector.feed(text)
+        if not span:
+            return
+        hold = self.hold
+        hold.src = span
+        hold.text = ""
+        hold.pcm = b""
+        old = hold.task
+        if old is not None and not old.done():
+            old.cancel()  # 单飞:新 span 顶掉旧投机(cancel→本地车道 abort/云端纯弃)
+        hold.task = asyncio.create_task(self._fire(span))
+        self._log(f"[interp] INTERP_SPEC fire chars={len(span)}")
+
+    async def _fire(self, span: str) -> None:
+        try:
+            text, pcm = await self._run_spec(span)
+        except asyncio.CancelledError:
+            self._log(f"[interp] INTERP_SPEC abort chars={len(span)}")
+            raise
+        except Exception as exc:  # noqa: BLE001 - 投机失败零影响(保持 slot 空=MISS)
+            self._log(f"[interp] INTERP_SPEC failed: {exc!r}")
+            return
+        if not text or not pcm:
+            return
+        self.hold.text = text
+        self.hold.pcm = pcm
+
+    # ---- final 入口 -------------------------------------------------------
+    def on_final(self, final_text: str) -> bool:
+        """final 到达:确认投机。返回 True=已投机交付(调用方跳过正常路径);
+        False=MISS/关闸(调用方走原路径)。切段(预算重置)两态都做。"""
+        if not self._enabled:
+            self._detector.reset_segment()
+            return False
+        played = self._confirm(str(final_text or "").strip())
+        self._detector.reset_segment()
+        return played
+
+    def _confirm(self, final_text: str) -> bool:
+        hold = self.hold
+        span = hold.src
+        task = hold.task
+        hold.src = ""
+        hold.task = None
+        if not span:
+            return False
+        if task is not None and not task.done():
+            # 未就绪:预热没赢过说话,投机价值已失——cancel 在途 MT 让路真车道
+            # (本地=abort 即时弃流;云端=客户端断开纯丢弃)。
+            task.cancel()
+        text, pcm = hold.text, hold.pcm
+        hold.text = ""
+        hold.pcm = b""
+        if not text or not pcm:
+            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
+            return False
+        sim, rest = _spec_prefix_split(final_text, span)
+        if sim < _SPEC_CONFIRM_SIM:
+            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} sim={sim:.2f}")
+            return False
+        self._log(
+            f"[interp] INTERP_SPEC hit chars={len(span)} rest={len(rest)} sim={sim:.2f}"
+        )
+        try:
+            self._say_cached(final_text, text, pcm)
+        except Exception as exc:  # noqa: BLE001 - 播放失败退正常路径(队列兜底)
+            self._log(f"[interp] INTERP_SPEC say failed: {exc!r}")
+            return False
+        if rest:
+            self._enqueue(rest)
+        return True
+
+    # ---- 生命周期 ---------------------------------------------------------
+    def cancel(self, reason: str = "shutdown") -> None:
+        """teardown/重连卫生:弃 slot + cancel 在途任务(绝不外抛)。"""
+        task = self.hold.task
+        self.hold.src = ""
+        self.hold.task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+
 async def _exit_stage(name: str, coro, timeout_s: float = 5.0):
     """退出路径单段守护（P1.c，2026-09-29 v2 spec §4）。
 
@@ -1446,6 +1709,9 @@ async def entrypoint(ctx) -> None:
         while True:
             text = await _src_q.get()
             _round += 1
+            # 真 MT 在途旗(2026-10-06 投机翻译 busy 闸消费;置位/清位零行为变化,
+            # BOK_INTERP_SPEC_MT=0 时无读者)。
+            _mt_busy["flag"] = True
             try:
                 # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
                 # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
@@ -1499,20 +1765,109 @@ async def entrypoint(ctx) -> None:
                     _lag.drop_src()
                     print(f"[interp] mt fail fallback say failed: {say_exc!r}", flush=True)
             finally:
+                _mt_busy["flag"] = False
                 _src_q.task_done()
 
     _mt_worker = asyncio.create_task(_mt_say_worker())
 
+    # —— 投机翻译装配(prewarm-and-confirm,机制见模块级块注释) ——
+    # text-only 方向(rev 默认档)无 TTS 无可预热音频=整闸不开;kill-switch 同判。
+    # (tts_cache 面函数级导入:interpret 模块头保持零 livekit 轻导入惯例。)
+    from .tts_cache import frames_aiter, pcm_to_frames
+
+    _mt_busy = {"flag": False}  # 真 MT 在途旗(投机 busy 闸消费,见 _mt_say_worker)
+    _spec_on = _spec_mt_enabled() and tts_provider is not None
+    if _spec_on:
+        print("[interp] spec_mt armed (interim prewarm-and-confirm)", flush=True)
+
+    async def _spec_synth_pcm(text: str) -> bytes | None:
+        """投机译文 TTS 全量排干成 PCM(不进 say 队列,零播放)。
+
+        合成走会话同一个 tts_provider(音色/模型档/语速按会话装配天然同源
+        ——confirm 播放的 audio 无需再对缓存 key, PCM 即真值)。miniMax bidi
+        并发合成已由 A 线垫话 backfill 实证安全;失败=slot 永不 ready,静默 MISS。"""
+        if tts_provider is None:
+            return None
+        buf = bytearray()
+        try:
+            stream = tts_provider.synthesize(_apply_voice_tags(text) if voice_tags else text)
+            async with stream:
+                async for ev in stream:
+                    frame = getattr(ev, "frame", None)
+                    data = getattr(frame, "data", None)
+                    if data is not None:
+                        buf.extend(data.tobytes() if isinstance(data, memoryview) else bytes(data))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[interp] INTERP_SPEC synth failed: {exc!r}", flush=True)
+            return None
+        return bytes(buf) or None
+
+    async def _spec_run(span: str) -> tuple[str, bytes]:
+        """投机执行体:同款 _mt_once 翻译 + TTS 排干。cancel 语义:本地 MT 车道
+        aclose 经 _attach_mlx_abort 即 POST /v1/abort(server 立即弃流);
+        云端 openai 车道无 abort 补丁=纯丢弃(客户端断开即终止)。"""
+        ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), span)
+        translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
+        if not translated:
+            return "", b""
+        pcm = await _spec_synth_pcm(translated)
+        if not pcm:
+            return "", b""
+        return translated, pcm
+
+    def _spec_busy_gate() -> bool:
+        """真车道忙闸(闭包后绑 backlog——事件只在 session.start 后流动,装配序安全):
+        FIFO 非空/真 MT 在途/背压摘译 pending 任一真=投机让路。"""
+        return bool(not _src_q.empty() or _mt_busy["flag"] or backlog.source_drops_pending)
+
+    def _spec_say_cached(final_src: str, text: str, pcm: bytes) -> None:
+        """HIT 直播:held PCM 走 say(audio=frames) 零合成(qa_gate 罐头车同构)。
+        先 say 后记账:say 失败不留 pending 孤儿(RC-8 同款纪律);投机轮 mt_ms=0
+        (非真译时长,同兜底句口径)防 _on_item 错弹下一对。"""
+        session.say(
+            _apply_voice_tags(text) if voice_tags else text,
+            audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate)),
+        )
+        _mt_latency["ms"] = 0
+        _lag.note_src(final_src)
+        _lag.done_mt(0)
+
+    def _spec_enqueue(rest: str) -> None:
+        """余段进正常管线(溢出摘译语义与 _on_user_input 同款)。"""
+        try:
+            _src_q.put_nowait(rest)
+            _lag.note_src(rest)
+        except asyncio.QueueFull:
+            print("[interp] source queue overflow, remainder dropped(摘译)", flush=True)
+
+    spec_ctl = _SpecMtController(
+        enabled=_spec_on,
+        detector=_SpecMtDetector(),
+        hold=_SpecMtHold(),
+        run_spec=_spec_run,
+        busy_gate=_spec_busy_gate,
+        say_cached=_spec_say_cached,
+        enqueue=_spec_enqueue,
+    )
+
     def _on_user_input(ev) -> None:
-        # STT 句级 FINAL 是 manual 模式下唯一句子入口(interim/空串过滤);
-        # 原文行即时落库,翻译进单消费队列。
-        if not getattr(ev, "is_final", False):
-            return
+        # STT 句级 FINAL 是 manual 模式下唯一句子入口(空串过滤);interim 事件
+        # 此前直接丢弃——投机翻译(2026-10-06)把它当 detector 输入(kill-switch
+        # BOK_INTERP_SPEC_MT=0 时 on_interim/on_final 零动作=旧路径逐字节)。
+        # 原文行即时落库,翻译进单消费队列;final 先过投机确认(HIT=held PCM
+        # 直播+余段入队,跳过整句正常路径)。
         text = str(getattr(ev, "transcript", "") or "").strip()
         if not text:
             return
+        if not getattr(ev, "is_final", False):
+            spec_ctl.on_interim(text)
+            return
         last_user["text"] = text
         _spawn_ledger(_add_turn(f"原文：{text}", source_lang))
+        if spec_ctl.on_final(text):
+            return
         try:
             _src_q.put_nowait(text)
         except asyncio.QueueFull:  # 48 句积压=极端场景,摘最新句防雪崩
@@ -1556,6 +1911,8 @@ async def entrypoint(ctx) -> None:
     # 房间断开 → SessionReport(真实 usage) + settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
     async def _shutdown() -> None:
         _mt_worker.cancel()  # 排空 MT 消费协程(挂队列 get 上,不 cancel 会泄漏到下个 job)
+        # 投机在途任务收线卫生(2026-10-06):cancel 在途 MT/TTS 排干,绝不外抛。
+        spec_ctl.cancel("shutdown")
         # TTS 收尾(2026-09-30 对账):bidi 持久 WS 无人 aclose=worker 复用进程下
         # 连接跨通残留;text-only 方向 rev 现不装配 TTS(None 跳过)。
         if tts_provider is not None:

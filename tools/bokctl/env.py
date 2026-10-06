@@ -756,6 +756,9 @@ _FORWARD_ENV = (
     #    （缺省开；agent.py 读注入 env Mapping 故静态扫描不强制，prod 转发靠此登记——
     #    BOK_INTERP_MT_PROBE 同款判例；tests/test_a_reply_probe.py 钉 membership） ——
     "BOK_A_REPLY_PROBE",
+    # —— B 线 interim 投机翻译（2026-10-06）：prewarm-and-confirm 总闸（缺省开，
+    #    0=旧路径逐字节；B 线 worker 专属，_interp_env 透传白名单同键） ——
+    "BOK_INTERP_SPEC_MT",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
@@ -892,6 +895,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # E5 增补 2026-09-21:MT 出口确定性语言校验+单次强化重试总闸。默认开
         # ——正常轮零额外延迟,仅错语言轮多一次往返;=0 回退旧「出口不校验」档。
         "BOK_INTERP_MT_LANGGUARD",
+        # B 线 interim 投机翻译 2026-10-06：prewarm-and-confirm 总闸，缺省开，
+        # 0=旧路径逐字节（_FORWARD_ENV 已登记，B 线 worker 专属）。
+        "BOK_INTERP_SPEC_MT",
         "BOK_INTERP_REV_AUDIO",
         "BOK_INTERP_BACKLOG",
         "BOK_INTERP_MAX_BACKLOG_S",
