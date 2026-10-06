@@ -64,6 +64,7 @@ class WatchdogTimeoutError(RuntimeError):
 # 独立立法;2026-09-27 意图闸默认翻启 "1"、QA 复核仍默认 "0")。缺 sidecar=
 # fail-open 结构性零退化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env。
 from .fillers import FillerDirector, derive_context_bucket, intent_category_hint
+from .ambience import AmbienceLoopPlayer, resolve_scene
 from .laya_judge import (
     build_qa_state,
     decide_qa_match,
@@ -5033,6 +5034,19 @@ async def entrypoint(ctx):
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
+    # W6 场景底噪(2026-10-06 demo-quality wave):可拔插全程环境音轨(office/
+    # callcenter/car 三档),与垫话共用同一 BackgroundAudioPlayer out-of-band 轨;
+    # BOK_AMBIENT_SCENE 缺省 none=零行为(resolve_scene 宽容:未知/资产缺失=None)。
+    # 播放器在 session 起来后创建(见 _bg_audio.start 之后);duck 绑定走
+    # agent_state_changed(speaking 避让 -12dB/200ms 平滑,停嘴回涨),钩子先于
+    # session.start 注册(与 _on_partial_gate 同规,免错过初始 speaking 转换)。
+    _ambience_scene = resolve_scene(os.environ.get("BOK_AMBIENT_SCENE", "").strip().lower())
+    _ambience: AmbienceLoopPlayer | None = None
+    if _ambience_scene is not None:
+        print(
+            f"[agent] ambience scene resolved: {_ambience_scene.get('scene')} (BOK_AMBIENT_SCENE)",
+            flush=True,
+        )
     # 垫话补物化执行体(task-14a):消费整段合成流(音频丢弃)——CachedTTS 未命中
     def _filler_caption(text: str) -> None:
         # F4(2026-09-11 用户点名「垫话字幕要出来」):out-of-band 音轨不入 chat_ctx
@@ -8785,6 +8799,20 @@ async def entrypoint(ctx):
 
         session.on("agent_state_changed", _on_spec_state)
 
+    if _ambience_scene is not None:
+        def _on_ambience_state(ev) -> None:
+            # W6 duck:AI speaking=底噪避让 -12dB(增益轨迹 ~200ms 平滑收敛),
+            # listening=回涨;thinking(LLM 生成未出声)不避让。高频翻转无害。
+            if _ambience is None:
+                return
+            state = str(getattr(ev, "new_state", "") or "")
+            if state == "speaking":
+                _ambience.set_ducked(True)
+            elif state == "listening":
+                _ambience.set_ducked(False)
+
+        session.on("agent_state_changed", _on_ambience_state)
+
     # ---- B4 打断轮补账 + B3 风暴计数(2026-09-17,注册须先于 session.start)----
     # 被打断的回复不出 conversation_item_added → turns 表零记录,连环打断现场
     # 无法从账本重建(agent-2 盘点缺口#4)。speech_created 给出每段 speech 的
@@ -9004,6 +9032,26 @@ async def entrypoint(ctx):
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] background audio start failed, filler off: {exc!r}", flush=True)
             _bg_audio = None
+    # W6 底噪起播:垫话轨在场+场景已解析才创建(共用同一 out-of-band 混音器);
+    # 资产缺失/起播失败=响亮日志零行为,唔阻通话。duck 钩子已先于 session.start
+    # 注册(见 _on_ambience_state),创建后状态翻转即生效。
+    if _bg_audio is not None and _ambience_scene is not None:
+        try:
+            _ambience = AmbienceLoopPlayer(
+                _bg_audio, entry=_ambience_scene, call_label=room_name
+            )
+            _ambience.start()
+            if _ambience.running:
+                print(
+                    f"[agent] ambience started scene={_ambience_scene.get('scene')} "
+                    f"gain={_ambience.gain_db}dB (duck on speaking) (call {room_name})",
+                    flush=True,
+                )
+            else:
+                _ambience = None
+        except Exception as exc:  # noqa: BLE001 - 底噪失败唔阻通话
+            print(f"[agent] ambience start failed, off: {exc!r}", flush=True)
+            _ambience = None
     _log_stage("session_started")
 
     if not agent.paused:
@@ -9060,6 +9108,12 @@ async def entrypoint(ctx):
             f"waited_ms={_ds_waited} n={_ds_n} (call {room_name})",
             flush=True,
         )
+        # W6 底噪收摊(先于垫话轨 aclose:停的是同一混音器上的自有流)。
+        if _ambience is not None:
+            try:
+                _ambience.stop()
+            except Exception:  # noqa: BLE001
+                pass
         # 垫话 out-of-band 音轨收摊(取消在播任务+取消发布);失败唔阻结算。
         if _bg_audio is not None:
             try:

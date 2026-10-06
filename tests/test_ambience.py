@@ -38,6 +38,23 @@ from agent_runtime.ambience import (  # noqa: E402
     resolve_scene,
 )
 
+_AGENT_SRC = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
+    encoding="utf-8", errors="replace"
+)
+
+
+def test_agent_wiring_source_pins():
+    """W6 接线 pin（test_filler_cloud 同款源级锚）：场景解析/duck 钩子/起播/收摊
+    四挂点在场——字符串变更须过本测试认账，防后续重构静默丢底噪。"""
+    assert 'os.environ.get("BOK_AMBIENT_SCENE", "").strip().lower()' in _AGENT_SRC
+    assert "def _on_ambience_state" in _AGENT_SRC
+    assert 'session.on("agent_state_changed", _on_ambience_state)' in _AGENT_SRC
+    assert "_ambience.set_ducked(True)" in _AGENT_SRC
+    assert "[agent] ambience started scene=" in _AGENT_SRC
+    assert "_ambience.stop()" in _AGENT_SRC
+    # 默认零行为：env 未设时 resolve_scene(None 面) → 不注册钩子不起播
+    assert "if _ambience_scene is not None:" in _AGENT_SRC
+
 _MANIFEST_OK = {
     "scenes": [
         {"scene": "office", "file": "office.wav", "loop_s": 40.0, "gain_db": -28.0, "license": "x"},
