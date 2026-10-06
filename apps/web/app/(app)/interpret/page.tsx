@@ -21,6 +21,13 @@ const LANGS = [
   { value: "zh", label: "普通话" },
   { value: "cantonese", label: "粤语" },
   { value: "en", label: "English" },
+  // 2026-10-06 W2 四语扩容（demo-quality-wave §W2c）：MT=DeepSeek 任意对；
+  // TTS=MiniMax 四语目录（lib/minimax-voices.ts）。ASR 侧豆包海外语种实测放行前
+  // 先跑 scripts/probes/probe_cloud_asr.py 四语小语料（宣发≠实测）。
+  { value: "de", label: "德语" },
+  { value: "fr", label: "法语" },
+  { value: "ja", label: "日语" },
+  { value: "pt", label: "葡萄牙语" },
 ];
 
 export default function InterpretPage() {

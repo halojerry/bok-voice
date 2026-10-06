@@ -50,6 +50,16 @@ def _norm_lang(raw: str, default: str = "zh") -> str:
         return "cantonese"
     if key in {"en", "english", "英语"}:
         return "en"
+    # 2026-10-06 W2 四语扩容（demo-quality-wave §W2）：德/法/日/葡进归一表——
+    # 不加则 target_lang="ja" 等落 default 折回 zh，boost_map/会话级音色全链哑火。
+    if key in {"de", "german", "德语", "德文"}:
+        return "de"
+    if key in {"fr", "french", "法语", "法文"}:
+        return "fr"
+    if key in {"ja", "japanese", "日语", "日文"}:
+        return "ja"
+    if key in {"pt", "portuguese", "葡萄牙语", "葡语"}:
+        return "pt"
     return default
 
 
@@ -810,7 +820,17 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
         # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。同经构造参数
         # 下发:同 worker 先 zh 后 en 的会话,旧 setdefault 会让 boost 停在首通
         # 的值(合成语种漂移),现逐会话解析零驻留。
-        boost_map = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
+        boost_map = {
+            "zh": "Chinese",
+            "cantonese": "Chinese,Yue",
+            "en": "English",
+            # 2026-10-06 W2 四语（MiniMax boost 官方枚举内：German/French/Japanese/
+            # Portuguese）；前提=_norm_lang 已收 de/fr/ja/pt（否则到不了这里）。
+            "de": "German",
+            "fr": "French",
+            "ja": "Japanese",
+            "pt": "Portuguese",
+        }
         boost = boost_map.get(target_lang, "")
         tts = MiniMaxTTS(
             voice=voice_map,

@@ -8,13 +8,14 @@
  * - 装配序：firstOption → 匹配 slotLang 的克隆置顶 → 目录/预置 → 其余克隆
  *   （Set 去重贯穿全序；克隆全语言可选，不吃 slotLang 过滤）；
  * - slotLang 只过滤目录，未知语言回落全量（personas 旧语言如 vi 不清空成空下拉）；
- * - 试听语言：音色 ID 正则优先（Cantonese_→粤语、English_/socialmedia_→英语），
+ * - 试听语言：音色 ID 正则优先（Cantonese_→粤语、English_/socialmedia_→英语、
+ *   German_/French_/Japanese_/Portuguese_→对应语，2026-10-06 W2 四语扩），
  *   否则按字段键（settings speaker_cantonese/speaker_en 本地链）→ fallback → 普通话；
  * - 罐头音试听路由：有录音=缓存（零云费）；缺录音现场合成烧云配额仅主管，
  *   非主管=拦截提示。
  */
 
-export type PreviewLang = "zh" | "cantonese" | "en";
+export type PreviewLang = "zh" | "cantonese" | "en" | "de" | "fr" | "ja" | "pt";
 
 export interface VoiceCatalogEntry {
   id: string;
@@ -27,10 +28,18 @@ export interface VoiceOptionItem {
   label: string;
 }
 
-const KNOWN_LANGS: readonly string[] = ["zh", "cantonese", "en"];
+const KNOWN_LANGS: readonly string[] = ["zh", "cantonese", "en", "de", "fr", "ja", "pt"];
 
 /** 克隆语言 → 中文标签（与 personas 页 LANG_LABEL 同值，此处为唯一装配点）。 */
-const LANG_LABEL: Record<string, string> = { zh: "普通话", cantonese: "粤语", en: "英语" };
+const LANG_LABEL: Record<string, string> = {
+  zh: "普通话",
+  cantonese: "粤语",
+  en: "英语",
+  de: "德语",
+  fr: "法语",
+  ja: "日语",
+  pt: "葡萄牙语",
+};
 
 /** 前缀风格克隆标签默认前缀（settings/interpret 现行文案）。 */
 const DEFAULT_CLONE_PREFIX = "克隆 · ";
@@ -137,12 +146,21 @@ export interface ResolvePreviewLangSpec {
  * 粤语音色（Cantonese_*）即使被设成「整场同声」，试听也该用粤语示例文本，
  * 否则 MiniMax 会用粤语音色念普通话文字 → 广式普通话。
  * 正则不中再按字段键回落（settings 本地 Qwen 音色链）→ fallback → 普通话。
- * 返回 "cantonese" | "en" | "zh"。
+ * 返回 PreviewLang（七语）。
+ *
+ * moss_audio_ 克隆按具体 ID 判：日语组两枚（c373f8c3/10297aea，2026-10-06 W2）→ ja；
+ * 其余 moss/克隆资产（zh 组 moss 男声 A/B、A 线默认 moss）不特判，走字段键/回落
+ * 链保持 zh——一刀切 moss_audio_→ja 会把 zh 组克隆的试听文本带偏成日语。
  */
 export function resolvePreviewLang(voice: string, spec: ResolvePreviewLangSpec = {}): PreviewLang {
   const v = String(voice || "");
   if (/^Cantonese_/i.test(v)) return "cantonese";
   if (/^(English_|socialmedia_)/i.test(v)) return "en";
+  if (/^German_/i.test(v)) return "de";
+  if (/^French_/i.test(v)) return "fr";
+  if (/^Japanese_/i.test(v)) return "ja";
+  if (/^Portuguese_/i.test(v)) return "pt";
+  if (/^moss_audio_(c373f8c3|10297aea)/i.test(v)) return "ja";
   if (spec.fieldKey === "speaker_cantonese") return "cantonese";
   if (spec.fieldKey === "speaker_en") return "en";
   if (spec.fallback && KNOWN_LANGS.includes(spec.fallback)) return spec.fallback as PreviewLang;
@@ -150,8 +168,9 @@ export function resolvePreviewLang(voice: string, spec: ResolvePreviewLangSpec =
 }
 
 /**
- * 试听示例文本（三语含粤语）：设置页与 personas 页文案合并收编——personas 版
- * 带人设称呼句式，name 缺省回落「Bok 客服」（设置页无称呼语境即用缺省）。
+ * 试听示例文本（七语含粤语）：设置页与 personas 页文案合并收编——personas 版
+ * 带人设称呼句式，name 缺省回落「Bok 客服」（设置页无称呼语境即用缺省）；
+ * 新四语（de/fr/ja/pt，2026-10-06 W2）用固定短句，与 audition 试听文本同源。
  */
 export function previewSampleText(lang: string, name = ""): string {
   const n = name.trim() || "Bok 客服";
@@ -160,6 +179,14 @@ export function previewSampleText(lang: string, name = ""): string {
       return `你好，我係${n}，唔該想問下件貨而家到咗未？可以幫我 check 下 status 嘛？`;
     case "en":
       return `Hello, this is ${n}. How can I help you today?`;
+    case "de":
+      return "Hallo, ich helfe Ihnen gern weiter.";
+    case "fr":
+      return "Bonjour, je vais vous aider.";
+    case "ja":
+      return "こんにちは、ご案内いたします。";
+    case "pt":
+      return "Olá, como posso ajudar?";
     default:
       return `你好，我是${n}，请问有什么可以帮您？`;
   }
