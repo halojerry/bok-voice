@@ -691,6 +691,9 @@ class FillerDirector:
         self._player = player
         self._guards = guards or (lambda: False)
         self._assets = Path(assets_dir) if assets_dir else FILLER_ASSETS_DIR
+        # 类别钉死（2026-10-08 云腿 emm 级缺省）：非 None 时 _select 跳过罐头匹配
+        # 与分类器，只出该类资产（云车道 minimal=纯语气音，整句垫话=本地慢腿专属）。
+        self._force_cat: str | None = None
         # 缓存键语速维度(W2):resolver 取合成时点语速(zh/粤 1.2),缺省 1.0=
         # 旧键语义;miss 落资产层与语速无关。
         self._speed_resolver = speed_resolver or (lambda: 1.0)
@@ -767,6 +770,12 @@ class FillerDirector:
         （BOK_FILLER=1 显式）。只影响本实例评估口——装配点按当通路由调用，
         零全局 env 态；arm/链发/开火三闸统一走 _on()。"""
         self._enabled_override = enabled
+
+    def restrict_category(self, cat: str | None) -> None:
+        """实例级类别钉死（2026-10-08 云腿 emm 级缺省）：cat="minimal"=只出
+        语气音类资产（云车道慢轮遮蔽,整句垫话=本地慢腿专属）；None=解除
+        （缺省,全类别+罐头匹配照旧——本地车道逐字节旧行为）。"""
+        self._force_cat = str(cat) if cat else None
 
     def _on(self) -> bool:
         """本实例有效闸：实例覆盖 > env 模块闸（filler_enabled）。
@@ -1335,9 +1344,14 @@ class FillerDirector:
 
         P2.4 意图喂下游:类别来源=**本轮提示(合法)优先,否则字面分类器**;罐头
         字面命中优先级不变(命中即返,提示不参与抢条目)。
+
+        类别钉死(2026-10-08 云腿 emm 级缺省):``restrict_category`` 非空时跳过
+        罐头匹配与分类器,只出该类资产——云车道 minimal=纯语气音。
         """
         bucket = self._current_bucket()
         self._last_bucket = bucket
+        if self._force_cat is not None:
+            return self._pick(lang, self._force_cat, bucket), self._force_cat
         if (
             self._entries_index is not None
             and self._user_text_provider is not None
