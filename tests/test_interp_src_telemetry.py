@@ -266,6 +266,7 @@ def test_settle_deferred_when_humans_still_active_source_pins():
 
 
 def test_textonly_direction_skips_tts_assembly_source_pins():
-    """text-only 方向(rev 默认)不构造/不连云端 TTS(零收益连接根除)。"""
+    """text-only 方向(BOK_INTERP_REV_AUDIO=0 回退档;2026-10-08 起双向出声为默认)
+    不构造/不连云端 TTS(零收益连接根除)。"""
     assert "_build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None" in INTERP_SRC
     assert "voice_tags = (\n        _dir_audio" in INTERP_SRC  # 语气标记同门(无合成=纯噪音)

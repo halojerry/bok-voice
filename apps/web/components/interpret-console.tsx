@@ -9,10 +9,13 @@
  *   ——字幕沿用已验证管线(lk.transcription 全量广播,同页双向原文译文都看得到)。
  * - other 身份是纯手动 livekit Room:只负责「对象的麦克风收音 + 对象译文放音」,
  *   不重复渲染字幕(同一房间两边看到的是同一份字幕)。
- * - 听感拓扑(2026-09-12 终版):对方=听我方译文 TTS(fwd,trans-<对方语言>,other
- *   房只挂 trans- 轨);我方=听对方麦克风原声(me 渲染器,me 房唯一远端音频),
- *   rev 译文纯字幕零 TTS——同传台姿势:听原声+看译文。双输出档:「对方扬声器」
- *   =译文指到朝向对方的音箱,「我方扬声器」=对方原声指到我方耳机/音箱。
+ * - 听感拓扑(2026-10-08 双向出声版,用户拍板:「对方说英文 我要听到英文转普通
+ *   话的翻译! 我讲普通话对方听到英文的翻译!」):对方=听我方译文 TTS(fwd,
+ *   trans-<对方语言>,other 房只挂 trans- 轨);我方=听对方麦克风原声 + **译员
+ *   耳语**(rev 译文 TTS,trans-<我方语言>,经 me 路 AudioContext 进我方扬声器,
+ *   hearMyTrans 默认开)——旧 2026-09-12「rev 纯字幕」单向化拍板作废
+ *   (BOK_INTERP_REV_AUDIO=0 回退档)。双输出档:「对方扬声器」=译文指到朝向
+ *   对方的音箱,「我方扬声器」=对方原声+耳语指到我方耳机/音箱。
  * - 字幕双栏成组(2026-10-07 W4a):我方列/对方列,列头承担归属;栏内「原文+其
  *   翻译」成对渲染(pairSubtitles 纯函数,node 单测),行标统一「原文/翻译」,
  *   大字幕窗同构;在途原文/孤儿译文单独渲染不丢。
@@ -632,6 +635,27 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       log.warn("persist hear-their-trans pref failed", { err: e instanceof Error ? e.message : String(e) });
     }
   }, []);
+  // 「译员耳语」(2026-10-08 双向出声票,默认开):rev 译文轨(trans-<我方语言>,
+  // 对方说的话翻成我方语言)接进我方扬声器——「对方说英文 我要听到英文转普通话
+  // 的翻译」。worker 侧 BOK_INTERP_REV_AUDIO 缺省已翻开(=0 回退单向化档,届时
+  // 本轨不存在=开关静默无轨);半双工 meHeld 闸原生覆盖(rev TTS 出声中暂让我
+  // 方麦,防串译)。持久化 bok_interp_hear_my_trans,缺值=开(基线听感,同 hearOrig)。
+  const [hearMyTrans, setHearMyTransState] = useState(() => {
+    try {
+      return localStorage.getItem("bok_interp_hear_my_trans") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const setHearMyTrans = useCallback((v: boolean) => {
+    setHearMyTransState(v);
+    try {
+      localStorage.setItem("bok_interp_hear_my_trans", v ? "1" : "0");
+    } catch (e) {
+      /* 隐私模式等场景持久化失败不阻功能 */
+      log.warn("persist hear-my-trans pref failed", { err: e instanceof Error ? e.message : String(e) });
+    }
+  }, []);
   useEffect(() => {
     if (!meConnected) return;
     const want = (track: RemoteTrack, participant: RemoteParticipant) =>
@@ -707,6 +731,52 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meRoom, meConnected, otherLang, hearTheirTrans, getRouter]);
+
+  // rev 译文轨订阅控制(2026-10-08 双向出声,默认开=译员耳语):把 trans-<我方
+  // 语言>(对方说的话翻成我方语言)接进我方扬声器——与 W4b 同构(订阅级控制:
+  // 关=连帧都不拉,半双工 watcher 挂不到轨、meHeld 不触发)。rev agent 侧
+  // deliver=me- 的订阅权本就白名单给 me-(单向化时代已如此);BOK_INTERP_REV_AUDIO=0
+  // 单向化档下 rev 不发轨=本 effect 静默无轨,开关空转不报错。
+  useEffect(() => {
+    if (!meConnected) return;
+    const revName = `trans-${myLang}`;
+    const isRev = (pub: RemoteTrackPublication) => String(pub.trackName ?? "") === revName;
+    const onSub = (track: RemoteTrack, pub: RemoteTrackPublication) => {
+      if (!isRev(pub) || !hearMyTrans) return;
+      if (!track.mediaStreamTrack) return;
+      wlog("my_trans_elem", { route: "ctx", out: (meOutIdRef.current || savedOutputDevice("me") || "default").slice(0, 12) });
+      getRouter("me").add(track.sid, track.mediaStreamTrack);
+    };
+    const onUnsub = (track: RemoteTrack) => getRouter("me").remove(track.sid);
+    const align = (pub: RemoteTrackPublication) => {
+      if (!isRev(pub) || pub.isSubscribed === hearMyTrans) return;
+      wlog("my_trans_sub", { want: hearMyTrans });
+      try {
+        pub.setSubscribed(hearMyTrans);
+      } catch (e) {
+        log.warn("my-trans setSubscribed failed", { err: e instanceof Error ? e.message : String(e) });
+      }
+    };
+    const onPublished = (pub: RemoteTrackPublication) => align(pub);
+    meRoom.on(RoomEvent.TrackSubscribed, onSub);
+    meRoom.on(RoomEvent.TrackUnsubscribed, onUnsub);
+    meRoom.on(RoomEvent.TrackPublished, onPublished);
+    for (const p of meRoom.remoteParticipants.values()) {
+      for (const pub of p.trackPublications.values()) {
+        if (!isRev(pub as RemoteTrackPublication)) continue;
+        align(pub as RemoteTrackPublication);
+        const t = pub.track;
+        if (t && hearMyTrans && t.mediaStreamTrack) getRouter("me").add(t.sid, t.mediaStreamTrack);
+        else if (!hearMyTrans) getRouter("me").remove(pub.trackSid); // 关=摘掉在播耳语
+      }
+    }
+    return () => {
+      meRoom.off(RoomEvent.TrackSubscribed, onSub);
+      meRoom.off(RoomEvent.TrackUnsubscribed, onUnsub);
+      meRoom.off(RoomEvent.TrackPublished, onPublished);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meRoom, meConnected, myLang, hearMyTrans, getRouter]);
 
   // ---- 对象连接(纯手动 Room:麦克风收音 + 译文放音) ----
   useEffect(() => {
@@ -1141,6 +1211,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         setOutputMode={setOutputMode}
         hearOrig={hearOrig}
         setHearOrig={setHearOrig}
+        hearMyTrans={hearMyTrans}
+        setHearMyTrans={setHearMyTrans}
         hearTheirTrans={hearTheirTrans}
         setHearTheirTrans={setHearTheirTrans}
         leave={leave}
@@ -1231,6 +1303,10 @@ type LiveProps = {
   /** 听对方原声总开关:开=像直接通话(默认),关=纯字幕同传。 */
   hearOrig: boolean;
   setHearOrig: (v: boolean) => void;
+  /** 译员耳语(2026-10-08 双向出声):开=rev 译文(对方说的话→我方语言)进我方
+   * 扬声器(默认开);关=只看字幕。 */
+  hearMyTrans: boolean;
+  setHearMyTrans: (v: boolean) => void;
   /** 听对方听到的翻译(W4b):开=fwd 译文轨也进我方扬声器(默认关,订阅级控制)。 */
   hearTheirTrans: boolean;
   setHearTheirTrans: (v: boolean) => void;
@@ -1876,6 +1952,18 @@ function ConsoleLive(p: LiveProps) {
               onChange={(e) => p.setHearOrig(e.target.checked)}
             />
             <span>听对方原声:开=像直接通话(译文叠加在原声上);关=纯字幕同传,只看「对方→我」字幕不出原声</span>
+          </label>
+          <label className="flex items-start gap-2 text-xs leading-relaxed">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={p.hearMyTrans}
+              onChange={(e) => p.setHearMyTrans(e.target.checked)}
+            />
+            <span>
+              译员耳语:开=对方说的话翻成我方语言念给你听(默认开);关=只看字幕不出声。外放时
+              播报期间我方麦自动暂让防串译
+            </span>
           </label>
           <label className="flex items-start gap-2 text-xs leading-relaxed">
             <input

@@ -303,10 +303,13 @@ def test_build_llm_provider_fallback(monkeypatch):
     assert ds._opts.model == "deepseek-chat"
 
 def test_direction_audio_enabled_rev_text_only_by_default(monkeypatch):
-    """2026-09-12 用户拍板:同传出声单向——fwd(听 me,译文给对方)恒出声;
-    rev(听 other,对方→我)默认纯字幕零 TTS;BOK_INTERP_REV_AUDIO=1 恢复双向。"""
+    """2026-10-08 用户翻案(「对方说英文 我要听到英文转普通话的翻译!」):同传
+    **双向出声**——fwd(听 me,译文给对方)恒出声;rev(听 other,对方→我)默认
+    也合成 TTS(译员耳语);BOK_INTERP_REV_AUDIO=0 回退旧单向化档(rev 纯字幕)。"""
     monkeypatch.delenv("BOK_INTERP_REV_AUDIO", raising=False)
     assert interpret._direction_audio_enabled("me") is True
+    assert interpret._direction_audio_enabled("other") is True
+    monkeypatch.setenv("BOK_INTERP_REV_AUDIO", "0")
     assert interpret._direction_audio_enabled("other") is False
     monkeypatch.setenv("BOK_INTERP_REV_AUDIO", "1")
     assert interpret._direction_audio_enabled("other") is True

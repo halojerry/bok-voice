@@ -271,12 +271,12 @@ async def main() -> int:
     # I1+I2 fwd/rev 双向（中↔英）
     info = await run_one(zh_pcm, en_pcm)
     record("I1 fwd: me(zh)→other 听到英文输出", info["fwd_ok"], info["fwd_text"])
-    # I2 改钉「出声单向化」契约(2026-09-12 拍板):rev 方向译文只走字幕/落库,
-    # 我方不播译文 TTS(BOK_INTERP_REV_AUDIO=1 才回退)——我方听感=对方麦克风
-    # 原声。所以 rev 断言=me 不应听到译文音轨(rev_ok=False 才对);rev 翻译链
-    # 路本身(转写→MT→turns 落库)由 I1b 原文/译文行覆盖。
-    record("I2 rev 单向化: other(en)→me 无译文音轨(仅字幕,0912 契约)",
-           not info["rev_ok"], info["rev_text"] or "me 侧零译文音轨 ✓")
+    # I2 改钉「双向出声」契约(2026-10-08 用户翻案:「对方说英文 我要听到英文转
+    # 普通话的翻译!」):rev 方向译文合成 TTS(trans-<我方语言>)发布进 me 房=
+    # 译员耳语。断言=me **应**听到译文音轨;BOK_INTERP_REV_AUDIO=0 回退单向化档
+    # (me 侧零译文音轨)由单测钉,不走真栈。
+    record("I2 rev 双向出声: other(en)→me 听到中文译文音轨(译员耳语)",
+           info["rev_ok"], info["rev_text"] or "me 侧译文音轨缺席")
     # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
     # ——旧断言查单行同含「原文：译文：」会永久假红)
     turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
