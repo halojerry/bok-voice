@@ -59,6 +59,7 @@ import { playAudioBlob } from "@/lib/preview";
 import {
   deviceRoleIssues,
   expectedScript,
+  isVirtualAudioDevice,
   scriptMismatch,
   scriptMismatchWarning,
   type RoleSlot,
@@ -159,7 +160,11 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
             setOthMicId("");
           }
         }
-        const realMic = mics.filter((d) => !d.is_default);
+        // 虚拟/回环设备硬排除(2026-10-08,call-933945a5):旧 realMic 只排 default 伪条目,
+        // BlackHole 2ch (Virtual)/OrayVirtualAudioDevice 混进候选——AirPods 失联触发
+        // stale 回落时 auto-assign 按枚举序把 BlackHole 塞给我方麦(虚拟回环当人麦=
+        // 吃进 routed 音频,谁在说话无从谈起)。判定单源 lib/device-roles(测试钉死)。
+        const realMic = mics.filter((d) => !d.is_default && !isVirtualAudioDevice(d.name));
         if (realMic.length >= 2) {
           const curMe = staleMe ? "" : savedMicDevice("me");
           const curOth = staleOth ? "" : savedMicDevice("other");
@@ -194,7 +199,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         webCanSwitchOutput() && outs.length >= 2 &&
         !savedOutputDevice("me") && !savedOutputDevice("other")
       ) {
-        const realOut = outs.filter((d) => !d.is_default);
+        // 同款虚拟排除(输出侧):译文 TTS 指到 BlackHole=声音进黑洞,现场没人听得到。
+        const realOut = outs.filter((d) => !d.is_default && !isVirtualAudioDevice(d.name));
         if (realOut.length >= 2) {
           wlog("out_auto_assign", { me: realOut[0].name, oth: realOut[1].name });
           saveOutputDevice(realOut[0].id, "me");

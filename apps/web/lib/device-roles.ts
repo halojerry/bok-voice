@@ -35,6 +35,22 @@ export type RoleSlot = {
 
 export type RoleIssues = { fatal: string[]; warn: string[] };
 
+/**
+ * 虚拟/回环音频设备判定（2026-10-08，call-933945a5 实证）：BlackHole 2ch (Virtual)、
+ * OrayVirtualAudioDevice (Virtual) 这类设备**不是物理收音/发声器件**——当麦克风=吃
+ * 进系统回环里 routed 的任意音频（谁在说话无从谈起）；当输出=声音进了黑洞没人听
+ * 得到。该通实测：AirPods 失联 → 我方麦 stale 回落默认（与对方麦同支，fatal 已亮）
+ * → auto-assign 在「非 default 伪条目」候选里按枚举序把 **BlackHole** 塞给我方麦
+ * ——两个方向听到同一个人 + 一路吃虚拟回环，「我听到的译文是对方说话的 TTS」。
+ * 判据=设备名命中虚拟/回环关键词（Chrome/macOS 对这类设备名字带 "(Virtual)" 或
+ * 品牌名）；误伤面可控——真实麦克风不叫这些名字。
+ */
+export function isVirtualAudioDevice(name: string): boolean {
+  return /virtual|blackhole|soundflower|loopback|voicemeeter|vb[- ]?audio|oray|groundcontrol|dante/i.test(
+    name || "",
+  );
+}
+
 /** 「默认 - Mac mini扬声器 (Built-in)」/「Default - X」→「mac mini扬声器」:
  *  去伪条目前缀与括注。英文前缀也要剥——不然 en-US Chrome 下默认项与实体项归一不到一起。 */
 export function deviceBaseName(raw: string): string {
@@ -103,6 +119,15 @@ const ALLOWED_PAIRS: RoleKey[][] = [
 export function deviceRoleIssues(slots: RoleSlot[]): RoleIssues {
   const fatal: string[] = [];
   const warn: string[] = [];
+  // 虚拟/回环设备出现在任一角色槽=提醒（用户可能刻意做路由实验,不拦死;auto-assign
+  // 侧则硬排除——见 interpret-console 的 realMic/realOut 过滤,测试钉死）。
+  for (const s of slots) {
+    if (s.name && isVirtualAudioDevice(s.name)) {
+      warn.push(
+        `${s.label}选的是虚拟音频设备「${s.name}」——它不是物理收音/发声器件（${s.role.endsWith("Mic") ? "吃到的是系统回环音频，无法区分谁在说话" : "声音进了虚拟回环，现场没人听得到"}）。请改选真实设备。`,
+      );
+    }
+  }
   for (const dupes of groupByDevice(slots)) {
     if (dupes.length < 2) continue;
     const roles = dupes.map((d) => d.role);
