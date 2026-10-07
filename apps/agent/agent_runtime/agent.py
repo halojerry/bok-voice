@@ -1716,25 +1716,31 @@ def _late_answer_dedup_verdict(
 
 
 def _filler_cloud_gate(filler_env: str, cloud_lane: bool, cloud_env: str = "") -> tuple[bool | None, str]:
-    """W1c 垫话云车道门（2026-10-06 demo-quality wave，纯函数单测用）。
+    """垫话云车道门（W1c 2026-10-06 立；2026-10-08 Ethan 定调改三态缺省 minimal）。
 
-    旧档（2026-10-03）云 a_reply 车道 auto-off——实弹翻案（call-6a8133f6 三轮
-    重问全哑）：云档一轮 commit_to_audio≈2.0s > 客户耐心，生成空窗无垫话遮蔽
-    =死寂直接诱发连环重问。现在云车道默认也 arm（``BOK_FILLER_CLOUD`` 默认
-    "1"；"0" 回旧 auto-off），配额/冷却/让路政策全部现成。优先序：
-    ① ``BOK_FILLER`` 显式 "1"/"0"（强制开/关，实例覆盖）
-    ② 云车道 × ``BOK_FILLER_CLOUD``（默认 arm；"0"=旧 auto-off）
+    演化：2026-10-03 云车道 auto-off → call-6a8133f6 三轮重问全哑翻案为默认 arm
+    （云档一轮 commit_to_audio≈2.0s 无遮蔽=死寂诱发连环重问）→ 2026-10-08 再定调：
+    **云腿不整句垫话**（速度够快；LLM 轮自带 (breath)/(emm) 开口标记，整句垫话
+    与之叠出重复的「思考感」——call-e077ded6 实弹）——慢轮只给 **emm 级最小垫音**
+    （minimal 类资产）。整句垫话=本地慢腿专属。优先序：
+    ① ``BOK_FILLER`` 显式 "1"/"0"（强制开/关，实例覆盖，A/B 用）
+    ② 云车道 × ``BOK_FILLER_CLOUD``："0"=关；"1"=整句（旧 arm 档，A/B 用）；
+      "minimal"/"emm"=emm 级；**缺省/坏值=minimal（新缺省）**。
     ③ 本地车道不触碰实例（返回 None=沿用模块 env 缺省，逐字节旧行为）。
-    返回 (enabled, reason)；enabled=None 表示不调 set_enabled。"""
+    返回 (enabled, reason)；enabled=None 表示不调 set_enabled；
+    reason=="cloud-minimal" 时装配点须连带 restrict_category("minimal")。"""
     env = str(filler_env or "").strip()
     if env == "1":
         return True, "env-forced-on"
     if env == "0":
         return False, "env-forced-off"
     if cloud_lane:
-        if str(cloud_env or "").strip() == "0":
+        cev = str(cloud_env or "").strip()
+        if cev == "0":
             return False, "cloud-auto-off"
-        return True, "cloud-armed"
+        if cev == "1":
+            return True, "cloud-armed"
+        return True, "cloud-minimal"  # 缺省/坏值/minimal/emm 全走 emm 级
     return None, "local-default"
 
 
@@ -5295,12 +5301,9 @@ async def entrypoint(ctx):
         # 真答案已在路上就不再补垫话。裸 provider/无缓存形态无此口=None=旧门。
         reply_pending_provider=getattr(tts_provider, "reply_stream_pending_since", None),
     )
-    # 云档垫话门（W1c，2026-10-06 demo-quality wave 翻案）：旧档云 a_reply
-    # 车道 auto-off——call-6a8133f6 实弹（三轮重问全哑）定性「云档 2s 生成空窗
-    # 无遮蔽=死寂诱发连环重问」。现在云车道默认也 arm（BOK_FILLER_CLOUD 默认
-    # "1"），垫话配额/冷却/让路政策全部现成；"0" 回旧 auto-off。BOK_FILLER
-    # 显式 1/0 仍最高优先（A/B 用）。决策收进纯函数 _filler_cloud_gate（单测）；
-    # 只动本实例评估口，零全局态。
+    # 垫话云车道门（W1c→2026-10-08 三态）：call-e077ded6 实弹定调——云腿不整句
+    # 垫话（速度够快+LLM 轮自带 (breath)/(emm) 开口，整句=重复思考感）；慢轮只给
+    # emm 级（minimal 类资产）。"1"=旧整句 arm（A/B 用）；"0"=关；缺省=minimal。
     _filler_env = os.environ.get("BOK_FILLER", "").strip()
     _filler_on, _filler_reason = _filler_cloud_gate(
         _filler_env,
@@ -5313,6 +5316,12 @@ async def entrypoint(ctx):
         print("[agent] filler auto-off (cloud lane, BOK_FILLER_CLOUD=0)", flush=True)
     elif _filler_reason == "cloud-armed":
         print("[agent] filler armed (cloud lane, BOK_FILLER_CLOUD=1)", flush=True)
+    elif _filler_reason == "cloud-minimal":
+        _filler.restrict_category("minimal")
+        print(
+            "[agent] filler armed minimal (cloud lane, BOK_FILLER_CLOUD=minimal 缺省)",
+            flush=True,
+        )
     # 垫话开播 → 看门狗一次性顺延(RC3,2026-09-17):垫话 out-of-band 出声框架
     # 不可见(不入 speech 队列、无首音频信号),watchdog 不拆弹——「垫话盖耳+
     # 系统慢」轮被 4s 闸误伤(50 轮开火 14 次、多次掐掉在途真回复)。回调在

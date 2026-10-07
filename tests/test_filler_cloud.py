@@ -27,9 +27,10 @@ AGENT_SRC = (_ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
 # ------------------------------------------------------------------ 纯函数两臂
 
 
-def test_default_cloud_lane_armed():
-    """默认档：云 a_reply 车道也 arm 垫话（BOK_FILLER_CLOUD 缺省="1"）。"""
-    assert _filler_cloud_gate("", True, "") == (True, "cloud-armed")
+def test_default_cloud_lane_minimal():
+    """2026-10-08 定调缺省=emm 级（call-e077ded6 实弹:整句垫话与 LLM 轮
+    (breath)/(emm) 开口标记叠出重复思考感;云腿速度够快不遮整句）。"""
+    assert _filler_cloud_gate("", True, "") == (True, "cloud-minimal")
 
 
 def test_cloud_zero_falls_back_to_old_auto_off():
@@ -54,10 +55,16 @@ def test_local_lane_untouched():
     assert _filler_cloud_gate("", False, "0") == (None, "local-default")
 
 
-def test_junk_cloud_env_treated_as_armed():
-    """坏值不回落 auto-off（缺省=arm 语义,只有字面 "0" 才关）。"""
-    assert _filler_cloud_gate("", True, "bogus") == (True, "cloud-armed")
+def test_junk_cloud_env_treated_as_minimal():
+    """坏值不回落 auto-off（缺省=minimal 语义,只有字面 "0" 才关）。"""
+    assert _filler_cloud_gate("", True, "bogus") == (True, "cloud-minimal")
     assert _filler_cloud_gate("", True, " 0 ") == (False, "cloud-auto-off")
+
+
+def test_cloud_explicit_minimal_and_emm_aliases():
+    assert _filler_cloud_gate("", True, "minimal") == (True, "cloud-minimal")
+    assert _filler_cloud_gate("", True, "emm") == (True, "cloud-minimal")
+    assert _filler_cloud_gate("", True, " MINIMAL ") == (True, "cloud-minimal")
 
 
 # ------------------------------------------------------------------ 接线 pin
@@ -68,8 +75,28 @@ def test_agent_wiring_source_pins():
     assert "os.environ.get(\"BOK_FILLER_CLOUD\", \"\").strip()" in AGENT_SRC
     assert "[agent] filler armed (cloud lane, BOK_FILLER_CLOUD=1)" in AGENT_SRC
     assert "[agent] filler auto-off (cloud lane, BOK_FILLER_CLOUD=0)" in AGENT_SRC
+    # 2026-10-08 minimal 缺省:装配点连带类别钉死（emm 级资产,无整句）
+    assert "_filler.restrict_category(\"minimal\")" in AGENT_SRC
+    assert "[agent] filler armed minimal" in AGENT_SRC
     # 实例闸仍以 set_enabled(_filler_on) 单点落地
     assert "_filler.set_enabled(_filler_on)" in AGENT_SRC
+
+
+def test_restrict_category_forces_minimal_select():
+    """fillers 契约:钉死类别时 _select 跳过罐头匹配/分类器,只出该类资产。"""
+    import agent_runtime.fillers as fl
+
+    d = object.__new__(fl.FillerDirector)
+    d._force_cat = None
+    d._last_bucket = ""
+    d._current_bucket = lambda: "default"
+    d._pick = lambda lang, cat, bucket: {"text": "嗯。", "file": None}  # 只回 entry(真 _pick 契约)
+    d.restrict_category("minimal")
+    assert d._force_cat == "minimal"
+    entry, cat = d._select("zh")
+    assert cat == "minimal" and entry["text"] == "嗯。"
+    d.restrict_category(None)
+    assert d._force_cat is None  # 解除=本地车道全类别旧行为
 
 
 def test_forward_env_registered():
