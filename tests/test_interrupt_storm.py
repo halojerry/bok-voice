@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 from agent_runtime.agent import (  # noqa: E402
     _storm_ack_line,
     _storm_active,
+    _storm_expiry_resume_enabled,
+    _storm_reclaim_line,
     _storm_max_rounds,
     _storm_on_turn,
     _storm_prune,
@@ -127,3 +129,68 @@ def test_storm_max_rounds_default_and_killswitch():
             os.environ.pop("BOK_INTERRUPT_STORM_MAX_ROUNDS", None)
         else:
             os.environ["BOK_INTERRUPT_STORM_MAX_ROUNDS"] = old
+
+
+# ---- 2026-10-07 死气窗票:到期自清 timer + nudge 风暴让位 ----------------------
+
+_AGENT_SRC_PATH = (
+    Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py"
+)
+
+
+def _agent_src() -> str:
+    return _AGENT_SRC_PATH.read_text(encoding="utf-8", errors="replace")
+
+
+def test_storm_reclaim_line_three_langs():
+    """回收语三语各别且短(到期时客户已讲完,方向=我回来答,区别于 ack 的「你讲」)。"""
+    langs = [_storm_reclaim_line(l) for l in ("cantonese", "zh", "en")]
+    assert all(langs)
+    assert len(set(langs)) == 3
+    assert len(langs[0]) <= 20 and len(langs[1]) <= 20  # 中短口直念即点即完
+    assert len(langs[2]) <= 45
+
+
+def test_storm_expiry_resume_env_default_on():
+    import os
+    old = os.environ.get("BOK_INTERRUPT_STORM_EXPIRY_RESUME")
+    try:
+        os.environ.pop("BOK_INTERRUPT_STORM_EXPIRY_RESUME", None)
+        assert _storm_expiry_resume_enabled() is True  # 缺省开
+        os.environ["BOK_INTERRUPT_STORM_EXPIRY_RESUME"] = "0"
+        assert _storm_expiry_resume_enabled() is False  # 0=回旧惰性求值
+        os.environ["BOK_INTERRUPT_STORM_EXPIRY_RESUME"] = "1"
+        assert _storm_expiry_resume_enabled() is True
+    finally:
+        if old is None:
+            os.environ.pop("BOK_INTERRUPT_STORM_EXPIRY_RESUME", None)
+        else:
+            os.environ["BOK_INTERRUPT_STORM_EXPIRY_RESUME"] = old
+
+
+def test_storm_expiry_timer_wiring_source_pins():
+    """源级 pin:timer 在 engage 与每个静听轮续期处拨、resume/收摊/重拨处收、
+    fire 迟到撞已清态=no-op;nudge 风暴让位守卫在位(同一总闸)。"""
+    src = _agent_src()
+    # arm 两处(engage + 逐轮续期),每处带总闸判定
+    assert src.count("_arm_storm_expiry(_STORM_QUIET_S)") == 2, "engage+续期两处拨钟"
+    # 总闸判定调用 3 处:engage(独立 if)/续期(独立 if)/nudge 让位(内联 and)
+    assert src.count("_storm_expiry_resume_enabled()") == 4, "def 行+三处调用"
+    # cancel 四处命中:def 定义行 + arm 内重拨 + 用户轮 resume + teardown finally
+    assert src.count("_cancel_storm_expiry()") == 4, "def+arm重拨+resume+teardown"
+    # fire 迟到 no-op 判据(已清态直接 return,不重复清/不播线)
+    assert "not _storm_active(_storm[\"active_until\"], _now)" in src
+    # nudge 让位:风暴活期间整体跳过且短周期重挂(不拆錶)
+    assert (
+        "_storm_active(_storm.get(\"active_until\", 0.0), now) and _storm_expiry_resume_enabled()"
+        in src
+    ), "nudge 风暴让位守卫"
+    assert src.count("lane=\"storm-reclaim\"") == 1, "回收线恰一条经 chokepoint"
+
+
+def test_storm_expiry_registered_in_forward_env():
+    """env 立法面:新键必须进 _FORWARD_ENV(worker 侧死门防线)。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from bokctl import env as bokctl_env  # noqa: E402
+
+    assert "BOK_INTERRUPT_STORM_EXPIRY_RESUME" in bokctl_env._FORWARD_ENV
