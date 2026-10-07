@@ -291,9 +291,9 @@ async def main() -> int:
     info_canto = await run_one(zh_pcm, canto_pcm, language="zh", target_lang="cantonese",
                              fwd_expect="Cantonese", rev_expect="Chinese")
     record("I5 fwd: me(zh)→other 听到粤语输出", info_canto["fwd_ok"], info_canto["fwd_text"])
-    # I6 同 I2:出声单向化契约(粤→中方向 me 不播译文 TTS),翻译落库由 I5b 覆盖。
-    record("I6 rev 单向化: other(粤)→me 无译文音轨(仅字幕,0912 契约)",
-           not info_canto["rev_ok"], info_canto["rev_text"] or "me 侧零译文音轨 ✓")
+    # I6 同 I2(2026-10-08 双向出声翻案):粤→中方向 me 也播译文 TTS(译员耳语)。
+    record("I6 rev 双向出声: other(粤)→me 听到中文译文音轨(译员耳语)",
+           info_canto["rev_ok"], info_canto["rev_text"] or "me 侧译文音轨缺席")
     turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
     orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
     tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]
