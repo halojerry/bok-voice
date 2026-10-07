@@ -4768,14 +4768,18 @@ async def entrypoint(ctx):
             llm_provider.prefix_prewarm, context_state, lane=_prefill_lane
         )
         llm_provider.on_request_messages = _prefill_spec.on_request_messages
-        # STT 稳定前缀挂点(Qwen3ASRLiveSTT 实例属性,流发射 PREFLIGHT 时回调);
-        # 非流式包装(StreamAdapter)无此通道,预热退化为无原料不接。
-        if isinstance(stt_provider, Qwen3ASRLiveSTT):
+        # STT 稳定前缀挂点：本地 Qwen3ASRLiveSTT（PREFLIGHT 流发射时回调）与
+        # 豆包 DoubaoSTT（interim 公共前缀回调，A 线对偶件 2026-10-07 补线——
+        # 此前只挂本地侧，云豆包档 speculator 无原料不发火）；非流式包装
+        # (StreamAdapter)无此通道,预热退化为无原料不接。
+        if isinstance(stt_provider, (Qwen3ASRLiveSTT, DoubaoSTT)):
             stt_provider.stable_prefix_listener = _prefill_spec.on_stable_prefix
         # lane=local 行逐字节不变（日志口径）；云臂带 lane=cloud 后缀可 grep。
+        # （旧打印串带陈旧硬编码 "(BOK_PREFILL_SPEC=0 关)" 后缀——on 分支里
+        # 语义错误，实弹误导排查，2026-10-07 修正。）
         _lane_tag = "" if _prefill_lane == "local" else f" lane={_prefill_lane}"
         print(
-            f"[agent] prefill speculator on{_lane_tag} (BOK_PREFILL_SPEC=0 关)",
+            f"[agent] prefill speculator on{_lane_tag}",
             flush=True,
         )
     llm_provider = ContextAwareLLM(

@@ -164,6 +164,12 @@ class DoubaoSTT(stt.STT):
     model = "doubao-asr"
     provider = "doubao"
 
+    # PrefillSpeculator 挂点（A 线对偶件 2026-10-07）：agent.py 按会话覆写——
+    # 流层在 interim 更新时以「与上一 interim 的公共前缀」为稳定前缀回调
+    # （语义镜像 Qwen3ASRLiveSTT 的 PREFLIGHT 挂点：稳定前缀=下一请求 user
+    # 文本的保守前缀）。类级缺省 None=零行为。
+    stable_prefix_listener = None
+
     def __init__(
         self,
         *,
@@ -492,7 +498,23 @@ class _DoubaoLiveStream(stt.RecognizeStream):
     def _maybe_interim(self, text: str) -> None:
         if not text or text == self._last_interim_emitted:
             return
+        # PrefillSpeculator 稳定前缀喂点（A 线对偶件 2026-10-07）：与上一 interim
+        # 的公共前缀=尚未被服务端修订的保守前缀（后续请求 user 文本的稳定头）。
+        # 回调异常绝不影响 interim 事件流（镜像 Qwen3 侧挂点纪律）。
+        _prev = self._last_interim_emitted
         self._last_interim_emitted = text
+        _spec_cb = getattr(self._stt_, "stable_prefix_listener", None)
+        if _spec_cb is not None and _prev:
+            _common_len = 0
+            for a, b in zip(_prev, text):
+                if a != b:
+                    break
+                _common_len += 1
+            if _common_len:
+                try:
+                    _spec_cb(_prev[:_common_len])
+                except Exception as exc:  # noqa: BLE001
+                    print(f"BOK_PREFILL_SPEC listener error: {exc!r}", flush=True)
         try:
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
