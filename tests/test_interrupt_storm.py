@@ -170,7 +170,8 @@ def test_storm_expiry_resume_env_default_on():
 
 def test_storm_expiry_timer_wiring_source_pins():
     """源级 pin:timer 在 engage 与每个静听轮续期处拨、resume/收摊/重拨处收、
-    fire 迟到撞已清态=no-op;nudge 风暴让位守卫在位(同一总闸)。"""
+    fire 逐值判据(_storm_expiry_should_clear,勿回 _storm_active 自毁守卫);
+    nudge 风暴让位守卫在位(同一总闸)。"""
     src = _agent_src()
     # arm 两处(engage + 逐轮续期),每处带总闸判定
     assert src.count("_arm_storm_expiry(_STORM_QUIET_S)") == 2, "engage+续期两处拨钟"
@@ -178,14 +179,30 @@ def test_storm_expiry_timer_wiring_source_pins():
     assert src.count("_storm_expiry_resume_enabled()") == 4, "def 行+三处调用"
     # cancel 四处命中:def 定义行 + arm 内重拨 + 用户轮 resume + teardown finally
     assert src.count("_cancel_storm_expiry()") == 4, "def+arm重拨+resume+teardown"
-    # fire 迟到 no-op 判据(已清态直接 return,不重复清/不播线)
-    assert "not _storm_active(_storm[\"active_until\"], _now)" in src
+    # fire 判据=逐值比对(自毁守卫回归钉:fire 醒来时 now≥active_until 恒真,
+    # 用 _storm_active 判 fire=no-op 恒成立——probe_storm_expiry 第一版实证)
+    assert "_storm_expiry_should_clear(_storm, _armed_until)" in src
+    assert "_armed_until = float(_storm.get(\"active_until\", 0.0))" in src
+    assert "not _storm_active(_storm[\"active_until\"], _now)" not in src, "自毁守卫禁回"
     # nudge 让位:风暴活期间整体跳过且短周期重挂(不拆錶)
     assert (
         "_storm_active(_storm.get(\"active_until\", 0.0), now) and _storm_expiry_resume_enabled()"
         in src
     ), "nudge 风暴让位守卫"
     assert src.count("lane=\"storm-reclaim\"") == 1, "回收线恰一条经 chokepoint"
+
+
+def test_storm_expiry_should_clear_value_match():
+    """fire 判据纯函数:本钟捕获值仍逐值等于账上 active_until 才清——续期/重拨/
+    清零任一发生即作废;不可用 now 比较(醒来恒过期,2026-10-07 自毁守卫教训)。"""
+    from agent_runtime.agent import _storm_expiry_should_clear
+
+    st = {"ts": [1.0], "rounds": 2, "active_until": 100.0}
+    assert _storm_expiry_should_clear(st, 100.0) is True   # 本钟仍是账上值→清
+    assert _storm_expiry_should_clear(st, 99.0) is False   # 被续期写新值→旧钟作废
+    assert _storm_expiry_should_clear(st, 0.0) is False    # 未捕获到期值
+    st2 = dict(st, active_until=0.0)
+    assert _storm_expiry_should_clear(st2, 100.0) is False  # 已被 resume/cap 清零
 
 
 def test_storm_expiry_registered_in_forward_env():

@@ -106,6 +106,7 @@
 | `scripts/probes/probe_llm_contention.py` | LLM 同卡争用微基准(2026-09-24):4B prefill 单飞 vs 9B 并行时的往返膨胀。 | 无(手动) | 是 | 2026-09-26 |
 | `scripts/probes/probe_llm_draft_ab.py` | spec decode 隔离 A/B 探针（2026-09-27，llm_draft 实弹验收）——纯客户端，零进程管理。 | bok.py | 是 | 2026-09-27 |
 | `scripts/probes/probe_llm_stall.py` | 慢速注入诊断探针（2026-09-29 v2 P0.2，纯诊断）。 | 无(手动) | 是 | 2026-09-30 |
+| `scripts/probes/probe_storm_expiry.py` | 风暴到期自清 timer 实弹探针(2026-10-07 死气窗票验收件):连发打断→engage→静默 15s→三关(expiry 打点/回收线出声/尾问真答)——第一版抓出自毁守卫。 | agent storm 路径 | 是 | 2026-10-07 |
 | `scripts/probes/probe_mt_glossary_ab.py` | B 线术语表 A/B/C 三臂实证探针(E5 定案用)。 | 无(手动) | 是 | 2026-09-21 |
 | `scripts/probes/probe_offscript_soak.py` | 话术外问题集锦测试台（2026-09-17）：客户不讲「剧本里的话」时 A 线怎么接。 | 2 脚本 import / test_offscript_report.py | 是 | 2026-10-02 |
 | `scripts/probes/probe_offtopic_recovery.py` | 跑题拉回探针（2026-09-25）：客户中途问流程完全无关的问题，A 线会不会被带飞。 | 无(手动) | 是 | 2026-10-03 |
