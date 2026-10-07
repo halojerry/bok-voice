@@ -396,6 +396,25 @@ audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修
   （ENOENT-on-dead-cwd）——解法=Write 工具原地重建该目录复活 cwd（勿用定时
   任务绕）。
 
+**第六波（session-20261007-202348-d436 + 204411-5cc6，PR #203/#204 main=b7d20ad）**：
+- **死气窗票收官链**：#200 timer 自毁守卫根修（fire 醒来 now≥active_until 恒真
+  →逐值比对 `_storm_expiry_should_clear`）+#202 探针加固（offscript 强刺激保
+  LLM 车道）——`probe_storm_expiry` **三关全过**（expiry 打点/回收线 2.6s/尾问
+  真答 1.2s）。
+- **#201 灰区前缀不早丢**：probe 第三关抓到同嗓音尾问前缀 0.75 被误杀（标定用
+  整段、门判前缀方差大）——前缀只裁 <relock_sim 清弃；灰区照喂 ASR 段末**整段
+  复核**，复核判丢才吞 FINAL（两车道三处否决点）。
+- **W5 v2 认人票（#203）**：官方 speechbrain ECAPA ckpt（Apache-2.0）自导出
+  单文件 ONNX（84MB sha256 存档,parity=1.0,导出件 `scripts/seed/export_ecapa_onnx.py`
+  torch 懒导入）；`SpeakerLock` 双档——**显式 env `BOK_SPEAKER_LOCK_MODEL`
+  才激活**（不自动扫盘,灭环境泄漏类;`_FORWARD_ENV` 264→265），阈值 0.62/0.40
+  自动切档，enrollment=running-mean(前 3 确证段,relock 重置)；缺位=v1 字节不变。
+  TTS 四嗓音标定：同人 ≥0.78|异人 max 0.57|噪声≈0（v1 零分离→真分离）。
+  **实弹**：ECAPA 档栈 canto E2E PASS、`probe_speaker_lock` PASS（零误杀/纯环境
+  音 3/3 判丢 sim≈-0.03/端到端活）。全量 4918。
+- **v2 遗留（明账）**：阈值=TTS provisional,真人通话 `SPEAKER_LOCK_DROP/RELOCK`
+  分布终裁；模型分发未建（他机跑导出件）；B 线 interpret 未接锁。
+
 **第二波待办**（合流后）：
 - 实弹剧本验收：barge_in 基线不变 + 短应承/假打断连发探针轮 + `MINIMAX_TTS_ZERO_AUDIO_PAD` 频率观测 + `BOK_AMBIENT_SCENE=callcenter` 实弹一通 + 挂断 10 通零 DataStreamError。
 - W2c 后置门：probe_cloud_asr 四语小语料实测（豆包宣发≠实测）。
