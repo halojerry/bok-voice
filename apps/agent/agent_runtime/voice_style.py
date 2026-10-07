@@ -16,8 +16,15 @@ sighs/chuckle/laughs 三件，Ethan 裁定每轮上限 2→3+标点语气）与�
    标记被当文本念出来）。门关 = transform 退化为全剥（2.6 回退档防线）。
 4. **单向流**：标记只活在合成层——turns 落库 / 记忆 / 重复锚 / 出站 LLM
    请求四处全部 strip_voice_style（LLM 不见自己上轮的标记=防复制引力）；
-   tts 缓存键天然含标记文本（键=text，无需 pregen 改动——罐头/开场白等
-   脚本线不带标记）。
+   tts 缓存键天然含标记文本（键=text，无需 pregen 改动）。
+5. **罐头线标记（2026-10-06 罐头线语气标记票）**：步骤文案（say 步/开场白
+   ref）允许作者直接携带白名单标记——`script_line_speech_text` 是脚本直念线
+   的规范形单源（pregen `_say_step_lines`/`_opening_line` 与运行时
+   `FlowController.step_say_text` 同调），缓存键两侧按同一规范形对齐；无括
+   号/停顿 token 的文案走快路径逐字节原样返回（marker-free 零漂移铁律）。
+   非 2.8 合成档的兜底剥除由 MiniMaxTTS._prep_outbound 实例门承担（既有），
+   env 总闸 BOK_A_LINE_VOICE_TAGS=0 时规范形同样全剥（kill-switch 跨 LLM/
+   脚本两线语义一致）。
 """
 
 from __future__ import annotations
@@ -194,6 +201,43 @@ def sanitize_speech_text(text: str) -> str:
     out = re.sub(r"(<#[^#<>]{0,24}#>)\s*(<#[^#<>]{0,24}#>)", r"\1", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 罐头线（脚本直念线）规范形（2026-10-06 罐头线语气标记票）：步骤文案允许作者
+# 直接携带白名单语气/停顿标记，pregen 物化时烧进缓存音频，运行时同键命中——
+# 前提是两侧对同一份 ref 首行算出**逐字节相同**的规范形。单源=本函数：
+# pregen `_say_step_lines`/`_opening_line` 与运行时 `FlowController.step_say_text`
+# 同调（缓存键 text 维度天然对齐）。快路径=无 `(`/`（`/`<#` 的文案原样返回
+# （sanitize 的空白收敛对英文双空格等文案也不发生）——marker-free 文案零漂移。
+# env 总闸关（BOK_A_LINE_VOICE_TAGS=0）→ 规范形全剥：kill-switch 对 LLM 线
+# （transform 全剥档）与罐头线语义一致。模型维度的兜底（persona 覆写 2.6）
+# 不在这里判——MiniMaxTTS._prep_outbound 实例门在合成出站前剥（既有单测钉住），
+# 本函数保持模型无关（pregen/运行时两侧同一环境同一结果，键不会因模型档分叉）。
+# ---------------------------------------------------------------------------
+
+
+def _has_marker_token(text: str) -> bool:
+    """文本是否含任何标记形状 token（括号词或停顿）——快路径判据。"""
+    return "(" in text or "（" in text or "<#" in text
+
+
+def script_line_speech_text(text: str) -> str:
+    """脚本直念线文本规范形：作者标记 → 合成安全形态（纯函数，env 只读总闸）。
+
+    - 白名单标记归一成小写 ASCII（`（Chuckle）`→`(chuckle)`，MiniMax 只认
+      ASCII 括号形态，全角原样会被当文本念出来并烧进缓存）；
+    - 句首/句读后未知括号词剥除（人工文案里的舞台指示「（停顿两秒）」主发位）；
+    - 停顿钳制 0.05-0.80s、坏格式剥除、行首尾/相邻停顿清理；
+    - env 总闸关 → 再叠 strip（标记从规范形中消失，pregen/运行时同步剥，
+      缓存键仍两侧一致）。
+    无标记 token 的文案逐字节原样返回。"""
+    if not text or not _has_marker_token(text):
+        return text
+    canonical = sanitize_speech_text(text)
+    if not env_gate_on():
+        canonical = strip_voice_style(canonical)
+    return canonical
 
 
 # ---------------------------------------------------------------------------
