@@ -314,6 +314,47 @@ def test_interim_dedupe(monkeypatch):
     assert asyncio.run(scenario()) == ["a", "ab"]
 
 
+def test_stable_prefix_listener_fed_common_prefix(monkeypatch):
+    """A 线对偶件（2026-10-07）：interim 更新喂「与上一 interim 的公共前缀」给
+    PrefillSpeculator 挂点——首个 interim 无前文不喂、后续喂公共头；回调炸
+    不影响 interim 事件流。"""
+    _fake_merge(monkeypatch)
+    stt = DoubaoSTT(api_key="k", vad_=_FakeVad())
+    assert stt.stable_prefix_listener is None  # 类级缺省=零行为
+
+    fed: list[str] = []
+
+    def _cb(text: str) -> None:
+        fed.append(text)
+
+    async def scenario(cb, boom: bool):
+        stt.stable_prefix_listener = cb
+        stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+        stream._maybe_interim("我个单号")
+        stream._maybe_interim("我个单号系三七")     # 公共前缀=「我个单号」
+        stream._maybe_interim("我个单号系三八七九")  # 公共前缀=「我个单号系三」
+        stream._maybe_interim("我个单号系三八七九")  # 同文去重=不喂
+        got: list[str] = []
+        try:
+            while True:
+                ev = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
+                got.append(ev.alternatives[0].text)
+        except (asyncio.TimeoutError, StopAsyncIteration):
+            pass
+        await stream.aclose()
+        return got
+
+    def _boom(text: str) -> None:
+        raise RuntimeError("listener boom")
+
+    # 正常臂：喂公共前缀，interim 事件照发
+    assert asyncio.run(scenario(_cb, False)) == ["我个单号", "我个单号系三七", "我个单号系三八七九"]
+    assert fed == ["我个单号", "我个单号系三"]
+    # 炸弹臂：回调抛异常不吞 interim 事件流（interim 状态在流实例上，新流重放）
+    fed.clear()
+    assert len(asyncio.run(scenario(_boom, True))) == 3
+
+
 def test_live_closing_say_suppresses(monkeypatch):
     _fake_merge(monkeypatch)
     _make_connect(monkeypatch, connect_fail=False, full_text="不该出现")
