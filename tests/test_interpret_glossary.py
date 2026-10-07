@@ -346,22 +346,90 @@ def test_voice_tags_supported_gate():
 
 def test_apply_voice_tags_leading_interjections():
     """Hy-MT2 把语气照词翻译(Hahaha/Coughs…),句首引导词换成 2.8 括号标记——
-    合成层出真声,不再是假人念稿。只动句首,中性句原样返回。"""
+    合成层出真声,不再是假人念稿。中性句原样返回。"""
     assert interpret._apply_voice_tags("Hahaha, this idea is really good.") == "(laughs) this idea is really good."
     assert interpret._apply_voice_tags("Coughs, let's continue the meeting.") == "(coughs) let's continue the meeting."
     assert interpret._apply_voice_tags("Sighs, we missed the target.") == "(sighs) we missed the target."
     assert interpret._apply_voice_tags("hehe, nice try!") == "(chuckle) nice try!"
     assert interpret._apply_voice_tags("Lol! That's wild.") == "(laughs) That's wild."
     assert interpret._apply_voice_tags("Alas, the deal fell through.") == "(sighs) the deal fell through."
-    # 中性句/句中语气词不动
+    # 中性句不动
     assert interpret._apply_voice_tags("Today's meeting room is on the third floor.") == (
         "Today's meeting room is on the third floor."
     )
-    assert interpret._apply_voice_tags("Well, hahaha happened mid-sentence.") == (
-        "Well, hahaha happened mid-sentence."
-    )
+    # 内容词防误伤:单个 ha 不成簇(Harvard/hard 原样)、括号内容 (USA) 不动
+    assert interpret._apply_voice_tags("Harvard University is old.") == "Harvard University is old."
+    assert interpret._apply_voice_tags("The parcel is at (USA) depot.") == "The parcel is at (USA) depot."
     # 纯语气句:只剩标记本身
     assert interpret._apply_voice_tags("Hahaha!") == "(laughs)"
+
+
+def test_apply_voice_tags_anywhere_interjections():
+    """v2(2026-10-08,call-996f3917):任意位置笑声簇→标记——句尾「…? Hahaha.」
+    旧版只认句首漏网被 2.8 逐字念出;中文目标语「哈哈哈」同收;词边界防粘连。"""
+    # call-996f3917 原句:句尾 Hahaha
+    assert interpret._apply_voice_tags("Uh, what are you talking about? Hahaha.") == (
+        "Uh, what are you talking about? (laughs)"
+    )
+    # 句中(词边界:后面的词不粘连)
+    assert interpret._apply_voice_tags("Well, hahaha happened mid-sentence.") == (
+        "Well, (laughs) happened mid-sentence."
+    )
+    # 中文目标语(对方说 en 被译成 zh):句首/句尾/带逗号三形
+    assert interpret._apply_voice_tags("哈哈哈，太好笑了") == "(laughs)太好笑了"
+    assert interpret._apply_voice_tags("太好笑了，哈哈哈。") == "太好笑了，(laughs)"
+    assert interpret._apply_voice_tags("哈哈。") == "(laughs)"
+    # 轻笑族:hehe/嘻嘻/嘿嘿/呵呵 → chuckle
+    assert "chuckle" in interpret._apply_voice_tags("That's funny, hehe.")
+    assert "chuckle" in interpret._apply_voice_tags("真的吗，嘻嘻。")
+    # 白名单标记归一:全角/大写→小写 ASCII(MiniMax 只认 ASCII 形)
+    assert interpret._apply_voice_tags("（Laughs）好的。") == "(laughs)好的。"
+
+
+def test_apply_voice_tags_output_within_a_line_whitelist():
+    """复用 A 线词汇表立法:产出恒 ⊆ voice_style.VOICE_TAG_WHITELIST——A/B 语气
+    词汇不双轨(输出里任何「长得像官方标记」的括号词都必须在白名单内)。"""
+    from agent_runtime.voice_style import VOICE_TAG_WHITELIST
+
+    samples = [
+        "Hahaha.", "haha ok", "Hehe!", "lol", "lmao", "哈哈哈", "嘻嘻", "嘿嘿", "呵呵",
+        "Uh, what? Hahaha.", "Coughs, go.", "Sighs, no.", "Alas.", "（Laughs）好的。",
+        "plain sentence", "今天三楼。", "(USA) depot",
+    ]
+    for s in samples:
+        out = interpret._apply_voice_tags(s)
+        for tok in interpret._TAG_PAREN_RE.findall(out):
+            norm = interpret.norm_voice_tag(tok)
+            if norm in interpret._STRIP_TAG_INNER:  # 官方标记形状(tag-as-tag)
+                assert norm in VOICE_TAG_WHITELIST, (s, out, tok)
+
+
+def test_speech_text_gate_off_strips_tags():
+    """_speech_text 单点:门开=拟声词→标记;门关=剥标记(云端 MT 按 instructions
+    产出标记,非 2.8 档念出来=假人念稿);tag-free 文本门关逐字节原样。"""
+    assert interpret._speech_text("Hahaha, ok.", True) == "(laughs) ok."
+    assert interpret._speech_text("(laughs) ok", False) == "ok"
+    assert interpret._speech_text("（Laughs）ok", False) == "ok"
+    # tag-free 逐字节(零漂移铁律)
+    assert interpret._speech_text("plain text.", False) == "plain text."
+    assert interpret._speech_text("plain text.", True) == "plain text."
+
+
+def test_translation_instructions_tone_rule():
+    """云端/回退 LLM 车道吃指令:语气上下文层(call-996f3917)——笑声/叹气/咳嗽
+    按语境转括号标记而非照词翻译;本地 Hy-MT2 对此无视(实测,不走 prompt)。"""
+    s = interpret._translation_instructions("zh", "en")
+    assert "(laughs)" in s and "(sighs)" in s and "(coughs)" in s
+
+
+def test_caption_text_pure_tone_placeholder():
+    """纯语气句译文剥后为空/只剩标点→本地化占位;有内容的译文照常剥标记。"""
+    assert interpret._caption_text("(laughs)", "en") == "(laughs)"
+    assert interpret._caption_text("(laughs)", "zh") == "（笑）"
+    assert interpret._caption_text("(laughs).", "en") == "(laughs)"  # 纯标点残渣=占位
+    assert interpret._caption_text("(sighs)", "zh") == "（叹气）"
+    assert interpret._caption_text("morning (laughs), right?", "en") == "morning, right?"
+    assert interpret._caption_text("no tags", "zh") == "no tags"
 
 
 def test_strip_voice_tags():

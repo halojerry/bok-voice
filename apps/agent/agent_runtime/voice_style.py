@@ -57,11 +57,19 @@ _PAUSE_MAX_S = 0.80
 _SENT_BOUNDARY_RE = re.compile(r"[。！？!?.；;\n]")
 
 
-def _norm_tag(inner: str) -> str:
+def norm_voice_tag(inner: str) -> str:
+    """括号词归一（NFKC/小写/连字符/去空白）——A/B 两线语气词汇判据共用单源。
+
+    2026-10-08 B 线复用立法：interpret 的标记归一/剥除吃同一张判据
+    （VOICE_TAG_WHITELIST + 本函数），A/B 语气词汇不双轨。"""
     # NFKC:全角字母/数字归一（４Ｂ 偶发全角 (ｅｍｍ) 也收进白名单）
     return (
         unicodedata.normalize("NFKC", inner).strip().lower().replace("－", "-").replace(" ", "").replace("\u3000", "")
     )
+
+
+# 既有内部名（本模块调用点零改动）
+_norm_tag = norm_voice_tag
 
 
 def env_gate_on() -> bool:

@@ -16,6 +16,10 @@
  * - 字幕双栏成组(2026-10-07 W4a):我方列/对方列,列头承担归属;栏内「原文+其
  *   翻译」成对渲染(pairSubtitles 纯函数,node 单测),行标统一「原文/翻译」,
  *   大字幕窗同构;在途原文/孤儿译文单独渲染不丢。
+ * - 列=说话方(2026-10-08 W4c):「我说的原文和译文是一列的,对方说的原文和译
+ *   文是一列的」——译文归**被译那句话的说话方**的列(whoIs 按 flow 分侧),列头
+ *   语言对=该侧 源→译;纯语气句剥标记后空泡→「（笑）」占位(与 worker 侧
+ *   _caption_text 同口径)。
  * - 「听对方听到的翻译」开关(2026-10-07 W4b,默认关):开=把 fwd 译文轨
  *   (trans-<对方语言>,对方耳机里那份)也接进我方扬声器,与我方听到的原声叠加;
  *   订阅级控制——关=对该轨 setSubscribed(false) 连帧都不拉(与旧行为等价),
@@ -1385,7 +1389,7 @@ function ConsoleLive(p: LiveProps) {
     trimmed.slice(-60).forEach((t, i) => {
       const w = whoIs(t, p.room, p.myLang, p.otherLang);
       if (popScope !== "both" && w.flow !== popScope) return;
-      out.push({ who: w, text: stripVoiceTags(String(t.text ?? "")), idx: i });
+      out.push({ who: w, text: subText(String(t.text ?? ""), w.lang), idx: i });
     });
     return pairSubtitles(out).slice(-3); // 追帧:只留最新 3 组(原文+其翻译),旧的让位
   }, [trimmed, p.room, p.myLang, p.otherLang, popScope]);
@@ -1445,7 +1449,7 @@ function ConsoleLive(p: LiveProps) {
       if (idx < clearedCount) return;
       const who = whoIs(t, p.room, p.myLang, p.otherLang);
       if (filter !== "both" && who.flow !== filter) return;
-      out.push({ who, text: stripVoiceTags(String(t.text ?? "")), idx });
+      out.push({ who, text: subText(String(t.text ?? ""), who.lang), idx });
     });
     return out;
   }, [items, offset, clearedCount, filter, p.room, p.myLang, p.otherLang]);
@@ -1896,9 +1900,10 @@ function ConsoleLive(p: LiveProps) {
               等说话…开口即译
             </div>
           )}
-          {/* W4a 双栏成组(2026-10-07):我方列/对方列,列头承担归属(行标只剩
-              原文/翻译);每栏内「原文气泡 + 其翻译气泡」成组,在途原文/孤儿译文
-              单独渲染不丢。流向筛选=选列(rev=对方列,fwd=我方列,both=双栏)。 */}
+          {/* W4a 双栏成组(2026-10-07)/W4c 列=说话方(2026-10-08):我方列=我说的
+              原文+其译文,对方列=对方说的原文+其译文——原文与译文永不分家;列头
+              语言对=该侧的 源→译。流向筛选=选列(rev=对方列,fwd=我方列,both=双栏);
+              每栏内「原文气泡 + 其翻译气泡」成组,在途原文/孤儿译文单独渲染不丢。 */}
           <div
             className={
               filter === "both"
@@ -1909,7 +1914,7 @@ function ConsoleLive(p: LiveProps) {
             {filter !== "fwd" && (
               <SubColumn
                 title="对方"
-                langShort={LANG_SHORT[p.otherLang] ?? p.otherLang}
+                langShort={`${LANG_SHORT[p.otherLang] ?? p.otherLang}→${LANG_SHORT[p.myLang] ?? p.myLang}`}
                 groups={otherGroups}
                 mine={false}
               />
@@ -1917,7 +1922,7 @@ function ConsoleLive(p: LiveProps) {
             {filter !== "rev" && (
               <SubColumn
                 title="我方"
-                langShort={LANG_SHORT[p.myLang] ?? p.myLang}
+                langShort={`${LANG_SHORT[p.myLang] ?? p.myLang}→${LANG_SHORT[p.otherLang] ?? p.otherLang}`}
                 groups={myGroups}
                 mine
               />
@@ -2029,6 +2034,27 @@ function ConsoleLive(p: LiveProps) {
   );
 }
 
+/** MiniMax 语气词标记((laughs)/(coughs)/(sighs) 等,仅合成层语义)——字幕不展示。 */
+const VOICE_TAG_RE = /\((?:laughs?|chuckles?|coughs?|clear[- ]throat|groans?|breaths?|pants?|inhales?|exhales?|gasps?|sniffs|sighs?|snorts|burps|lip-smacking|humming|hissing|emm|sneezes?)\)/gi;
+const stripVoiceTags = (s: string) =>
+  s
+    .replace(VOICE_TAG_RE, "")
+    .replace(/\s+([,!?;:.，。？！；：、])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+/** 剥标记后为空的纯语气句→本地化占位(镜像 worker 侧 _caption_text 同口径,
+ * 2026-10-08 call-996f3917:「哈哈。」整句转 (laughs) 后字幕空泡)。 */
+const tonePlaceholder = (lang: string) =>
+  lang === "zh" || lang === "cantonese" || lang === "ja" ? "（笑）" : "(laughs)";
+const subText = (raw: string, lang: string): string => {
+  const t = stripVoiceTags(raw);
+  if (t) return t;
+  return String(raw).match(VOICE_TAG_RE) ? tonePlaceholder(lang) : t;
+};
+
+// ==== interp-subtitles (pure; extracted & node-tested by test/interp-subtitles.test.mjs) ====
+
 type Bubble = {
   /** 行标(W4a 统一):原文行=「原文」、译文行=「翻译」;归属由列头承担。 */
   text: string;
@@ -2039,26 +2065,36 @@ type Bubble = {
   lang: string;
 };
 
-/** MiniMax 语气词标记((laughs)/(coughs)/(sighs) 等,仅合成层语义)——字幕不展示。 */
-const VOICE_TAG_RE = /\((?:laughs?|chuckles?|coughs?|clear[- ]throat|groans?|breaths?|pants?|inhales?|exhales?|gasps?|sniffs|sighs?|snorts|burps|lip-smacking|humming|hissing|emm|sneezes?)\)/gi;
-const stripVoiceTags = (s: string) =>
-  s
-    .replace(VOICE_TAG_RE, "")
-    .replace(/\s+([,!?;:.，。？！；：、])/g, "$1")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-
 type TextStreamEntry = {
   text?: unknown;
   participantInfo?: { identity?: string };
   streamInfo?: { attributes?: Record<string, string> };
 };
 
-/** 字幕归属（照抄 interpret 页 subtitleLabel 的解析，另给译文标注听众端）：
- * 人端 identity=原文说话方;agent 转写看 lk.transcribed_track_id——指向人端轨=原文,
- * 指向 agent 自己的 trans-<lang> 轨=译文。行标统一「原文/翻译」(W4a 2026-10-07:
- * 删 译文·X/同传/我方说的/对方说的——归属由双栏列头 我方/对方 承担)。 */
-function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string): Bubble {
+/** 结构化最小 Room 形状(真 Room 结构兼容;测试替身零 livekit 依赖)。
+ * trackPublications 按 livekit 真形收 Map 的 values() 迭代面——旧代码
+ * Object.values(Map) 恒空([]),trackSid 查找从未生效、全部译文落 fallback
+ * (W4c 2026-10-08 tsc 逼型时发现的运行时根因,node 钉死)。 */
+export type SubRoomLike = {
+  remoteParticipants: { values(): Iterable<SubParticipantLike> };
+  localParticipant: SubParticipantLike;
+};
+export type SubParticipantLike = {
+  identity?: string;
+  trackPublications?: { values(): Iterable<SubPubLike | undefined> };
+};
+export type SubPubLike = { trackSid?: string; trackName?: string };
+
+/** 字幕归属(W4c 2026-10-08 修正):人端 identity=原文说话方;agent 转写看
+ * lk.transcribed_track_id——指向人端轨=原文,指向 agent 自己的 trans-<lang>
+ * 轨=译文。**列=说话方**(Ethan 拍板:「我说的原文和译文是一列的,对方说的
+ * 原文和译文是一列的」):原文行=说话方本人列;译文行=**被译那句话的说话方**
+ * 的列(fwd=我说的话→我方列,rev=对方说的话→对方列)。旧版两 bug:①译文按
+ * 「译文语言」分列(mylang 译文→我方列),原文与译文分家,pairSubtitles 同侧
+ * 配对恒落空;②Object.values(Map) 恒空→trackSid 查找全落 fallback(所有
+ * 译文 flow=rev 挤对方列,连流向都错)。
+ * 行标统一「原文/翻译」,归属由双栏列头 我方/对方 承担。 */
+export function whoIs(t: TextStreamEntry, room: SubRoomLike, myLang: string, otherLang: string): Bubble {
   const id = String(t.participantInfo?.identity ?? "");
   if (id.startsWith("me-")) return { text: "原文", side: "right", kind: "src", flow: "fwd", lang: myLang };
   if (id.startsWith("other-")) return { text: "原文", side: "left", kind: "src", flow: "rev", lang: otherLang };
@@ -2067,15 +2103,16 @@ function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string
     const pools = [room.remoteParticipants.values(), [room.localParticipant].values()];
     for (const pool of pools) {
       for (const participant of pool) {
-        for (const pub of Object.values(participant.trackPublications ?? {})) {
-          if (pub?.trackSid !== trackSid) continue;
+        for (const pub of participant.trackPublications?.values() ?? []) {
+          if (!pub || pub.trackSid !== trackSid) continue;
           const owner = String(participant.identity ?? "");
           if (owner.startsWith("me-")) return { text: "原文", side: "right", kind: "src", flow: "fwd", lang: myLang };
           if (owner.startsWith("other-")) return { text: "原文", side: "left", kind: "src", flow: "rev", lang: otherLang };
           const name = String(pub.trackName ?? "");
           if (name.startsWith("trans-")) {
             const lang = name.slice("trans-".length);
-            return { text: "翻译", side: lang === myLang ? "right" : "left", kind: "dst", flow: lang === myLang ? "rev" : "fwd", lang };
+            const flow = lang === myLang ? "rev" : "fwd";
+            return { text: "翻译", side: flow === "fwd" ? "right" : "left", kind: "dst", flow, lang };
           }
         }
       }
@@ -2083,8 +2120,6 @@ function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string
   }
   return { text: "翻译", side: "left", kind: "dst", flow: "rev", lang: myLang };
 }
-
-// ==== interp-subtitles (pure; extracted & node-tested by test/interp-subtitles.test.mjs) ====
 
 type SubLine = { text: string; idx: number };
 

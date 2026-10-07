@@ -10,6 +10,8 @@
 //   ⑥ 输出保同列内时间序。
 // 另钉 LANG_SHORT 七语表(zh/cantonese/en + W2 四语 de/fr/ja/pt)——防裸语言串
 // 回归(语言对行/列头都吃这张表)。
+// W4c(2026-10-08)新增 whoIs 契约:列=说话方——译文归「被译那句话的说话方」的
+// 列(fwd→右/我方,rev→左/对方),不按译文语言分列;原文+译文同列成组。
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -53,7 +55,7 @@ execFileSync(
   { stdio: "inherit" },
 );
 const require = createRequire(import.meta.url);
-const { pairSubtitles } = require(path.join(TMP_OUT, "interp-subtitles.js"));
+const { pairSubtitles, whoIs } = require(path.join(TMP_OUT, "interp-subtitles.js"));
 
 test.after(() => {
   rmSync(TMP_OUT, { recursive: true, force: true });
@@ -61,6 +63,63 @@ test.after(() => {
 
 const src = (side, flow, text, idx) => ({ who: { kind: "src", side, flow }, text, idx });
 const dst = (side, flow, text, idx) => ({ who: { kind: "dst", side, flow }, text, idx });
+
+// ---- whoIs 列=说话方(W4c 2026-10-08)----
+/** agent 转写行的最小替身:transcribed_track_id 指向 agent 的 trans-<lang> 轨。 */
+const agtRow = (trackSid) => ({
+  streamInfo: { attributes: { "lk.transcribed_track_id": trackSid } },
+});
+/** 最小 Room 替身:远端只有一个 agent 参与者(既非 me- 也非 other-),挂 trans- 轨;
+ * trackPublications 按 livekit 真形给 Map 形(值迭代面)——Object.values(Map)=恒空
+ * 是 W4c 前译文归属全落 fallback 的运行时根因,替身必须长成真形才测得出。 */
+const mkRoom = (trackSid, trackName) => ({
+  remoteParticipants: { values: () => [{ identity: "agent-bok-interp", trackPublications: new Map([["t1", { trackSid, trackName }]]) }] },
+  localParticipant: {},
+});
+
+test("whoIs:人端 identity 直判原文侧(me=右/我方,other=左/对方)", () => {
+  assert.deepEqual(
+    { side: whoIs({ participantInfo: { identity: "me-room1" } }, mkRoom("", ""), "zh", "en").side, kind: whoIs({ participantInfo: { identity: "me-room1" } }, mkRoom("", ""), "zh", "en").kind },
+    { side: "right", kind: "src" },
+  );
+  const other = whoIs({ participantInfo: { identity: "other-room1" } }, mkRoom("", ""), "zh", "en");
+  assert.equal(other.side, "left");
+  assert.equal(other.kind, "src");
+  assert.equal(other.flow, "rev");
+});
+
+test("whoIs W4c:译文归「被译那句话的说话方」的列,不按译文语言分列", () => {
+  // 我说 zh,译成 en(fwd):旧版 en 译文进左列(对方列)=原文译文分家;现进右列。
+  const fwd = whoIs(agtRow("TR_FWD"), mkRoom("TR_FWD", "trans-en"), "zh", "en");
+  assert.equal(fwd.kind, "dst");
+  assert.equal(fwd.flow, "fwd");
+  assert.equal(fwd.side, "right");
+  // 对方说 en,译成 zh(rev):zh 译文进左列(对方列),与对方原文同列。
+  const rev = whoIs(agtRow("TR_REV"), mkRoom("TR_REV", "trans-zh"), "zh", "en");
+  assert.equal(rev.kind, "dst");
+  assert.equal(rev.flow, "rev");
+  assert.equal(rev.side, "left");
+});
+
+test("whoIs:track 元数据缺席回落 rev/左列(保守=对方说的话的译文)", () => {
+  const fb = whoIs({}, mkRoom("", ""), "zh", "en");
+  assert.equal(fb.kind, "dst");
+  assert.equal(fb.flow, "rev");
+  assert.equal(fb.side, "left");
+});
+
+test("W4c 端到端:我说的话的原文+译文落同一列并成组(不再孤儿泡)", () => {
+  const room = mkRoom("TR_FWD", "trans-en");
+  const rows = [
+    { who: whoIs({ participantInfo: { identity: "me-room1" } }, room, "zh", "en"), text: "听得到我声音吗？", idx: 1 },
+    { who: whoIs(agtRow("TR_FWD"), room, "zh", "en"), text: "Can you hear my voice?", idx: 2 },
+  ];
+  const groups = pairSubtitles(rows);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].side, "right");
+  assert.equal(groups[0].src.text, "听得到我声音吗？");
+  assert.deepEqual(groups[0].dsts.map((d) => d.text), ["Can you hear my voice?"]);
+});
 
 test("LANG_SHORT 七语表:三基语 + W2 四语(de/fr/ja/pt),别再出裸语言串", () => {
   const m = source.match(/const LANG_SHORT(?::[^=]*)?= \{([^}]*)\}/);
