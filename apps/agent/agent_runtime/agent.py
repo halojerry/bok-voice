@@ -1841,6 +1841,15 @@ def _storm_on_turn(state: dict, now: float, *, quiet_s: float, max_rounds: int) 
     return "silent"
 
 
+def _storm_expiry_should_clear(state: dict, armed_until: float) -> bool:
+    """到期钟 fire 判据(纯函数,单测钉):本钟 arm 时捕获的 active_until **逐值
+    仍是**当前账上的 active_until——被用户轮续期(写新值)/engage 重拨/resume
+    清零(写 0.0)任一发生,旧钟即作废。**不可**用 _storm_active 判:fire 睡满
+    到期点才醒,醒来时 now ≥ active_until 恒真——那会令 fire 结构性 no-op
+    (probe_storm_expiry 实弹抓到的第一版自毁守卫,2026-10-07)。"""
+    return armed_until > 0.0 and state.get("active_until", 0.0) == armed_until
+
+
 # ---- W1f 打断四分法（2026-10-06 demo-quality wave）：短应承判据 ----
 # 客户附和（嗯/好的/ok）不是打断——「打断确证才弃流」的豁免面。词面 zh/canto/en
 # 收全，一律小写、去标点/空白后整串匹配；全部 ≤4 内容字符（超长=真内容轮，
@@ -4091,14 +4100,16 @@ async def entrypoint(ctx):
 
     def _arm_storm_expiry(delay_s: float) -> None:
         _cancel_storm_expiry()
+        # 捕获调用方刚写进账上的到期值(engage: now+quiet_s;续期同)——fire 时
+        # 逐值比对,被续期/重拨/清零即作废(判据见 _storm_expiry_should_clear)。
+        _armed_until = float(_storm.get("active_until", 0.0))
 
         async def _fire() -> None:
             await asyncio.sleep(max(0.1, float(delay_s)))
             if closed.is_set() or agent.paused:
                 return
-            _now = time.monotonic()
-            if not _storm.get("active_until", 0.0) or not _storm_active(_storm["active_until"], _now):
-                return  # 已被用户轮 resume/cap 清掉——timer 迟到 no-op
+            if not _storm_expiry_should_clear(_storm, _armed_until):
+                return  # 旧钟作废(用户轮续期/engage 重拨/resume 清零)
             _storm["ts"] = []
             _storm["rounds"] = 0
             _storm["active_until"] = 0.0
