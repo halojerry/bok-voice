@@ -185,15 +185,27 @@ async def main() -> None:
         )
         agent_audio.clear()
 
-        # ---- 阶段一：连发打断直到 engage（最多 5 轮，20s 窗内 ≥3 次）----
+        # ---- 阶段一：连发打断直到 engage（最多 7 轮，20s 窗内 ≥3 次）----
+        # 每轮独立 offscript 强刺激（保证 LLM 车道回复——打断 script/say 不计风暴
+        # 计数，弱问句会掉进快路/罐头=白烧一轮）；回复超时也照打断（agent 大概率
+        # 仍在讲，漏等不漏打断）。
+        QUESTIONS = [
+            "我想问下你们平台系咪要跑路了？",
+            "我要投诉你们乱扣我费用。",
+            "我个包裹三个礼拜都未到，搞咩啊？",
+            "你们客服点解永远都搵唔到人？",
+            "仲有，上次讲好嘅赔偿一直冇兑现。",
+            "我要同你们经理讲话。",
+            "你哋网址同联系电话都系假嘅？",
+        ]
         engaged = False
-        for i, burst in enumerate(BURSTS):
-            q = "我想问下你们平台系咪要跑路了？" if i == 0 else "你仲有咩想讲？"
+        for i in range(len(BURSTS) + 2):
+            q = QUESTIONS[i % len(QUESTIONS)]
+            burst = BURSTS[i % len(BURSTS)]
             await push_pcm(audio_source, tts_pcm(q))
-            got = await _wait_speech(agent_audio, 0, need_s=0.6, timeout_s=25)
+            got = await _wait_speech(agent_audio, 0, need_s=0.6, timeout_s=18)
             if got < 0.6:
                 print(f"[storm-probe] round{i}: reply_no_speech ({got:.1f}s)", flush=True)
-                continue
             await push_pcm(audio_source, tts_pcm(burst))
             await asyncio.sleep(1.2)  # 等 agent 侧 speech_created(interrupted) 落账
             if "[storm] engage" in _log_since(mark0):
