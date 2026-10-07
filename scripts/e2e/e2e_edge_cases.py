@@ -63,6 +63,34 @@ def tts_pcm(text: str, lang: str = "cantonese") -> bytes:
     return stimulus_pcm(text, lang, tts_url=TTS_URL)
 
 
+def sinji_pcm(text: str) -> bytes:
+    """macOS Sinji（zh_HK）真粤语声渲染 16k mono PCM（corpus-v2 同款链路）。
+
+    为什么要有它（2026-10-07 E2/E4 诊断）：本地 sidecar 缺省音色 Vivian 是普通话
+    声，念粤语字可懂度差（docs corpus-v2 翻案同款结论）——云豆包 canto ASR 听
+    Vivian 粤语会把「我個單號係三七七八九零」转成「我歌当午黑3,700 8905」（ctx
+    断言必挂）。换 Sinji 后豆包逐字转写（「377890」「单号」全对，2026-10-07
+    call 实弹验证）。say/afconvert 不可用时回退 Vivian tts_pcm（不阻测试）。
+    """
+    import subprocess
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            aiff = Path(td) / "s.aiff"
+            wav = Path(td) / "s.wav"
+            subprocess.run(["say", "-v", "Sinji", "-o", str(aiff), text], check=True)
+            subprocess.run(
+                ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
+                 str(aiff), str(wav)],
+                check=True,
+            )
+            return wav.read_bytes()
+    except Exception as exc:  # noqa: BLE001 - 非 macOS/缺声源=回退旧链路
+        print(f"[e2e] sinji_pcm fallback to Vivian: {exc!r}", flush=True)
+        return tts_pcm(text)
+
+
 def silence_pcm(seconds: float, sr: int = 16000) -> bytes:
     return b"\x00\x00" * int(sr * seconds)
 
@@ -89,11 +117,23 @@ def record(name: str, ok: bool, note: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name} {note}", flush=True)
 
 
+DEBUG_E4 = os.environ.get("EDGE_DEBUG", "")  # 诊断临时仪表（2026-10-07）
+
+
+def dbg(msg: str) -> None:
+    if DEBUG_E4:
+        print(f"[dbg +{time.perf_counter() - T0:7.2f}s] {msg}", flush=True)
+
+
+T0 = time.perf_counter()
+
+
 async def wait_reply_speech(agent_audio: bytearray, mark: int, timeout_s: float) -> int:
     """等 agent_audio 自 mark 起出现 ≥0.6s 语音，返回此刻长度；超时返回 -1。"""
     deadline = time.perf_counter() + timeout_s
     processed = mark
     speech = 0.0
+    dbg(f"wait_reply_speech mark={mark} timeout={timeout_s} audio_len={len(agent_audio)}")
     while time.perf_counter() < deadline:
         step = 320
         while processed + step <= len(agent_audio):
@@ -101,8 +141,10 @@ async def wait_reply_speech(agent_audio: bytearray, mark: int, timeout_s: float)
                 speech += 0.02
             processed += step
         if speech >= 0.6:
+            dbg(f"wait_reply_speech HIT speech={speech:.2f}s processed={processed}")
             return len(agent_audio)
         await asyncio.sleep(0.1)
+    dbg(f"wait_reply_speech TIMEOUT speech={speech:.2f}s processed={processed} audio_len={len(agent_audio)}")
     return -1
 
 
@@ -205,7 +247,9 @@ async def main() -> int:
     ONLY = os.environ.get("EDGE_ONLY", "")  # 逗号分隔,如 "E1,E2"
     OUT_DIR.mkdir(exist_ok=True)
     # 预合成测试音频
-    digit_pcm = tts_pcm("我個單號係三七七八九零，唔該幫我查下。")
+    # 数字句用 Sinji 真粤语声（Vivian 普通话腔念粤语→云豆包转写必烂,E2 ctx 断言
+    # 结构性必挂,2026-10-07 实证「單號」→「当午」;Sinji 链路实弹「377890」全对）。
+    digit_pcm = sinji_pcm("我個單號係三七七八九零，唔該幫我查下。")
     ack1 = tts_pcm("好。")
     ack2 = tts_pcm("係。")
     # ---- 测试话音：真人客户口吻（集运/理赔域），每句只用一次 ----
@@ -227,16 +271,18 @@ async def main() -> int:
     ]
     # E2E 句形铁律:<10 字单口气句结构性免疫 vad-pause 劈轮(渲染内停顿致
     # vad-pause 劈轮→迟到 finish 续句 interrupt 初生回复→首轮无语音,E4 连挂实证;
-    # 短句只可能 EOS 单轮提交)。
-    e4_first = tts_pcm("我要投訴件貨延誤")
-    e4_interrupt = tts_pcm("Hello, I would like to know more about your compensation policy.", lang="en")
+    # 短句只可能 EOS 单轮提交)。E4 两句均 Sinji 真粤语声(理由见 sinji_pcm)。
+    e4_first = sinji_pcm("我要投訴件貨延誤")
+    # 打断句须 ≥10 字单口气(无逗号):云豆包对 Vivian/英语声常出空转写(旧 en 句
+    # 实证 ASR ''),空轮无回复=E4 第二腿结构性挂;粤语 Sinji 转写稳。
+    e4_interrupt = sinji_pcm("咁我想知埋賠償方面係點計法")
     e6_pcm = tts_pcm("咁我唔等喇，唔該幫我跟進埋佢。")
     e7_pcm = tts_pcm("喂，聽到咩？")
     # E3 超长输入 = 8 句【不同】真人话连讲（句间 0.5s 自然停顿），唔再同一段
     # fixture 推 10 遍——同输入会令模型回复也近似复读，测试失真。
     long_input = b"".join(pcm + silence_pcm(0.5) for pcm in canto_pool)
 
-    # ---- 共享通话跑 E1-E5 ----
+    # ---- 共享通话跑 E1/E2/E3/E5/E5b（E4 因风暴静默语义需独立通话,见 E4 块）----
     call_id, room, audio_source, agent_audio = await make_call("main")
     await asyncio.sleep(12)  # 等开场白播完（greeting ~8s + 余量）
 
@@ -246,6 +292,7 @@ async def main() -> int:
         return sum(1 for t in rows if t.get("role") == "user")
 
     n0 = user_turns(call_id)
+    turns: list = []  # E3 引用 E2 的 turns 变量;EDGE_ONLY 跳过 E2 时防 NameError
     if not ONLY or "E1" in ONLY:
         await push_pcm(audio_source, silence_pcm(3.0))
         await asyncio.sleep(4)
@@ -257,8 +304,11 @@ async def main() -> int:
     if not ONLY or "E2" in ONLY:
         mark = len(agent_audio)
         baseline_user_turns = user_turns(call_id)
+        dbg(f"E2 begin mark={mark} baseline={baseline_user_turns}")
         await push_pcm(audio_source, digit_pcm)
+        dbg(f"E2 digit pushed audio_len={len(agent_audio)}")
         ok_reply = await wait_reply_speech(agent_audio, mark, 40) >= 0
+        dbg(f"E2 ok_reply={ok_reply}")
         # 轮落库有写入竞态窗口(P1 turns 竞态):断言前轮询等本段用户轮落库,
         # 唔係嘅话取到空表会把完美转写判成 FAIL(2026-09-08 实证:转写逐字全对
         # 仍报 digits_norm='')。上限 12s,超出照旧按当刻 turns 判。
@@ -290,20 +340,64 @@ async def main() -> int:
     turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     record("E3 超长输入成轮有回复", ok_long and len(turns) > n_before, f"turns {n_before}->{len(turns)}")
 
-    # E4 回复中打断：推 cantonese 触发回复，检测到回复语音立即推 en
-    mark = len(agent_audio)
-    push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source, e4_first))
-    speech_at = await wait_reply_speech(agent_audio, mark, 40)
-    await push_task
+    # E4 回复中打断：推 cantonese 触发回复，检测到回复语音立即推新输入。
+    # 【独立通话铁律（2026-10-07 根修）】E4 曾与 E3 共用通话——E3 的 8 句连珠炮
+    # 触发连环打断风暴静听（storm engage 3 打断/20s），E4 首句落在风暴窗内被判
+    # r4=silent（无 ack 无回复），且 resume 只在「下一个用户轮」才评估=agent 结构
+    # 性静默到测试 40s 超时（实证：仪表化运行 wait_reply_speech 全窗 speech=0.00s、
+    # roomio 40.0s 纯静音；call-d19cb02e）。E4 的前提=「首轮有正常回复可打断」，
+    # 必须无风暴史——与 E6/E7 同款独立通话。
+    dbg("E4 begin (own call)")
+    call_e4, room_e4, src_e4, agent_audio4 = await make_call("intr")
+    await asyncio.sleep(10)  # 等开场白播完（greeting ~6s + 余量）
+    mark4 = len(agent_audio4)
+    push_task4 = asyncio.get_running_loop().create_task(push_pcm(src_e4, e4_first))
+    speech_at = await wait_reply_speech(agent_audio4, mark4, 40)
+    dbg(f"E4 speech_at={speech_at} audio_len={len(agent_audio4)}")
+    await push_task4
     if speech_at >= 0:
         # 回复语音中推入新输入
-        interrupt_mark = len(agent_audio)
-        await push_pcm(audio_source, e4_interrupt)
-        grew = await wait_reply_speech(agent_audio, interrupt_mark, 40)
-        turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
-        record("E4 回复中打断有后续回复", grew >= 0 and len(turns) > 0, f"turns={len(turns)}")
+        interrupt_mark = len(agent_audio4)
+        pre_rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_e4}/turns", headers=_CP_HEADERS, timeout=10).json()
+        await push_pcm(src_e4, e4_interrupt)
+        dbg(f"E4 interrupt pushed, audio_len={len(agent_audio4)}")
+        grew = await wait_reply_speech(agent_audio4, interrupt_mark, 40)
+        dbg(f"E4 grew={grew}")
+        # 账本权威断言：打断用户轮落库 + 其后出现【非 interrupted】新 assistant
+        # 回复轮。纯音频判据（grew）会被旧回复尾音污染——打断推入需 ~2s，旧回复
+        # 尾音落进 interrupt_mark 之后=瞬间命中假绿（2026-10-07 call-3d18d877 实证）。
+        # 新行判据用【行数快照】而非 id 差集：turns API 恒插入序追加，而打断轮的
+        # 落库与 pre 抓取存在同刻竞态（id 已入 pre 集则永远找不到「新」用户轮，
+        # call-32877068 实证 replied=False 假阴）。
+        replied = False
+        n_pre = len(pre_rows)
+        rows4: list = pre_rows
+        deadline = time.perf_counter() + 30
+        while time.perf_counter() < deadline:
+            rows4 = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_e4}/turns", headers=_CP_HEADERS, timeout=10).json()
+            new_rows = rows4[n_pre:]
+            new_user_idx = next(
+                (i for i, t in enumerate(new_rows) if t.get("role") == "user"),
+                None,
+            )
+            if new_user_idx is not None:
+                replied = any(
+                    t.get("role") == "assistant"
+                    and t.get("gen") != "interrupted"
+                    and (t.get("transcript") or "").strip()
+                    for t in new_rows[new_user_idx + 1:]
+                )
+                if replied:
+                    break
+            await asyncio.sleep(1.5)
+        record("E4 回复中打断有后续回复", grew >= 0 and replied, f"turns={len(rows4)} replied={replied}")
     else:
         record("E4 回复中打断有后续回复", False, "首轮无回复语音可打断")
+    await room_e4.disconnect()
+    try:
+        httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_e4}/hangup", headers=_CP_HEADERS, timeout=10)
+    except Exception:
+        pass
 
     # E5 快速短应承×3（短应承被吞→只剩心跳收线的回归）
     n_before = turns_count(call_id)

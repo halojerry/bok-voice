@@ -1,9 +1,17 @@
-"""I1c（2026-10-03）host 门：云端车道不发 prefix prewarm / 投机预热 / warmup。
+"""I1c（2026-10-03）host 门：云端车道不发 prefix prewarm / warmup。
 
-routing openai 档 = 同款 MlxLlmLLM + 云 base_url——isinstance/hasattr 门放行，
-但云端无本地 KV 语义。行为面：agent `_llm_prewarm_local`（内芯 base_url 判据）
-+ plugins `_is_local_mlx_url`（纯 host 谓词，与 abort env 解耦）；源级 pin 钉
-三个消费点（prefix prewarm 主题条件 / speculator 条件 / `_prewarm_impl` 门）。
+2026-10-06 修订（A 线对偶件）：投机预热（PrefillSpeculator）云车道放行——
+DeepSeek 端点 + BOK_PREFILL_SPEC_CLOUD=1（缺省）判 lane="cloud"（DeepSeek
+服务端自动前缀缓存吃同款 max_tokens=1 预热；成本护栏=
+prefill_speculator.cloud_budget_verdict 云臂专属）；BOK_PREFILL_SPEC_CLOUD=0
+回旧 host 门逐字节（云档零发射）。会话首轮真实前缀预热（LLM_PREFIX_PREWARM）
+与 warmup 仍本地专属（`_llm_prewarm_local(_raw_llm)` pin 不变）。
+
+routing openai 档 = 同款 MlxLlmLLM + 云 base_url。行为面：agent
+`_llm_prewarm_local`（首轮预热本地门）+ `prefill_speculator.lane_for_llm_provider`
+（投机预热车道判定）+ plugins `_is_local_mlx_url`（纯 host 谓词，与 abort env
+解耦）；源级 pin 钉三个消费点（首轮 prewarm 条件 / speculator 车道判定 /
+`_prewarm_impl` 门）。
 """
 
 from __future__ import annotations
@@ -43,6 +51,28 @@ def test_is_local_mlx_url_pure_host_predicate():
 
 
 def test_prewarm_host_gate_source_pins():
+    # 首轮真实前缀预热仍本地专属（I1c 原判,云放行不扩到此件）;
+    # 投机预热已换车道判定单点（prefill_speculator.lane_for_llm_provider）。
     assert "_llm_prewarm_local(_raw_llm)" in AGENT_SRC
-    assert "_llm_prewarm_local(llm_provider)" in AGENT_SRC
+    assert "lane_for_llm_provider(llm_provider)" in AGENT_SRC
     assert "_is_local_mlx_url(self._bok_abort_base)" in PLUGINS_SRC
+
+
+def test_prefill_lane_for_llm_provider(monkeypatch):
+    """投机预热车道判定：本机=local 恒定;DeepSeek 缺省=cloud / =0 回旧门;
+    非 DeepSeek 云端点两档都不放;读不到底=保守 local。"""
+    from agent_runtime.prefill_speculator import lane_for_llm_provider
+
+    local = SimpleNamespace(_client=SimpleNamespace(base_url="http://127.0.0.1:1235/v1/"))
+    deepseek = SimpleNamespace(_client=SimpleNamespace(base_url="https://api.deepseek.com/v1"))
+    other = SimpleNamespace(_client=SimpleNamespace(base_url="https://api.openai.com/v1"))
+    monkeypatch.delenv("BOK_PREFILL_SPEC_CLOUD", raising=False)
+    assert lane_for_llm_provider(local) == "local"
+    assert lane_for_llm_provider(deepseek) == "cloud", "缺省(未设)=云档放行"
+    assert lane_for_llm_provider(other) == ""
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD", "0")
+    assert lane_for_llm_provider(deepseek) == "", "=0 回旧 host 门(云档零发射)"
+    assert lane_for_llm_provider(local) == "local"
+    # 读不到底（替身/嵌入方）=保守 local（旧 _llm_prewarm_local True 同款）
+    assert lane_for_llm_provider(SimpleNamespace()) == "local"
+    assert lane_for_llm_provider(object()) == "local"

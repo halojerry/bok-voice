@@ -323,6 +323,32 @@ e2e 三语回归不受影响；B 线新语种实弹一通（zh↔ja）出声。
 
 全量 pytest **4842 passed / 4 skipped**（基线 4753，+89 测试）；tsc 绿；web node 套件绿。
 
+## 执行纪要·续（2026-10-07 第二波 PR #194 + 第三波）
+
+**第二波（PR #194，main=95c9633）**：W4 双栏成组+label 统一「翻译」+听对方翻译
+toggle（a178c53）；W2c 判决落地——豆包对 de/fr/ja/pt 完全不可用（24/24 幻觉/空串、
+nostream 0/21 同签名），源语下拉收三语/目标语保七语（7f38d42+9d6bd81）；
+edge_cases 模板闸修复（621220f）。实弹验收：三语 E2E/barge_in interrupted+resumed/
+interpret 8/8/ambience callcenter 起播+duck/零 ZERO_AUDIO_PAD/零 TTS error 全过；
+audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修复）。
+
+**第三波（session-20261007-b-061319-71c4）**：
+- `6046a21` A 线对偶件：PrefillSpeculator 云放行（DeepSeek 前缀缓存预热，
+  BOK_PREFILL_SPEC_CLOUD 缺省开+三护栏 16k 字符/每通 12 次/端点闸；abort 云端
+  零注入确认；首轮 6k 级真实预热仍本地专属）。**合流后实弹验证：fire lane=cloud
+  + LLM_TTFT_MS cached=N/M 抬升**（基线 716-990ms cached=2432/3055）。
+- `9450dfa` W5 声纹锁模块件（v1 纯 numpy mel 白化统计声纹：同人 0.84-0.98/
+  异嗓 0.03-0.14/键盘 0.05-0.13；fail-open 三态；默认关）。**接线+真实语音阈值
+  实弹留下窗**；v2=ECAPA-ONNX 单点替换 embed_pcm。
+- `810d73a` edge_cases E2/E4 根修 8/8：E2=Vivian 声源债（Sinji 渲染修）、
+  E4=E3 风暴静默吞掉共用通话首句（独立通话+账本权威断言修）；ambient 轨三重
+  证据无罪。
+- **SubK 产品侧两张真票（下窗派单）**：①风暴过期死气窗（active_until 过期后
+  无新输入=对停嘴客户无限静默，实测 ~30s——考虑过期即 resume 或看门狗短应承）；
+  ②风暴后首真回复被 REPEAT_GUARD 误杀（33 字投诉回复 REPEAT_GUARD_CANCEL_DROP
+  ——跨轮复读账本在风暴 ack 弹幕语境下过严，考虑风暴窗内不进账本或豁免段）。
+- 四语双向候选（按语种分 ASR 车道，MiniMax 伪流式无热词）仍为独立评估票。
+
 **第二波待办**（合流后）：
 - 实弹剧本验收：barge_in 基线不变 + 短应承/假打断连发探针轮 + `MINIMAX_TTS_ZERO_AUDIO_PAD` 频率观测 + `BOK_AMBIENT_SCENE=callcenter` 实弹一通 + 挂断 10 通零 DataStreamError。
 - W2c 后置门：probe_cloud_asr 四语小语料实测（豆包宣发≠实测）。

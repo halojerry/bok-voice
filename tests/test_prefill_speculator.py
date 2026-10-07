@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from types import SimpleNamespace
 
-from agent_runtime.prefill_speculator import PrefillSpeculator
+from agent_runtime.prefill_speculator import (
+    PrefillSpeculator,
+    cloud_budget_verdict,
+    prefill_lane_for,
+)
 
 
 class _FakeCtx:
@@ -284,3 +289,185 @@ def test_new_turn_aborts_inflight():
 
     spec = asyncio.run(run())
     assert spec._task is None, "finally 清槽,后续可再开火"
+
+
+# ---- 云车道（2026-10-06 A 线对偶件）------------------------------------------
+# 车道判定 prefill_lane_for / lane_for_llm_provider 的装配点行为在
+# tests/test_prewarm_host_gate.py（host 门立法档案同处）;本段钉 lane="cloud"
+# 臂的护栏与打点行为,及 lane="local" 逐字节不变。
+
+
+def test_prefill_lane_local_default_and_deepseek_cloud(monkeypatch):
+    """车道判定:本机恒 local(不看云开关);DeepSeek 缺省 cloud、=0 回旧门;
+    非 DeepSeek 云端点不放。"""
+    assert prefill_lane_for("http://127.0.0.1:1235/v1") == "local"
+    assert prefill_lane_for("http://localhost:1238/v1") == "local"
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD", "0")
+    assert prefill_lane_for("http://127.0.0.1:1235/v1") == "local", "本机不看云开关"
+
+    monkeypatch.delenv("BOK_PREFILL_SPEC_CLOUD", raising=False)
+    assert prefill_lane_for("https://api.deepseek.com/v1") == "cloud", "缺省=云档放行"
+    assert prefill_lane_for("https://api.deepseek.com") == "cloud", "裸域(无 /v1)同判"
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD", "0")
+    assert prefill_lane_for("https://api.deepseek.com/v1") == "", "=0 回旧 host 门"
+
+    monkeypatch.delenv("BOK_PREFILL_SPEC_CLOUD", raising=False)
+    assert prefill_lane_for("https://api.openai.com/v1") == "", "非 DeepSeek 云端点不放"
+    assert prefill_lane_for("") == "local", "空 base 保守 local(旧门 True 同款)"
+    assert prefill_lane_for("garbage") == "", "非本地非 DeepSeek=不放(旧门 False 同款)"
+
+
+def test_lane_for_llm_provider_unreadable_is_conservative_local():
+    from agent_runtime.prefill_speculator import lane_for_llm_provider
+
+    assert lane_for_llm_provider(SimpleNamespace()) == "local"
+    assert lane_for_llm_provider(object()) == "local"
+    cloud = SimpleNamespace(_client=SimpleNamespace(base_url="https://api.deepseek.com/v1"))
+    assert lane_for_llm_provider(cloud) == "cloud"
+
+
+def test_cloud_budget_length_guardrail():
+    env = {"BOK_PREFILL_SPEC_CLOUD_MAX_CHARS": "100"}
+    ok, why = cloud_budget_verdict(101, 0, env)
+    assert not ok and why == "max_chars"
+    assert cloud_budget_verdict(100, 0, env) == (True, ""), "压线放行"
+    assert cloud_budget_verdict(10**9, 0, {"BOK_PREFILL_SPEC_CLOUD_MAX_CHARS": "0"}) == (
+        True,
+        "",
+    ), "0=关(不限长)"
+    # 非整数回缺省(16000)
+    bad = {"BOK_PREFILL_SPEC_CLOUD_MAX_CHARS": "abc"}
+    assert cloud_budget_verdict(16001, 0, bad) == (False, "max_chars")
+    assert cloud_budget_verdict(16000, 0, bad) == (True, "")
+
+
+def test_cloud_budget_per_call_cap():
+    env = {"BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL": "2"}
+    assert cloud_budget_verdict(10, 1, env) == (True, "")
+    ok, why = cloud_budget_verdict(10, 2, env)
+    assert not ok and why == "max_per_call"
+    assert cloud_budget_verdict(10, 999, {"BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL": "0"}) == (
+        True,
+        "",
+    ), "0=关(不限次)"
+
+
+def test_cloud_lane_fires_and_logs_lane_tag(capsys):
+    """云臂照常开火(缺省护栏内),打点带 lane=cloud 后缀。"""
+
+    async def run():
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, _FakeCtx(), lane="cloud")
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")
+        assert spec._task is not None
+        await spec._task
+        return prewarm, spec
+
+    prewarm, spec = asyncio.run(run())
+    assert len(prewarm.calls) == 1
+    assert spec._cloud_fires == 1
+    out = capsys.readouterr().out
+    assert "BOK_PREFILL_SPEC fire lane=cloud chars=" in out
+
+
+def test_local_lane_fire_line_unchanged(capsys):
+    """local 行打点逐字节不变(无 lane= 后缀)——RUNBOOK 日志口径不动。"""
+
+    async def run():
+        spec, prewarm = _spec()  # lane 缺省 "local"
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")
+        await spec._task
+        return prewarm
+
+    asyncio.run(run())
+    out = capsys.readouterr().out
+    assert "BOK_PREFILL_SPEC fire chars=" in out
+    assert "lane=" not in out
+
+
+def test_cloud_length_guardrail_skips_without_burning_state(monkeypatch):
+    """长度护栏拦截:不开火且不烧轮内预算/去重态/每通计数。"""
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_CHARS", "10")
+
+    async def run():
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, _FakeCtx(), lane="cloud")
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")  # 快照+尾部+前缀合计远超 10 字
+        await asyncio.sleep(0)
+        return prewarm, spec
+
+    prewarm, spec = asyncio.run(run())
+    assert spec._task is None and not prewarm.calls, "超长 prompt 云档跳过"
+    assert spec._turn_fires == 0 and spec._last_prefix == "", "拦截不烧轮内预算/去重态"
+    assert spec._cloud_fires == 0
+
+
+def test_cloud_per_call_cap_across_turns(monkeypatch):
+    """每通上限跨轮生效:new_turn 归还轮内预算但不归还每通计数。"""
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL", "2")
+
+    async def run():
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, _FakeCtx(), lane="cloud")
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")
+        await spec._task
+        spec._last_fire_ts = 0.0
+        spec.on_stable_prefix("你好我想查下我個集運件")
+        await spec._task
+        assert spec._cloud_fires == 2
+        spec.new_turn()
+        spec._last_fire_ts = 0.0
+        spec._last_final_ts = 0.0
+        spec.on_stable_prefix("你好我想查下我個集運件而家")
+        await asyncio.sleep(0)
+        return prewarm, spec
+
+    prewarm, spec = asyncio.run(run())
+    assert spec._task is None and len(prewarm.calls) == 2, "每通上限 2 拦第三发"
+
+
+def test_cloud_lane_busy_and_gap_gates_unchanged(monkeypatch):
+    """云臂不放松既有门控:busy/间隔(600ms)照旧拦;护栏 0=关隔离变量。"""
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_CHARS", "0")
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL", "0")
+
+    async def run():
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, _FakeCtx(), lane="cloud")
+        spec.on_request_messages([dict(m) for m in _REQ])
+        spec.on_reply_history_text("回复")
+        spec.set_busy(True)
+        spec._last_fire_ts = 0.0
+        spec._last_final_ts = 0.0
+        spec.on_stable_prefix("你好我想查下我個")
+        await asyncio.sleep(0)
+        assert spec._task is None and not prewarm.calls, "busy 不开火(云臂同)"
+        spec.set_busy(False)
+        spec.on_stable_prefix("你好我想查下我個")
+        await spec._task
+        assert len(prewarm.calls) == 1
+        spec.on_stable_prefix("你好我想查下我個集運件而家")
+        assert spec._task is None, "间隔门(600ms)照旧拦(云臂同)"
+        return prewarm
+
+    asyncio.run(run())
+
+
+def test_local_lane_ignores_cloud_guardrails(monkeypatch):
+    """护栏是云臂专属:local 车道在护栏收紧档下照常开火(逐字节旧行为)。"""
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_CHARS", "10")
+    monkeypatch.setenv("BOK_PREFILL_SPEC_CLOUD_MAX_PER_CALL", "1")
+
+    async def run():
+        spec, prewarm = _spec()  # lane 缺省 "local"
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")
+        await spec._task
+        return prewarm, spec
+
+    prewarm, spec = asyncio.run(run())
+    assert len(prewarm.calls) == 1 and spec._cloud_fires == 0, "local 不经云护栏"
