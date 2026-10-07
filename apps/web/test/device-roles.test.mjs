@@ -99,3 +99,13 @@ test("装配 pin：interpret-console realMic/realOut 过滤带 isVirtualAudioDev
   assert.match(src, /realOut = outs\.filter\(\(d\) => !d\.is_default && !isVirtualAudioDevice\(d\.name\)\)/);
   assert.match(src, /isVirtualAudioDevice,\s*\n\s*scriptMismatch/);
 });
+
+test("装配 pin：saved 存量虚拟毒值清洗（call-e1cd7550——#211 只挡新分配没清存量）", () => {
+  const src = readFileSync(path.join(WEB_ROOT, "components", "interpret-console.tsx"), "utf8");
+  // 麦侧：saved 命中虚拟设备并入 badMe/badOth（stale 同款清理路径）
+  assert.match(src, /const badMe = micStale\(savedMicDevice\("me"\)\) \|\| micVirtual\(savedMicDevice\("me"\)\);/);
+  assert.match(src, /const curMe = badMe \? "" : savedMicDevice\("me"\);/);
+  // 输出侧：saved 虚拟清洗 + wlog 可观测
+  assert.match(src, /wlog\("out_virtual_reset"/);
+  assert.match(src, /saveOutputDevice\("", "me"\)/);
+});

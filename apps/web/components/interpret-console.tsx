@@ -143,19 +143,31 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // 放宽到「有空缺或两侧撞同一支」——本轮最危险的组合(一侧死 id + 一侧显式)恰
         // 好不满足旧条件。
         const micStale = (id: string) => Boolean(id) && !mics.some((d) => d.id === id);
-        const staleMe = micStale(savedMicDevice("me"));
-        const staleOth = micStale(savedMicDevice("other"));
-        if (staleMe || staleOth) {
+        // saved 存量污染清洗(2026-10-08,call-e1cd7550):#211 只挡住了**新的** auto-assign
+        // 分配,没清已经存进 saved 的毒值——00:51 会话 auto-assign 把 BlackHole 存成我方麦,
+        // e1cd7550(02:02) 带着它跑了 30s(我方麦=虚拟回环,吃到机器自播音频,me 腿转写出
+        // 机器在放的 "How are you?")。saved 命中虚拟设备=当失效清掉,交 auto-assign 重挑
+        // 真实件(与 stale 同款清理路径)。
+        const micVirtual = (id: string) => {
+          const d = mics.find((x) => x.id === id);
+          return Boolean(d) && isVirtualAudioDevice(d.name || "");
+        };
+        const badMe = micStale(savedMicDevice("me")) || micVirtual(savedMicDevice("me"));
+        const badOth = micStale(savedMicDevice("other")) || micVirtual(savedMicDevice("other"));
+        if (badMe || badOth) {
           wlog("mic_stale_reset", {
-            who: [staleMe ? "我方" : "", staleOth ? "对方" : ""].filter(Boolean).join("+"),
-            me: staleMe ? savedMicDevice("me").slice(0, 12) : null,
-            oth: staleOth ? savedMicDevice("other").slice(0, 12) : null,
+            who: [badMe ? "我方" : "", badOth ? "对方" : ""].filter(Boolean).join("+"),
+            me: badMe ? savedMicDevice("me").slice(0, 12) : null,
+            oth: badOth ? savedMicDevice("other").slice(0, 12) : null,
+            virtual: [micVirtual(savedMicDevice("me")) ? "me" : "", micVirtual(savedMicDevice("other")) ? "oth" : ""]
+              .filter(Boolean)
+              .join("+") || null,
           });
-          if (staleMe) {
+          if (badMe) {
             saveMicDevice("", "me");
             setMeMicId("");
           }
-          if (staleOth) {
+          if (badOth) {
             saveMicDevice("", "other");
             setOthMicId("");
           }
@@ -166,8 +178,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // 吃进 routed 音频,谁在说话无从谈起)。判定单源 lib/device-roles(测试钉死)。
         const realMic = mics.filter((d) => !d.is_default && !isVirtualAudioDevice(d.name));
         if (realMic.length >= 2) {
-          const curMe = staleMe ? "" : savedMicDevice("me");
-          const curOth = staleOth ? "" : savedMicDevice("other");
+          const curMe = badMe ? "" : savedMicDevice("me");
+          const curOth = badOth ? "" : savedMicDevice("other");
           if (!curMe || !curOth || curMe === curOth) {
             const me = curMe || realMic.find((d) => d.id !== curOth)?.id || realMic[0].id;
             const oth = curOth && curOth !== me ? curOth : realMic.find((d) => d.id !== me)?.id || "";
@@ -189,6 +201,25 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
                 log.error("auto-assign mic hot-switch failed (other)", e, { id: oth.slice(0, 12) }),
               );
             }
+          }
+        }
+        // saved 输出侧同款存量清洗(2026-10-08):译文 TTS 指到 BlackHole=声音进黑洞。
+        const outVirtual = (id: string) => {
+          const d = outs.find((x) => x.id === id);
+          return Boolean(d) && isVirtualAudioDevice(d.name || "");
+        };
+        if (outVirtual(savedOutputDevice("me")) || outVirtual(savedOutputDevice("other"))) {
+          wlog("out_virtual_reset", {
+            me: outVirtual(savedOutputDevice("me")) ? savedOutputDevice("me").slice(0, 12) : null,
+            oth: outVirtual(savedOutputDevice("other")) ? savedOutputDevice("other").slice(0, 12) : null,
+          });
+          if (outVirtual(savedOutputDevice("me"))) {
+            saveOutputDevice("", "me");
+            setMeOutId("");
+          }
+          if (outVirtual(savedOutputDevice("other"))) {
+            saveOutputDevice("", "other");
+            setOthOutId("");
           }
         }
         // 双扬声器自动分配(2026-09-12「我的扬声器还听到译文 TTS」根因):双输出档
