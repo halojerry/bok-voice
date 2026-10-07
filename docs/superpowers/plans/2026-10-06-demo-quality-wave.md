@@ -444,6 +444,20 @@ audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修
   `whoIs` 按 flow 分侧（fwd 译文→我方列）+ Map `.values()` 迭代 + 列头语言对
   源→译；whoIs 入 node 测试标记区（结构化 SubRoomLike 替身,14/14）。
 
+**W4d 麦设备角色·虚拟设备排除（2026-10-08，call-933945a5「我听到的译文是对方
+说话的 TTS」）**：web-client.log 铁证三连——①会话头 `role_conflict` FATAL（两侧
+麦=同一支默认 Built-in，fatal 判定层工作正常）；②saved 我方麦=AirPods 失联 →
+stale 回落默认=与对方麦同支；③auto-assign 补位时 `realMic` 只排 default 伪条目，
+**BlackHole 2ch (Virtual) 混进候选按枚举序中选**——虚拟回环设备当人麦。rev 腿
+`audio=text-only`（无 TTS）排除翻译方向 bug；听到的 TTS 全来自 fwd trans-en，
+内容装着对方语音=两个 agent 在吃同一支麦/虚拟回环。修=`isVirtualAudioDevice`
+纯函数（BlackHole/Oray/Soundflower/Loopback/Voicemeeter/VB-Audio/GroundControl/
+Dante 族）进 `device-roles` 单源；console realMic/realOut 双过滤硬排除（候选不足
+≥2 就不分配,fatal 红字继续当诚实信号）；`deviceRoleIssues` 虚拟槽=warn（用户刻
+意路由实验不拦死）。回归测试用该通真实设备表（过滤后 BlackHole/Oray 出局,我方
+补位=AB13X 真实件）。**已知残余**：stale 设备重连不自动复归（saved 只存 id,蓝牙
+重连换 id 无从匹配）——AirPods 掉线又回来需手动重选,独立票。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，
