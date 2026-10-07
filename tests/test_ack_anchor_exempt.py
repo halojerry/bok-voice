@@ -64,9 +64,32 @@ def test_timeout_budgets_pinned():
     5.66s 之外才出手)、LLM read-gap 22s(盖冷 prefill p95 18.9s)——防手调
     常数回退到与延迟分布相撞的旧值。"""
     root = Path(__file__).resolve().parents[1]
-    agent_src = (root / "apps/agent/agent_runtime/agent.py").read_text(encoding="utf-8")
+    agent_src = (root / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
     assert 'os.environ.get("BOK_RESPONSE_WATCHDOG_S", "6")' in agent_src
     plugins_src = (
-        (root / "apps/agent/agent_runtime/providers/livekit_plugins.py").read_text(encoding="utf-8")
+        (root / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
     )
     assert 'os.environ.get("LLM_REQUEST_TIMEOUT_S", "22")' in plugins_src
+
+
+def test_interrupted_item_corpus_skip_pinned():
+    """2026-10-07 风暴误杀票:被打断的 LLM 半截 item 复用豁免通道——不进上句
+    锚/账本/摘要。真因链:碎片进锚 → 风暴后重生成同答案首句 SequenceMatcher
+    ≥0.9 → 头冻结 → 6s 看门狗 force-interrupt → 33 字死在 REPEAT_GUARD_CANCEL_DROP。
+    打断后重述=有意识修复,碎片不配当复读比对语料;chat ctx 真历史不受影响。"""
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    assert '_item_interrupted = bool(getattr(item, "interrupted", False))' in src
+    assert "interrupted-item corpus skip" in src
+    # 复用豁免出口(锚/账本/摘要三面同让):interrupted 判定在 ack 判定之后、
+    # 豁免出口之前。
+    i_ack = src.index("_assistant_ack = _is_ack_anchor_text(text)")
+    i_int = src.index('_item_interrupted = bool(getattr(item, "interrupted", False))')
+    i_exit = src.index("if _assistant_ack:\n                    print(f\"[agent] ack-anchor-exempt")
+    assert i_ack < i_int < i_exit
+    # gen="interrupted" 落账轮(W1d)在 reply_ledger() 只回 llm-gen 的过滤下
+    # 本就不进比对面——本票堵的是 item 路的 llm-gen 记录,双路径皆净。
+    plugins_src = (
+        (root / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
+    )
+    assert 'if g == "llm"' in plugins_src  # 账本过滤仍在(票据侧碎片面已由本票封)

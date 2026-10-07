@@ -5925,6 +5925,20 @@ async def entrypoint(ctx):
                 # 记忆同一把尺(转录落咗罐頭,記憶/錨都唔可以留原稿)。
                 # ack/兜底直念行豁免(2026-09-28 道歉毒性消散,见 _is_ack_anchor_text)。
                 _assistant_ack = _is_ack_anchor_text(text)
+                # 打断半截豁免(2026-10-07 风暴误杀票):被打断的 LLM item 是半截
+                # 碎片,进「上句锚/账本」会把风暴后重生成同答案的首句判成复读
+                # (REPEAT_SELF 头冻结→6s 看门狗 force-interrupt→33 字死在
+                # REPEAT_GUARD_CANCEL_DROP)。复读守卫防无意识复读;打断后重述=
+                # 有意识修复,碎片不配当比对语料。上句锚保留风暴前最后一条完整
+                # 回复(ack 豁免同机制)。prefill 历史喂入不受影响(KV 前缀字节
+                # 对齐:历史怎么落就怎么喂)。
+                _item_interrupted = bool(getattr(item, "interrupted", False))
+                if _item_interrupted and not _assistant_ack:
+                    _assistant_ack = True  # 复用豁免通道:锚/账本/摘要全让开
+                    print(
+                        f"[agent] interrupted-item corpus skip {str(text)[:24]!r} 不进重复锚/账本",
+                        flush=True,
+                    )
                 if _assistant_ack:
                     print(f"[agent] ack-anchor-exempt {text[:24]!r} 不进重复锚/摘要", flush=True)
                 else:
