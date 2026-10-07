@@ -63,6 +63,24 @@ def _norm_lang(raw: str, default: str = "zh") -> str:
     return default
 
 
+def _minimax_asr_lane(source_lang: str, minimax_key: str) -> bool:
+    """四语 ASR 车道判定（2026-10-07 W2c；纯函数，单测直喂）。
+
+    B 线源语 ∈ {de,fr,ja,pt} 时豆包 SAUC 24/24 幻听（实测不可用），MiniMax
+    asr-1.0 24/24 CER≤0.08——四语源语优先走 MiniMax 伪流式（官方 StreamAdapter
+    包 offline provider）。三条件齐备才上车：源语在集内 + 总闸开
+    （BOK_MINIMAX_ASR=0 一键回旧装配链逐字节）+ 凭据在场。zh/cantonese/en
+    不在此集=既有装配链逐字节。
+    """
+    from .providers.minimax_asr import MINIMAX_ASR_4LANG, minimax_asr_enabled
+
+    return (
+        source_lang in MINIMAX_ASR_4LANG
+        and minimax_asr_enabled()
+        and bool((minimax_key or "").strip())
+    )
+
+
 def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
     """同传 system 指令(对齐 v1 已退役 Node POC 的 local-openai prompt——目录
     2026-10-02 删除,prompt 血统见 git 史;补电话同传节奏与港式粤语输出规则)。
@@ -1528,7 +1546,33 @@ async def entrypoint(ctx) -> None:
     _doubao_old_auth = bool(str(asr_cfg.get("app_id") or "").strip()) and bool(
         str(asr_cfg.get("access_token") or "").strip()
     )
-    if (
+    # MiniMax ASR 凭据:env 优先(probe 同源 MINIMAX_API_KEY,_FORWARD_ENV 已登记),
+    # 缺省回设置面 tts.api_key——MiniMax 控制台同一把 key(TTS/ASR 共用,probe
+    # minimax_key() 回读同一 DB 面)。零打印(掩码都不打,装配行只报语言)。
+    _minimax_key = (
+        os.environ.get("MINIMAX_API_KEY", "").strip()
+        or str(tts_cfg.get("api_key") or "").strip()
+    )
+    if _minimax_asr_lane(source_lang, _minimax_key):
+        # 四语车道（2026-10-07 W2c）：de/fr/ja/pt 源语豆包 24/24 幻听，MiniMax
+        # asr-1.0 24/24 CER≤0.08——官方 stt.StreamAdapter(vad=) 包 offline
+        # provider 伪流式（MiniMax 输入侧不支持推流，SSE 只是结果流）。MiniMax
+        # ASR 无热词表，术语表只帮 MT 侧（_glossary 照旧进翻译 prompt）。
+        from .providers.minimax_asr import LANG_TAGS, MiniMaxSTT
+
+        stt_provider = lk_stt.StreamAdapter(
+            stt=MiniMaxSTT(
+                api_key=_minimax_key,
+                language_state=asr_ls,
+                lang_tag=LANG_TAGS[source_lang],
+            ),
+            vad=vad_provider,
+        )
+        print(
+            f"[interp] asr=minimax (4lang lane) lang={source_lang}",
+            flush=True,
+        )
+    elif (
         _asr_provider_name in ("doubao", "doubao_asr")
         and doubao_asr_enabled()
         and (_doubao_key or _doubao_old_auth)

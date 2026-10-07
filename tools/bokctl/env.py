@@ -774,6 +774,10 @@ _FORWARD_ENV = (
     #    云车道放行门（默认 1=DeepSeek openai 档也发 interim 前缀预热
     #    max_tokens=1 预热，吃服务端前缀缓存；0=回旧「仅本地 mlx 端点」host 门） ——
     "BOK_PREFILL_SPEC_CLOUD",
+    # —— B 线四语 ASR 车道（2026-10-07）：de/fr/ja/pt 源语走 MiniMax 伪流式
+    #    （豆包四语 24/24 幻听实测；MiniMax 24/24 CER≤0.08）总闸（缺省开，
+    #    0=回旧装配链逐字节；B 线 worker 专属，_interp_env 透传白名单同键） ——
+    "BOK_MINIMAX_ASR",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
@@ -913,6 +917,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # B 线 interim 投机翻译 2026-10-06：prewarm-and-confirm 总闸，缺省开，
         # 0=旧路径逐字节（_FORWARD_ENV 已登记，B 线 worker 专属）。
         "BOK_INTERP_SPEC_MT",
+        # B 线四语 ASR 车道 2026-10-07：de/fr/ja/pt 源语走 MiniMax 伪流式总闸，
+        # 缺省开，0=回旧装配链逐字节（_FORWARD_ENV 已登记，B 线 worker 专属）。
+        "BOK_MINIMAX_ASR",
         "BOK_INTERP_REV_AUDIO",
         "BOK_INTERP_BACKLOG",
         "BOK_INTERP_MAX_BACKLOG_S",

@@ -72,7 +72,8 @@ _FORWARD_ENV_SNAPSHOT: frozenset[str] = frozenset({
     "BOK_LAYA_SIDECAR_URL", "BOK_LLM_FALLBACK", "BOK_LLM_FAMINE", "BOK_LLM_FAMINE_DRAIN_S",
     "BOK_LLM_FAMINE_FIRST_S", "BOK_LLM_FAMINE_TTFT_S", "BOK_LLM_MSG_DEBUG", "BOK_LLM_REGEN",
     "BOK_LLM_STALL_OBS_TPS", "BOK_LOG_LEVEL", "BOK_MAX_CALL_DURATION_S", "BOK_MEMORY_CHARS", "BOK_MINED_HOTWORDS",
-    "BOK_MINIMAX_BIDI_GUARD", "BOK_MLX_ABORT", "BOK_MODEL_ROUTING", "BOK_NUMBER_GUARD", "BOK_PAUSE_ACK",
+    "BOK_MINIMAX_ASR", "BOK_MINIMAX_BIDI_GUARD", "BOK_MLX_ABORT", "BOK_MODEL_ROUTING",
+    "BOK_NUMBER_GUARD", "BOK_PAUSE_ACK",
     "BOK_PERCEIVED_BUDGET_MS", "BOK_PREEMPTIVE_DEBUG", "BOK_PREFILL_SPEC", "BOK_PREFILL_SPEC_DEBUG",
     "BOK_PREFILL_SPEC_FINAL_QUIET_MS", "BOK_PREFILL_SPEC_CLOUD", "BOK_PREFIX_PREWARM_YIELD", "BOK_QA_AUTO_DIGEST",
     "BOK_QA_CANNED_COOLDOWN_S", "BOK_QA_FASTPATH", "BOK_QA_HOMOPHONE", "BOK_QA_MATCH_THRESHOLD", "BOK_QA_PHONETIC",
@@ -113,7 +114,7 @@ _FORWARD_ENV_SNAPSHOT: frozenset[str] = frozenset({
     "VOLC_ACCESS_TOKEN", "VOLC_APP_ID", "VOLC_DIALECT", "VOLC_LANGUAGE", "VOLC_LOUDNESS_RATE", "VOLC_RESOURCE_ID",
     "VOLC_SPEAKER", "VOLC_SPEECH_RATE", "VOLC_TTS_ENDPOINT", "WEB_SEARCH",
 })
-assert len(_FORWARD_ENV_SNAPSHOT) == 265, "快照含重复键（生成脚本口径坏了）"
+assert len(_FORWARD_ENV_SNAPSHOT) == 266, "快照含重复键（生成脚本口径坏了）"
 
 
 def test_forward_env_table_literal_is_unique_in_tools():
@@ -132,7 +133,7 @@ def test_forward_env_key_set_matches_frozen_snapshot():
         f"_FORWARD_ENV 键面漂移：新增 {added}，删除 {removed} ——"
         "更新表必须同步更新 tests/test_bok_module_contract.py 快照（显式立法动作）"
     )
-    assert len(current) == 265
+    assert len(current) == 266
 
 
 def test_control_plane_env_def_is_unique_in_tools():
