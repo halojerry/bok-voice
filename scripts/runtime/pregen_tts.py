@@ -78,6 +78,7 @@ from agent_runtime.providers.livekit_plugins import (  # noqa: E402
     minimax_speed_for,
 )
 from agent_runtime.tts_cache import TtsAudioCache, default_cache_dir  # noqa: E402
+from agent_runtime.voice_style import script_line_speech_text  # noqa: E402
 
 # 物化 job=(persona, lang, text);persona=None=无对应人设(回落设置默认音色)。
 Job = tuple[dict | None, str, str, str]  # (persona, lang, text, emotion)
@@ -256,7 +257,10 @@ def _template_steps(tpl: dict | None) -> list[dict]:
 
 def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
     """话术第 1 步 ref 首行渲染(与 FlowController.opening_text 同逻辑):
-    模板语言≠通话语言或变量缺失 → 空串(运行时会退通用语,预生成跳过)。"""
+    模板语言≠通话语言或变量缺失 → 空串(运行时会退通用语,预生成跳过)。
+
+    返回前过 script_line_speech_text 规范形(2026-10-06 罐头线标记票)——运行时
+    opening_text 经 step_say_text 同调同一规范形,缓存键两侧对齐。"""
     if not tpl or str(tpl.get("language") or "") != lang:
         return ""
     steps = _template_steps(tpl)
@@ -271,7 +275,7 @@ def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
         rendered = render_template_text(line, object_vars(obj))
         if "{" in rendered and "}" in rendered:
             return ""  # 仍有未填占位
-        return rendered
+        return script_line_speech_text(rendered)
     return ""
 
 
@@ -287,7 +291,12 @@ def _say_step_lines(tpl: dict | None, obj: dict | None = None) -> list[tuple[str
     运行时 FlowController.vars_map=object_vars(object_card)(flow.py:1183),这里
     走同一个 object_vars()+render_template_text(),故对同一 obj 产出的文本逐字节
     等于 step_say_text(),缓存键(文本+音色+模型)才对得上。obj=None=空变量(旧
-    行为:含 {占位} 的行渲染后仍有残留 → 跳过,永不物化)。"""
+    行为:含 {占位} 的行渲染后仍有残留 → 跳过,永不物化)。
+
+    文本过 script_line_speech_text 规范形(2026-10-06 罐头线标记票):步骤文案
+    允许携带白名单语气/停顿标记,物化侧与运行时 step_say_text 同调同一规范形
+    ——标记随文本进缓存键(不与无标记变体相撞)并随合成烧进缓存音频;作者写成
+    全角括号/未知词/坏停顿的形态在此归一或剥除,绝不把会念出声的残片烧进罐头。"""
     if not tpl:
         return []
     vars_map = object_vars(obj) if obj else {}
@@ -299,7 +308,7 @@ def _say_step_lines(tpl: dict | None, obj: dict | None = None) -> list[tuple[str
         for line in rendered.splitlines():
             line = line.strip()
             if line and not re.search(r"\{[^{}]+\}", line):
-                out.append((line, s.emotion))
+                out.append((script_line_speech_text(line), s.emotion))
                 break
     return out
 

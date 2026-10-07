@@ -32,6 +32,8 @@ from bok_voice_core.flow_graph import (
     pick_catchall_action,
 )
 
+from .voice_style import script_line_speech_text  # 罐头线规范形(2026-10-06 标记票)
+
 # 客户状态判定结果
 CONFIRM = "confirm"       # 确认/认可当前步 → 可推进下一步
 OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
@@ -1704,7 +1706,11 @@ class FlowController:
 
         force=True 跳过 say 旗标(开场白机制用——step 0 恒取首行,不要求标 say)。
         渲染后仍剩 {占位} = 变量缺失 → 返回空串(直念线宁可退 LLM,唔念占位符)。
-        """
+
+        返回前过 `script_line_speech_text` 规范形(2026-10-06 罐头线标记票):
+        步骤文案允许携带白名单语气/停顿标记,运行时与 pregen 物化同调同一规范形
+        ——缓存键(text 维度)两侧逐字节对齐,物化版即点即播;无标记 token 的
+        文案快路径原样返回(既有直念线逐字节零漂移)。"""
         if not self.has_steps or not (0 <= idx < len(self.steps)):
             return ""
         s = self.steps[idx]
@@ -1714,7 +1720,7 @@ class FlowController:
         for line in rendered.splitlines():
             line = line.strip()
             if line and not re.search(r"\{[^{}]+\}", line):
-                return line
+                return script_line_speech_text(line)
         return ""
 
     def pending_say_text(self) -> str:
