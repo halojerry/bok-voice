@@ -169,10 +169,20 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           if (badMe) {
             saveMicDevice("", "me");
             setMeMicId("");
+            // 房间 exact 约束同步回默认(2026-10-08):saved 清了但房间还攥着死 id 的话,
+            // livekit 内部采集重试每次撞死设备 → OverconstrainedError 未接管 rejection
+            // 循环(今晚 console error 实证);热复位让重试落回系统默认,直到 auto-assign
+            // /人工重挑真实件。
+            meRoomRef.current?.switchActiveDevice("audioinput", "").catch((e: unknown) =>
+              log.warn("me room active-device reset (stale) failed", { err: e instanceof Error ? e.message : String(e) }),
+            );
           }
           if (badOth) {
             saveMicDevice("", "other");
             setOthMicId("");
+            otherRoomRef.current?.switchActiveDevice("audioinput", "").catch((e: unknown) =>
+              log.warn("other room active-device reset (stale) failed", { err: e instanceof Error ? e.message : String(e) }),
+            );
           }
         }
         // 虚拟/回环设备硬排除(2026-10-08,call-933945a5):旧 realMic 只排 default 伪条目,
@@ -560,13 +570,23 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // session.start 内部 token/连房与麦克风并行:麦克风失败时房间可能仍连上。
         const raw = e instanceof Error ? e.message : String(e ?? "");
         // overconstrained/请求设备不存在 = 存下来的那支麦已不在场（拔了/蓝牙换 id），
-        // 报「麦克风」比报「连接失败」贴切——同时把存值清掉，下次按在场设备重选。
+        // 报「麦克风」比报「连接失败」贴切——同时把存值清掉+房间 exact 约束回默认,
+        // 下次按在场设备重选。**只报不清**(2026-10-08 修):毒 id 留在 saved/房间,
+        // livekit 内部采集重试每次都撞死设备 → OverconstrainedError 未接管 rejection
+        // 循环刷屏(console error 实证)。
         if (/notallowed|permission|notreadable|track invalid|device in use|overconstrained|requested device not found/i.test(raw)) {
+          if (/overconstrained|requested device not found/i.test(raw)) {
+            saveMicDevice("", "me");
+            setMeMicId("");
+            meRoom.switchActiveDevice("audioinput", "").catch((e2: unknown) =>
+              log.warn("me room active-device reset to default failed", { err: e2 instanceof Error ? e2.message : String(e2) }),
+            );
+          }
           if (!cancelled) {
             setMeMicOn(false);
             setError(
               /overconstrained|requested device not found/i.test(raw)
-                ? "我方麦克风已不在设备列表（可能拔了/蓝牙重连换了 id）——请在「声音设备」里重新指定一支。"
+                ? "我方麦克风已不在设备列表（可能拔了/蓝牙重连换了 id）——已清掉记住的设备,请在「声音设备」里重新指定一支。"
                 : "无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。",
             );
           }
@@ -833,9 +853,20 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       } catch (e) {
         if (!cancelled) {
           const raw = e instanceof Error ? e.message : String(e ?? "");
+          if (/overconstrained|requested device not found/i.test(raw)) {
+            // 同 me 侧(2026-10-08):清毒 id+房间 exact 约束回默认,断掉 livekit
+            // 内部重试的 OverconstrainedError 循环。
+            saveMicDevice("", "other");
+            setOthMicId("");
+            if (room) {
+              room.switchActiveDevice("audioinput", "").catch((e2: unknown) =>
+                log.warn("other room active-device reset to default failed", { err: e2 instanceof Error ? e2.message : String(e2) }),
+              );
+            }
+          }
           setError(
             /overconstrained|requested device not found/i.test(raw)
-              ? "对方麦克风已不在设备列表（可能拔了/蓝牙重连换了 id）——请在「声音设备」里重新指定一支。"
+              ? "对方麦克风已不在设备列表（可能拔了/蓝牙重连换了 id）——已清掉记住的设备,请在「声音设备」里重新指定一支。"
               : describeConnectError(e, "join-session"),
           );
         }

@@ -109,3 +109,12 @@ test("装配 pin：saved 存量虚拟毒值清洗（call-e1cd7550——#211 只�
   assert.match(src, /wlog\("out_virtual_reset"/);
   assert.match(src, /saveOutputDevice\("", "me"\)/);
 });
+
+test("装配 pin：OverconstrainedError 毒 id 清理（清 saved + 房间 exact 约束回默认）", () => {
+  const src = readFileSync(path.join(WEB_ROOT, "components", "interpret-console.tsx"), "utf8");
+  // me 侧连接错误分支：overconstrained → 清 saved + setMeMicId("") + 房间回默认
+  assert.match(src, /meRoom\.switchActiveDevice\("audioinput", ""\)/);
+  assert.match(src, /room\.switchActiveDevice\("audioinput", ""\)/);
+  assert.match(src, /otherRoomRef\.current\?\.switchActiveDevice\("audioinput", ""\)/);
+  assert.match(src, /已清掉记住的设备/);
+});
