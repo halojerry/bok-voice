@@ -102,6 +102,11 @@ def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
         "- Keep names, numbers and technical terms where sensible; preserve the original tone (casual/courteous).",
         "- Speak like a live interpreter: short spoken sentences, one utterance at a time, no summaries.",
         "- If the utterance is already in the target language, output it unchanged.",
+        # 语气上下文层(2026-10-08,call-996f3917):回退/云端 LLM 车道吃指令(本地
+        # Hy-MT2 对模板外指示无视——实测留档,_mt_prompt docstring),把笑声/叹气/
+        # 咳嗽按语境转括号标记而非照词翻译;确定性兜底=interpret._apply_voice_tags。
+        "- If the speaker laughs, giggles, sighs or coughs, render the sound as a bracket tag in place of the sound word: "
+        "(laughs) / (chuckle) / (sighs) / (coughs) — at most one tag per sentence, only for genuine vocal sounds.",
     ]
     if glossary:
         lines.append(f"- Glossary (keep these renderings exactly): {glossary}")
@@ -115,15 +120,31 @@ def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
 
 # MiniMax 2.8 系语气词标记(官方文档 2026-09-16 核实:仅 speech-2.8-hd/2.8-turbo
 # 支持;非 2.8 模型会把标记当文本念出来——所以有 _voice_tags_supported 门控)。
-_VOICE_TAG_RE = re.compile(
-    r"\((?:laughs|chuckle|coughs?|clear-throat|groans|breath|pant|inhale|exhale|gasps?|"
-    r"sniffs|sighs?|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)",
-    re.IGNORECASE,
+# 插入词汇表单源=A 线 voice_style.VOICE_TAG_WHITELIST(2026-10-08 复用立法,
+# call-996f3917:句尾「…? Hahaha.」被 2.8 逐字念出+纯笑句译文列空白);剥除面更宽
+# (白名单 ∪ 官方全集——MT 车道可能吐任意官方标记,字幕面要全收)。
+from .voice_style import VOICE_TAG_WHITELIST, norm_voice_tag
+
+_STRIP_TAG_INNER: frozenset[str] = VOICE_TAG_WHITELIST | frozenset(
+    "groan groans pant pants gasp gasps sniff sniffs snort snorts burp burps "
+    "lip-smacking humming hissing sneeze sneezes cough sigh breaths chuckles laugh".split()
 )
+# 括号 token:ASCII + 全角(镜像 A 线 _PAREN_RE 形状;云端 MT 车道按 instructions
+# 产出标记会写全角（laughs）,只认 ASCII 会漏归一/漏剥/被非 2.8 档念出来)。
+_TAG_PAREN_RE = re.compile(r"[（(]([^（）()]{1,24})[）)]")
 # 引导词→标记:Hy-MT2 会把源文语气词照词翻译(Hahaha/Coughs/Ah),MiniMax 2.8
 # 对这些词只会「念字」;say 前换成括号标记,合成层才出真声(笑/咳/叹)。
 _VOICE_TAG_LEAD_RE = re.compile(
     r"^\s*((?:(?:ha){2,}|(?:he)+|lol|coughs?|ahem|sighs?|alas)\b)[,;:!.\s]*",
+    re.IGNORECASE,
+)
+# 任意位置独立笑声簇(2026-10-08 v2):旧版只动句首——call-996f3917 句尾
+# 「呃，你在说什么？哈哈哈。」译出「…? Hahaha.」漏网被逐字念出。token=笑声/
+# 轻笑拟声词簇(拉丁侧 (?![A-Za-z0-9]) 词边界防误伤内容词;CJK 簇 ≥2),尾随
+# 标点收编进替换(标记不吃标点),中文目标语「哈哈哈/嘻嘻/嘿嘿/呵呵」同收。
+_INTERJECT_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:(?:ha){2,}|(?:he){2,}|lol|lmao|哈{2,}|嘻{2,}|嘿{2,}|呵{2,}))"
+    r"(?![A-Za-z0-9])(?:\s*[.,;:!?，。！？；：、]+)?",
     re.IGNORECASE,
 )
 
@@ -143,35 +164,132 @@ def _resolve_minimax_model() -> str:
     return (os.environ.get("MINIMAX_MODEL") or "").strip() or "speech-2.8-turbo"
 
 
-def _apply_voice_tags(text: str) -> str:
-    """句首语气引导词 → MiniMax 2.8 语气标记(纯函数,单测直喂)。
+def _canonical_tags(text: str) -> str:
+    """白名单标记归一(纯函数):全角括号/大写→小写 ASCII 括号形(MiniMax 只认
+    ASCII 形)。非白名单括号词是可能的内容((USA)/(广东话)),逐字不动——判据与
+    A 线 sanitize 同源(白名单内才动),但**不做**句首未知剥除:MT 输出的句首括号
+    更可能是真内容,不是 4B 自创标签。"""
+    return _TAG_PAREN_RE.sub(
+        lambda m: (
+            f"({norm_voice_tag(m.group(1))})"
+            if norm_voice_tag(m.group(1)) in VOICE_TAG_WHITELIST
+            else m.group(0)
+        ),
+        text,
+    )
 
-    Hy-MT2 实测会照词翻译语气(Hahaha/Coughs/…),念出来是假人念稿;换成括号
-    标记后 2.8 合成层出真声。只动句首(位置最稳),不认识的中性句原样返回。"""
-    m = _VOICE_TAG_LEAD_RE.match(text)
-    if not m:
+
+def _interject_tag(word: str) -> str:
+    """拟声词簇→白名单标记(ha 族/lol/lmao/哈→laughs;hehe/嘻/嘿/呵→chuckle)。"""
+    w = word.lower()
+    if w.startswith("ha") or w in ("lol", "lmao") or w.startswith("哈"):
+        return "(laughs)"
+    return "(chuckle)"
+
+
+def _apply_voice_tags(text: str) -> str:
+    """语气拟声词 → MiniMax 2.8 语气标记(纯函数,单测直喂)。
+
+    v2(2026-10-08,call-996f3917 实证):旧版只动句首,句尾/句中笑声漏网被 2.8
+    逐字念出(假人念稿)。现三层:①白名单标记归一(全角/大写→ASCII,A 线词汇表
+    单源);②句首引导词(旧契约,coughs/ahem/sighs/alas 词形);③任意位置独立
+    笑声簇(拉丁+CJK,尾随标点收编)。产出恒 ⊆ A 线 VOICE_TAG_WHITELIST(test
+    钉死);中性句原样返回。"""
+    if not text:
         return text
-    word = m.group(1).lower()
-    if word.startswith("hah") or word == "lol":
-        tag = "(laughs)"
-    elif word.startswith("heh"):
-        tag = "(chuckle)"
-    elif word.startswith(("cough", "ahem")):
-        tag = "(coughs)"
-    elif word.startswith(("sigh", "alas")):
-        tag = "(sighs)"
-    else:
-        return text
-    rest = text[m.end():].lstrip()
-    return f"{tag} {rest}" if rest else tag
+    out = _canonical_tags(text)
+    m = _VOICE_TAG_LEAD_RE.match(out)
+    if m:
+        word = m.group(1).lower()
+        if word.startswith("hah") or word == "lol":
+            tag = "(laughs)"
+        elif word.startswith("heh"):
+            tag = "(chuckle)"
+        elif word.startswith(("cough", "ahem")):
+            tag = "(coughs)"
+        elif word.startswith(("sigh", "alas")):
+            tag = "(sighs)"
+        else:
+            tag = ""
+        if tag:
+            rest = out[m.end():].lstrip()
+            out = f"{tag} {rest}" if rest else tag
+
+    def _r(mm: re.Match) -> str:
+        tag = _interject_tag(mm.group(1))
+        if mm.start() == 0:
+            return tag
+        # 前邻是字母数字才补空格;前邻是标点(CJK 常形「…，哈哈哈。」)不补——
+        # 字幕剥标记后不留「， 」悬挂空格。
+        prev = out[mm.start() - 1]
+        return f" {tag}" if prev.isalnum() else tag
+
+    out = _INTERJECT_RE.sub(_r, out).strip()
+    return re.sub(r"\s{2,}", " ", out)
+
+
+def _has_strip_tag(text: str) -> bool:
+    """文本是否含剥除面内的标记(tag-free 文本走零漂移快路径的判据)。"""
+    return any(norm_voice_tag(x) in _STRIP_TAG_INNER for x in _TAG_PAREN_RE.findall(text or ""))
 
 
 def _strip_voice_tags(text: str) -> str:
     """剥语气词标记(字幕/落库口径):标记只属合成层,不该出现在读者面前。
-    剥后把标点前的悬挂空格收掉(「morning (laughs),」→「morning,」)。"""
-    cleaned = _VOICE_TAG_RE.sub("", text)
+    剥除面=白名单 ∪ 官方全集,括号收全角形(云端 MT 车道会写全角（laughs）)。
+    剥后把标点前的悬挂空格收掉(「morning (laughs),」→「morning,」),句尾被标
+    记带走的分隔符残渣(「太好笑了，」)一并清。"""
+    cleaned = _TAG_PAREN_RE.sub(
+        lambda m: "" if norm_voice_tag(m.group(1)) in _STRIP_TAG_INNER else m.group(0), text
+    )
     cleaned = re.sub(r"\s+([,!?;:.，。？！；：、])", r"\1", cleaned)
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return re.sub(r"[,，、;；]\s*$", "", cleaned).strip()
+
+
+def _speech_text(text: str, tags_on: bool) -> str:
+    """译文出声文本单点(2026-10-08):门开=拟声词→2.8 标记;门关=剥标记。
+
+    门关也要剥:云端 MT 车道按 instructions 语气规则产出标记(_translation_
+    instructions),非 2.8 合成/text-only 档把它念出来=假人念稿。tag-free 文本
+    逐字节原样(零漂移铁律)。"""
+    if tags_on:
+        return _apply_voice_tags(text)
+    return _strip_voice_tags(text) if _has_strip_tag(text) else text
+
+
+# 纯语气句的读者面占位(call-996f3917:「哈哈。」整句转 (laughs) 后字幕译文列
+# 空白)。zh 系(含粤语/日语)用中文记法,其余用拉丁记法;（笑）是转写通行记法。
+_CAPTION_TAG_ZH = {
+    "laughs": "（笑）", "chuckle": "（轻笑）", "sighs": "（叹气）", "coughs": "（咳嗽）",
+    "breath": "（换气）", "emm": "（嗯）", "inhale": "（吸气）", "exhale": "（呼气）",
+    "clear-throat": "（清嗓）", "groan": "（叹气）", "groans": "（叹气）",
+}
+_CAPTION_TAG_EN = {
+    "laughs": "(laughs)", "chuckle": "(chuckles)", "sighs": "(sighs)", "coughs": "(coughs)",
+    "groan": "(groans)", "groans": "(groans)",
+}
+
+
+# 纯标点/空白残渣判据:剥标记后只剩「.」「，」等不算有内容(云端 MT 直接吐
+# "(laughs)." 的形状),按纯语气句走占位。
+_PUNCT_ONLY_RE = re.compile(r"^[\s.,;:!?，。！？；：、…]+$")
+
+
+def _caption_text(text: str, lang: str) -> str:
+    """译文行读者口径:剥合成层标记;纯语气句剥后为空(或只剩标点)→本地化占位。
+
+    空译文行=读者面破相(通话记录/字幕只见空白不知发生了什么);占位让「这里
+    是一声笑」可读,结算/蒸馏读到的也是有意义的转写记法而非空串。"""
+    stripped = _strip_voice_tags(text)
+    if stripped and not _PUNCT_ONLY_RE.match(stripped):
+        return stripped
+    m = next((x for x in _TAG_PAREN_RE.findall(text or "") if norm_voice_tag(x) in _STRIP_TAG_INNER), None)
+    if not m:
+        return stripped
+    key = norm_voice_tag(m)
+    zh_side = lang in ("zh", "cantonese", "ja")
+    table = _CAPTION_TAG_ZH if zh_side else _CAPTION_TAG_EN
+    return table.get(key, "（语气）" if zh_side else "(tone)")
 
 
 # 术语表分隔符:中英逗号/顿号/分号/换行都收(与 A 线 hotwords 字段同口径)。
@@ -1625,11 +1743,14 @@ async def entrypoint(ctx) -> None:
     # 还与在途方向抢握手。音频向关闭的方向直接不装配 TTS。
     _dir_audio = _direction_audio_enabled(speaker_role)
     tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None
-    # 语气词标记(2026-09-16 用户拍板):Hy-MT2 会把语气照词翻译(Hahaha/Coughs),
-    # say 前由 _apply_voice_tags 换成 MiniMax 2.8 括号标记——合成层出真声(笑/咳/
-    # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
-    # + env 总闸(BOK_INTERP_VOICE_TAGS=0 关)。标记进 say() 文本,字幕/落库由
-    # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
+    # 语气词标记(2026-09-16 用户拍板;2026-10-08 v2):Hy-MT2/云端 MT 都会把语气照
+    # 词翻译(Hahaha/哈哈),say 前由 _speech_text→_apply_voice_tags 换成 MiniMax
+    # 2.8 括号标记——合成层出真声(笑/咳/叹),不再是假人念稿;v2 收任意位置笑声
+    # 簇+CJK 目标语(旧版句首一刀切漏句尾,call-996f3917)。双门控:模型档(仅 2.8
+    # 系支持,非 2.8 会把标记念出来;门关也剥——云端 MT 按 instructions 产出的
+    # 标记在非 2.8 档念出来=假人念稿) + env 总闸(BOK_INTERP_VOICE_TAGS=0 关)。
+    # 标记进 say() 文本,字幕/落库由 _caption_text(译文行,纯语气句回退（笑）占位)
+    # 与前端 stripVoiceTags(字幕)剥掉,只活合成层。
     # 模型档只认 MiniMax 分支(旧版靠 _build_tts_provider 的 setdefault 副作用
     # 传递;本地 Qwen3 兜底档标记会被当文本念出来,必须保持熄火)。
     # 语气词标记同理只在音频向有意义(合成层标记,text-only 无合成=纯噪音)。
@@ -1758,12 +1879,12 @@ async def entrypoint(ctx) -> None:
                 )
                 _spawn_ledger(
                     _add_turn(
-                        f"译文：{_strip_voice_tags(text)}", target_lang, latency,
+                        f"译文：{_caption_text(text, target_lang)}", target_lang, latency,
                         started_ms=_started_ms, ended_ms=_ended_ms, perceived_ms=_perceived_ms,
                     )
                 )
             else:
-                _spawn_ledger(_add_turn(f"译文：{_strip_voice_tags(text)}", target_lang, latency))
+                _spawn_ledger(_add_turn(f"译文：{_caption_text(text, target_lang)}", target_lang, latency))
 
     session.on("conversation_item_added", _on_item)
 
@@ -1790,7 +1911,7 @@ async def entrypoint(ctx) -> None:
                     _mt_pairs.append((text, translated))
                     # 先 say 后记账:say 失败(会话关闭)不留 pending 孤儿——待配对
                     # 队列只装「交付已发起」的句,与 item 到达序仍一一对应(RC-8)。
-                    session.say(_apply_voice_tags(translated) if voice_tags else translated)
+                    session.say(_speech_text(translated, voice_tags))
                     _lag.done_mt(_mt_latency["ms"])
                 else:
                     _lag.drop_src()
@@ -1854,7 +1975,7 @@ async def entrypoint(ctx) -> None:
             return None
         buf = bytearray()
         try:
-            stream = tts_provider.synthesize(_apply_voice_tags(text) if voice_tags else text)
+            stream = tts_provider.synthesize(_speech_text(text, voice_tags))
             async with stream:
                 async for ev in stream:
                     frame = getattr(ev, "frame", None)
@@ -1891,7 +2012,7 @@ async def entrypoint(ctx) -> None:
         先 say 后记账:say 失败不留 pending 孤儿(RC-8 同款纪律);投机轮 mt_ms=0
         (非真译时长,同兜底句口径)防 _on_item 错弹下一对。"""
         session.say(
-            _apply_voice_tags(text) if voice_tags else text,
+            _speech_text(text, voice_tags),
             audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate)),
         )
         _mt_latency["ms"] = 0
