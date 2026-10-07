@@ -336,6 +336,9 @@ export default function TemplateEditor(props: {
   const [pubErr, setPubErr] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 加语气(AI) busy 态（authoring-time 语气标记 pass，2026-10-07）：仅编辑态可用，
+  // draft 应用到表单（未保存态），保存仍走既有 save()——绝不自动保存。
+  const [voiceTagging, setVoiceTagging] = useState(false);
   // dirty 快照锚点：tpl 变化（换模板/退回新建态）与保存成功时重锚为当时的序列化。
   const [snap, setSnap] = useState<string>(() => serializeState(EMPTY_FORM, []));
 
@@ -507,6 +510,36 @@ export default function TemplateEditor(props: {
     setSteps(example);
   }
 
+  /** 加语气(AI)（authoring-time 语气标记 pass，2026-10-07）：LLM 给步文案/开场白/
+   * 收尾拼白名单语气标记（(breath)/(sighs)/(chuckle)… 与 <#0.3#> 停顿），CP 只回
+   * draft 零 DB 写——应用到编辑器表单（未保存态），用户审阅后自己点保存。
+   * dirty 时先确认（draft 由已保存模板算出，会覆盖未保存的手改）；publishing 同款
+   * 失败走 toast，成功 toast 提示改动数。 */
+  async function applyVoiceTags() {
+    if (!tplId || voiceTagging) return;
+    if (dirty && !window.confirm("当前有未保存的修改，应用 AI 语气标记会以已保存版本为基础覆盖编辑区。继续？")) {
+      return;
+    }
+    setVoiceTagging(true);
+    try {
+      const draft = await api.voiceTagPass(tplId);
+      const nextSteps = jsonToSteps(String(draft?.steps_json ?? ""));
+      if (nextSteps.length > 0) setSteps(nextSteps);
+      setForm((f) => ({
+        ...f,
+        opening: String(draft?.opening ?? f.opening),
+        closing: String(draft?.closing ?? f.closing),
+      }));
+      const changed = Number(draft?.changed ?? 0);
+      if (changed > 0) toast.success(`AI 已给 ${changed} 处话术加了语气标记（草稿，未保存），请审阅后保存`);
+      else toast.info("AI 没有找到适合加语气标记的话术，未做改动");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setVoiceTagging(false);
+    }
+  }
+
   /** 从表格粘贴导入：解析成步骤并填充当前编辑区（可继续增删改）。 */
   function importTable() {
     const { steps: parsed, error } = parseStepsFromTable(tableText);
@@ -654,6 +687,16 @@ export default function TemplateEditor(props: {
               填入{l}理赔示例
             </button>
           ))}
+          {editing && (
+            <button
+              className="btn-ghost text-xs"
+              disabled={readOnly || voiceTagging}
+              onClick={applyVoiceTags}
+              title="AI 给正稿/开场白/收尾插入白名单语气标记（如 (breath)），只改草稿不自动保存；保存后需重跑 tts-pregen 才进罐头音频"
+            >
+              {voiceTagging ? "加语气中…" : "加语气(AI)"}
+            </button>
+          )}
           {!readOnly && (form.opening || form.core || form.objection || form.closing) && (
             <button className="btn-ghost text-xs" onClick={() => { setSteps(fourSectionsToSteps(form)); setForm({ ...form, opening: "", core: "", objection: "", closing: "" }); }}>
               从旧四段导入步骤

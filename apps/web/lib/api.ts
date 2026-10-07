@@ -471,6 +471,11 @@ export const api = {
   // 发布当前版本（W2 发布两态）：冻结当时 live 九键写 published_json；返回更新行（含派生 published/has_changes）。
   publishTemplate: (id: string) =>
     request<Record<string, unknown>>(`/api/templates/${id}/publish`, { method: "POST" }),
+  // 语气标记 pass（authoring-time，2026-10-07）：LLM 给步文案/开场白/收尾拼白名单
+  // 语气标记。draft-only 零 DB 写——调用方把返回应用到编辑器表单（未保存态），
+  // 人类审阅后自己走既有 PUT 保存；LLM 失败=502 {"detail","stage"}。
+  voiceTagPass: (id: string) =>
+    request<VoiceTagPassDraft>(`/api/templates/${encodeURIComponent(id)}/voice-tags`, { method: "POST" }),
   deleteTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`, { method: "DELETE" }),
   listAudit: (accountId = "", action = "", callId = "") =>
     request<Record<string, unknown>[]>(
@@ -560,6 +565,22 @@ export type ModelRoutingTestResult = {
   latency_ms: number;
   model: string;
   error: string | null;
+};
+
+// ---- 语气标记 pass（authoring-time，POST /api/templates/{id}/voice-tags 契约形状） ----
+// draft-only：CP 零 DB 写，调用方把 steps_json/opening/closing 应用到编辑器
+// 表单（未保存态），人类审阅后自己走既有 PUT 保存。
+export type VoiceTagPassDraft = {
+  template_id: string;
+  language: string;
+  draft_only: boolean;
+  steps_json: string;
+  opening: string;
+  closing: string;
+  /** 守卫后真正加了标记的条数（没加/被拒不计）。 */
+  changed: number;
+  /** 送入 LLM 的可标记面总数（正稿步数+开场白+收尾）。 */
+  lines: number;
 };
 
 // ---- 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱，GET /api/stats/llm-gaps 契约形状） ----
