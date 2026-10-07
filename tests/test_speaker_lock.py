@@ -299,6 +299,7 @@ def test_gray_zone_preserves_but_not_counts_streak(gate_on):
     """[relock, drop) 灰区=丢、连击不清零也不计入：[严重,灰,严重,严重] 第 4 段 relock。"""
     anchor = embed_pcm(_A_SEGS[0], SR)
     seq = [
+        anchor,  # enroll 位（v2 起 enroll 也走 _embed——登记吃掉首向量=锚）
         _vector_at_cos(anchor, 0.10, seed=11),  # 严重（<0.65）→ 丢，连击 1
         _vector_at_cos(anchor, 0.70, seed=12),  # 灰区（0.65≤sim<0.78）→ 丢，连击仍 1
         _vector_at_cos(anchor, 0.10, seed=13),  # 严重 → 丢，连击 2
@@ -315,7 +316,7 @@ def test_gray_zone_preserves_but_not_counts_streak(gate_on):
 def test_gray_zone_drop_is_loss_not_pass(gate_on):
     """灰区段必须丢（不喂 ASR）——保守语义的另一面：不确定 ≠ 放行。"""
     anchor = embed_pcm(_A_SEGS[0], SR)
-    lock = _StubEmbedLock([_vector_at_cos(anchor, 0.72, seed=21)], relock_streak=3)
+    lock = _StubEmbedLock([anchor, _vector_at_cos(anchor, 0.72, seed=21)], relock_streak=3)
     lock.enroll(_A_SEGS[0])
     assert lock.admit(b"x") == (False, "drop")
 
@@ -324,7 +325,7 @@ def test_relock_enrolls_trigger_segment(gate_on):
     """relock 新锚=触发段本身（随后同向量必然 hit）。"""
     anchor = embed_pcm(_A_SEGS[0], SR)
     v = _vector_at_cos(anchor, 0.05, seed=31)
-    lock = _StubEmbedLock([v, v], relock_streak=1)
+    lock = _StubEmbedLock([anchor, v, v], relock_streak=1)
     lock.enroll(_A_SEGS[0])
     assert lock.admit(b"x") == (True, "relock")
     assert lock.admit(b"x") == (True, "hit")  # 与新锚逐位同向量 → cos=1
@@ -387,14 +388,23 @@ def test_gate_explicit_on_values(monkeypatch, value):
 
 
 def test_env_read_surface_single_registered_key():
-    """源级 pin：模块 env 读取面恒等于已注册的 {BOK_SPEAKER_LOCK}。
+    """源级 pin：模块 env 读取面恒等于已注册的 {BOK_SPEAKER_LOCK,
+    BOK_SPEAKER_LOCK_MODEL}（后者=v2 ECAPA 模型指路,已入 _FORWARD_ENV）。
 
     drop/relock 两子键**故意不读 env**（test_forward_env 扫描面内未注册键即 CI 红），
     调参=SpeakerLock 构造参数。新增 env 读取必须先进 _FORWARD_ENV 并改本测试认账。
     """
     reads = set(re.findall(r'os\.environ\.get\(\s*"([A-Z][A-Z0-9_]+)"', _MODULE_SRC))
     reads |= set(re.findall(r"""\.get\(\s*["'](BOK_[A-Z0-9_]+)["']""", _MODULE_SRC))
+    from agent_runtime.speaker_lock import ECAPA_MODEL_ENV
+
+    # 字面量读取面只有总闸；v2 模型键走 ECAPA_MODEL_ENV 常量间接（值+注册面双钉）
     assert reads == {SPEAKER_LOCK_ENV}
+    assert ECAPA_MODEL_ENV == "BOK_SPEAKER_LOCK_MODEL"
+    _forward = (
+        Path(__file__).resolve().parents[1] / "tools" / "bokctl" / "env.py"
+    ).read_text(encoding="utf-8")
+    assert '"BOK_SPEAKER_LOCK_MODEL",' in _forward, "v2 模型键必须注册 _FORWARD_ENV"
 
 
 def test_admit_returns_reason_enum():
@@ -523,14 +533,14 @@ def test_segment_gate_judges_once_per_segment(gate_on):
     for c in _chunks(_B_SEGS[0]):
         gate.feed(c)  # 判丢
     gate.segment_end("")
-    assert lock.n_embeds == 2  # 每段恰一次：hit 段 1+drop 段 1（enroll 直调
-    # embed_pcm 不经 _embed 钩、首段未登记 admit 在 _embed 前返回——都不计）
+    assert lock.n_embeds == 3  # 每段恰一次：登记 1+hit 段 1+drop 段 1（v2 起
+    # enroll 也走 _embed 统一嵌入面——running-mean 登记需要同源向量）
 
 
 def test_segment_gate_relock_after_streak(gate_on, capsys):
     """连续严重不匹配段数到 relock_streak：触发段放行、打点 SPEAKER_RELOCK after=3。"""
     centroid = embed_pcm(_A_SEGS[0])
-    vecs = [_vector_at_cos(centroid, 0.05, 900 + i) for i in range(3)]
+    vecs = [centroid] + [_vector_at_cos(centroid, 0.05, 900 + i) for i in range(3)]
     lock = _StubEmbedLock(vecs)
     assert lock.enroll(_A_SEGS[0])
     gate = SegmentSpeakerGate(lock)
@@ -566,7 +576,8 @@ def test_segment_gate_grey_prefix_not_dropped_early(gate_on, capsys):
     """前缀灰区(0.65≤sim<0.78)：feed 恒放行不早丢、无 DROP 打点；段末复核仍灰
     → segment_end 返回 False（吞 FINAL）+ DROP src=segment_end 打点。"""
     centroid = embed_pcm(_A_SEGS[0])
-    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.72, seed=71),
+    lock = _StubEmbedLock([centroid,
+                           _vector_at_cos(centroid, 0.72, seed=71),
                            _vector_at_cos(centroid, 0.72, seed=72)])
     assert lock.enroll(_A_SEGS[0])
     gate = SegmentSpeakerGate(lock)
@@ -585,7 +596,8 @@ def test_segment_gate_grey_recheck_hit_passes_final(gate_on, capsys):
     """前缀灰区但整段复核 hit（真实场景：前缀方差大、整段回到 ≥drop_sim）→
     segment_end 返回 True，FINAL 放行、无 DROP。"""
     centroid = embed_pcm(_A_SEGS[0])
-    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.72, seed=81),
+    lock = _StubEmbedLock([centroid,
+                           _vector_at_cos(centroid, 0.72, seed=81),
                            _vector_at_cos(centroid, 0.95, seed=82)])
     assert lock.enroll(_A_SEGS[0])
     gate = SegmentSpeakerGate(lock)
@@ -598,7 +610,7 @@ def test_segment_gate_grey_recheck_hit_passes_final(gate_on, capsys):
 def test_segment_gate_clear_mismatch_still_early_drop(gate_on, capsys):
     """清弃档(<relock_sim,白噪/键盘形)不变：前缀处即早丢停喂（省成本语义保留）。"""
     centroid = embed_pcm(_A_SEGS[0])
-    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.05, seed=91)])
+    lock = _StubEmbedLock([centroid, _vector_at_cos(centroid, 0.05, seed=91)])
     assert lock.enroll(_A_SEGS[0])
     gate = SegmentSpeakerGate(lock)
     gate.segment_start()
@@ -606,3 +618,80 @@ def test_segment_gate_clear_mismatch_still_early_drop(gate_on, capsys):
     assert verdicts[-1] is False
     assert gate.dropped is True
     assert "SPEAKER_LOCK_DROP" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- 9. v2 ECAPA 双档
+# （2026-10-07 认人票：模型在场=onnx 嵌入+0.62/0.40 档；缺位回 v1 0.78/0.65
+# 字节不变。CI 零模型文件——全部 monkeypatch fake session。）
+
+
+class _FakeOnnxSession:
+    """可控 fake：run(wav) 返回单位化常设向量（按调用序弹出）。"""
+
+    def __init__(self, vectors):
+        self._vecs = list(vectors)
+        self.calls = 0
+
+    def run(self, _names, feed):
+        self.calls += 1
+        v = self._vecs.pop(0)
+        n = float(np.linalg.norm(v))
+        return (v / n).reshape(1, 1, -1)
+
+
+def _with_fake_onnx(monkeypatch, vectors):
+    import agent_runtime.speaker_lock as sl
+
+    fake = _FakeOnnxSession(vectors)
+    monkeypatch.setattr(sl, "_onnx_session", lambda: fake)
+    monkeypatch.setattr(sl, "_reset_onnx_state", lambda: None)
+    return sl, fake
+
+
+def test_v2_model_present_selects_ecapa_profile(monkeypatch, gate_off):
+    """模型在场（fake）：阈值自动取 ECAPA 档（0.62/0.40），嵌入走 onnx 通道。"""
+    sl, fake = _with_fake_onnx(monkeypatch, [_fake_vec(5, 1)] * 6)
+    lock = sl.SpeakerLock()
+    assert lock.drop_sim == sl.ECAPA_DROP_SIM
+    assert lock.relock_sim == sl.ECAPA_RELOCK_SIM
+    assert lock._use_onnx is True
+
+
+def test_v2_model_absent_keeps_v1_byte_identical(monkeypatch, gate_off):
+    """模型缺位（session=None）：v1 阈值/mel 嵌入,行为逐字节不变。"""
+    import agent_runtime.speaker_lock as sl
+
+    monkeypatch.setattr(sl, "_onnx_session", lambda: None)
+    lock = sl.SpeakerLock()
+    assert lock.drop_sim == DEFAULT_DROP_SIM
+    assert lock.relock_sim == DEFAULT_RELOCK_SIM
+    assert lock._use_onnx is False
+
+
+def test_v2_running_mean_enroll_and_relock_reset(monkeypatch, gate_on):
+    """running-mean：前 3 段确证平均成锚；relock 重置账本以触发段为新锚。"""
+    v_same = _fake_vec(192, 1)
+    v_other = _fake_vec(192, 9)
+    sl, fake = _with_fake_onnx(
+        monkeypatch,
+        # 登记三段（同向量→平均=自身,断言精确）+cap 探针第 4 段（也吃桩位）
+        # +hit 段+严重不匹配×3(relock)+relock 后同段 admit(vs 新锚 cos=1 hit)
+        [v_same] * 5 + [v_other] * 4,
+    )
+    lock = sl.SpeakerLock(relock_streak=3)
+    pcm = b"\x11\x22" * int(1.6 * SR)
+    assert lock.enroll(pcm) and lock.enroll(pcm) and lock.enroll(pcm)
+    assert lock._centroid_n == 3
+    lock.enroll(pcm)  # 第 4 段登记不再计入（cap 3）
+    assert lock._centroid_n == 3
+    assert lock.admit(pcm)[1] == "hit"  # 同向量 vs mean(自身)=cos 1
+    for _ in range(2):
+        assert lock.admit(pcm) == (False, "drop")  # 严重不匹配,连击 1→2
+    assert lock.admit(pcm) == (True, "relock")  # 第 3 段触发重锁
+    assert lock._centroid_n == 1  # 账本重置=触发段即新锚
+    assert lock.admit(pcm)[1] == "hit"  # 同向量 vs 新锚 → cos=1
+
+
+def _fake_vec(dim: int, seed: int) -> np.ndarray:
+    v = np.random.default_rng(seed).standard_normal(dim)
+    return v / float(np.linalg.norm(v))

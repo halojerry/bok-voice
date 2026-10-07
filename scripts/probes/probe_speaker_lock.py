@@ -249,12 +249,14 @@ def main() -> int:
     assert gate.lock.enrolled, "enroll failed"
     noisy = mix_at_snr(pcms["meijia"][2], amb, 6.0, seed=42)
     gate.segment_start()
-    v_hit = [gate.feed(noisy[j : j + 6400]) for j in range(0, len(noisy), 6400)][-1]
-    gate.segment_end("麻烦你稍等一下")
+    for j in range(0, len(noisy), 6400):
+        gate.feed(noisy[j : j + 6400])
+    v_hit = gate.segment_end("麻烦你稍等一下")  # 灰区语义:裁决权在段末复核
     amb_seg = _f_to_pcm(amb[16000 : 16000 + 2 * SR])
     gate.segment_start()
-    v_drop = [gate.feed(amb_seg[j : j + 6400]) for j in range(0, len(amb_seg), 6400)][-1]
-    gate.segment_end("")
+    for j in range(0, len(amb_seg), 6400):
+        gate.feed(amb_seg[j : j + 6400])
+    v_drop = not gate.segment_end("")  # feed 灰区恒 True——判丢=段末复核否决
     print(f"  同人带噪 6dB → {'放行' if v_hit else '误杀!'}；纯环境音段 → {'判丢' if not v_drop else '漏放!'}")
     gate_ok = v_hit is True and v_drop is False
 

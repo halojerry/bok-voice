@@ -70,6 +70,8 @@ DEFAULT_RELOCK_SIM = 0.65
 DEFAULT_RELOCK_STREAK = 3
 # enrollment 最短段（spec 定案：<1s 拒绝登记）。
 ENROLL_MIN_SECONDS = 1.0
+# running-mean 登记上限（前 N 个确证段滚动平均成锚）。
+ENROLL_MAX_SAMPLES = 3
 
 _FRAME_S = 0.025
 _HOP_S = 0.010
@@ -188,8 +190,70 @@ def speaker_relock_line(after: int) -> str:
     return f"SPEAKER_RELOCK after={after}"
 
 
+# ---- v2 ECAPA 嵌入器（2026-10-07 认人票）-------------------------------------
+# 模型=官方 speechbrain/spkrec-ecapa-voxceleb（Apache-2.0）自导出单文件 ONNX
+# （wav→Fbank80→CMVN→ECAPA→192 维整管线，导出脚本 scripts/seed/export_ecapa_onnx.py；
+# sha256=fa492b67…3574e4，84MB）。**激活=显式 env ``BOK_SPEAKER_LOCK_MODEL`` 指路
+# （只认 env,不自动探测磁盘——本机碰巧有模型文件不许泄进单测/意外换档）**；
+# 未设/文件缺位/坏档=fail-open 回 v1 mel 统计嵌入（字节不变）。部署位惯例=
+# ``<app-data>/models/ecapa_tdnn_voxceleb.onnx``（serve 侧 env 指过去）。
+# v2 阈值（四嗓音 TTS 语料 provisional，0dB SNR 极端臂=灰区由段末复核+relock 兜）：
+#   同人净 ≥0.78 | 异人 max 0.57（v1 完全无分离）| 纯噪声 ≈0——0.62/0.40 取
+#   「同人净下界-0.16 / 异人上界+0.05」。
+ECAPA_MODEL_ENV = "BOK_SPEAKER_LOCK_MODEL"
+ECAPA_DROP_SIM = 0.62
+ECAPA_RELOCK_SIM = 0.40
+_ONNX_STATE: dict = {"sess": None, "resolved": False, "path": ""}
+
+
+def _onnx_session():
+    """懒加载单例（进程级）；**仅显式 env** 指路；缺位/异常=None（fail-open v1）。"""
+    if _ONNX_STATE["resolved"]:
+        return _ONNX_STATE["sess"]
+    _ONNX_STATE["resolved"] = True
+    path = os.environ.get(ECAPA_MODEL_ENV, "").strip()
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        import onnxruntime as ort
+
+        _ONNX_STATE["sess"] = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        _ONNX_STATE["path"] = path
+        print(f"SPEAKER_LOCK_EMBEDDER onnx src={path}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 模型缺位/坏档=回 v1,绝不炸会话
+        print(f"SPEAKER_LOCK_EMBEDDER onnx_unavailable {exc!r} -> v1 mel-stat", flush=True)
+        _ONNX_STATE["sess"] = None
+    return _ONNX_STATE["sess"]
+
+
+def _reset_onnx_state() -> None:
+    """测试钩子：清单例（monkeypatch 改 env 后重解析）。"""
+    _ONNX_STATE.update(sess=None, resolved=False, path="")
+
+
+def embed_pcm_onnx(pcm: bytes, sr: int = 16000) -> np.ndarray:
+    """v2 嵌入：raw wav 整段进 ONNX（特征面在图内闭合）→ 192 维 L2 归一。"""
+    sess = _onnx_session()
+    if sess is None:
+        raise ValueError("speaker_lock: onnx model unavailable")
+    n = len(pcm) // 2
+    wav = np.frombuffer(pcm, dtype="<i2", count=n).astype(np.float32) / 32768.0
+    if len(wav) < sr // 2:
+        raise ValueError(f"speaker_lock: pcm too short for ecapa ({len(wav)} samples)")
+    emb = sess.run(None, {"wav": wav[None, :]})[0].ravel().astype(np.float64)
+    norm = float(np.linalg.norm(emb))
+    if norm <= 0.0:
+        raise ValueError("speaker_lock: degenerate ecapa embedding")
+    return emb / norm
+
+
 class SpeakerLock:
     """1v1 声纹锁：:meth:`enroll` 登记通话对象，:meth:`admit` 逐 VAD 段把门。
+
+    嵌入器双档：**v2 ECAPA ONNX**（模型在场时自动启用,阈值 0.62/0.40——真分人：
+    异人 max 0.57 vs 同人 ≥0.78）优先；缺位回 **v1 mel 统计**（0.78/0.65,只分
+    语音/非语音）。enrollment=**running mean**（前 3 个确证段滚动平均,抬同人
+    稳定性;v1 单段语义不变——首段即锚,后续段继续精化）。
 
     admit 返回 ``(放行?, 原因)``，原因四值：
       - ``"enroll"``：放行且**未做声纹判定**（总闸关 / 未登记 / 段太短不可嵌入
@@ -207,34 +271,54 @@ class SpeakerLock:
     def __init__(
         self,
         *,
-        drop_sim: float = DEFAULT_DROP_SIM,
-        relock_sim: float = DEFAULT_RELOCK_SIM,
+        drop_sim: float | None = None,
+        relock_sim: float | None = None,
         relock_streak: int = DEFAULT_RELOCK_STREAK,
         sample_rate: int = 16000,
     ) -> None:
-        self.drop_sim = float(drop_sim)
-        self.relock_sim = float(relock_sim)
+        self._use_onnx = _onnx_session() is not None
+        self.drop_sim = float(
+            drop_sim if drop_sim is not None else (ECAPA_DROP_SIM if self._use_onnx else DEFAULT_DROP_SIM)
+        )
+        self.relock_sim = float(
+            relock_sim if relock_sim is not None else (ECAPA_RELOCK_SIM if self._use_onnx else DEFAULT_RELOCK_SIM)
+        )
         self.relock_streak = max(1, int(relock_streak))
         self.sample_rate = int(sample_rate)
+        self._centroid_sum: np.ndarray | None = None
+        self._centroid_n = 0
         self._centroid: np.ndarray | None = None
         self._severe_streak = 0
         # 观测位（打点用，admit 每次嵌入时刷新；relock 触发时刻的连击数）。
         self.last_sim: float | None = None
-        self.last_relock_streak: int = 0
+        self.last_relock_streak = 0
 
     @property
     def enrolled(self) -> bool:
         return self._centroid is not None
 
     def enroll(self, pcm: bytes) -> bool:
-        """首个确证语音段登记（<1s 或不可嵌入拒绝；返回是否成功）。"""
+        """确证语音段登记（<1s 或不可嵌入拒绝；返回是否成功）。
+
+        running mean（v2 认人票,2026-10-07）：前 ``ENROLL_MAX_SAMPLES``(3) 个确证段
+        滚动平均成锚（TTS 语料标定:单段锚同人下界 0.78,多段平均抬同人间隙）;
+        v1 行为不变——首段即锚(平均=首段),后续段只是精化同向。"""
         if len(pcm) < 2 * int(ENROLL_MIN_SECONDS * self.sample_rate):
             return False
-        try:
-            vec = embed_pcm(pcm, self.sample_rate)
-        except ValueError:
+        vec = self._embed(pcm)
+        if vec is None:
             return False
-        self._centroid = vec
+        if self._centroid_sum is None:
+            self._centroid_sum = vec.copy()
+            self._centroid_n = 1
+        elif self._centroid_n < ENROLL_MAX_SAMPLES:
+            self._centroid_sum = self._centroid_sum + vec
+            self._centroid_n += 1
+        mean = self._centroid_sum / float(self._centroid_n)
+        norm = float(np.linalg.norm(mean))
+        if norm <= 0.0:
+            return False
+        self._centroid = mean / norm
         self._severe_streak = 0
         return True
 
@@ -256,15 +340,24 @@ class SpeakerLock:
             self._severe_streak += 1
             if self._severe_streak >= self.relock_streak:
                 self.last_relock_streak = self._severe_streak
-                self._centroid = vec  # 重锁=触发段即新锚
+                # 重锁=触发段即新锚（重置 running mean 账本）
+                self._centroid_sum = vec.copy()
+                self._centroid_n = 1
+                self._centroid = vec
                 self._severe_streak = 0
                 return (True, "relock")
         return (False, "drop")
 
+    def _embed_raw(self, pcm: bytes) -> np.ndarray:
+        """原始嵌入（可抛 ValueError）：v2 ECAPA 在场优先，否则 v1 mel 统计。"""
+        if self._use_onnx:
+            return embed_pcm_onnx(pcm, self.sample_rate)
+        return embed_pcm(pcm, self.sample_rate)
+
     def _embed(self, pcm: bytes) -> np.ndarray | None:
-        """嵌入失败（段太短/全静音）返回 None；测试可子类覆盖钉状态机。"""
+        """嵌入失败（段太短/全静音/模型缺位）返回 None；测试可子类覆盖钉状态机。"""
         try:
-            return embed_pcm(pcm, self.sample_rate)
+            return self._embed_raw(pcm)
         except ValueError:
             return None
 

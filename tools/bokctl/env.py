@@ -769,6 +769,7 @@ _FORWARD_ENV = (
     "BOK_AMBIENT_SCENE",
     #    W5 声纹锁通话对象（默认 0 关；enrollment+VAD 段相似度 pre-ASR 门）——
     "BOK_SPEAKER_LOCK",
+    "BOK_SPEAKER_LOCK_MODEL",
     # —— A 线对偶件（2026-10-07，demo-quality-wave 第二窗）：PrefillSpeculator
     #    云车道放行门（默认 1=DeepSeek openai 档也发 interim 前缀预热
     #    max_tokens=1 预热，吃服务端前缀缓存；0=回旧「仅本地 mlx 端点」host 门） ——
