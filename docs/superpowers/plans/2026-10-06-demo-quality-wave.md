@@ -424,6 +424,26 @@ audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修
 - W1g 残留：`entrypoint did not exit in time` 的 12s close-flush 窗口未动（另一张票）。
 - 候选评估票：audition symlink 在 Next 静态导出的拷贝行为（CI build 裁决，红则改实体拷贝）。
 
+**W4c+B 语气词 v2（2026-10-08，call-996f3917 实证）**：
+- 病灶①：`_apply_voice_tags` 只认句首——句尾「呃，你在说什么？哈哈哈。」译出
+  「…? Hahaha.」漏网被 2.8 逐字念出。修=v2 三层（白名单归一（全角/大写→ASCII）
+  →句首引导词（旧契约）→**任意位置**笑声簇（拉丁词边界+CJK 哈哈/嘻/嘿/呵）），
+  产出恒 ⊆ A 线 `VOICE_TAG_WHITELIST`（`voice_style.norm_voice_tag` 公开共用，
+  A/B 词汇不双轨,parity test 钉死）。
+- 病灶②：纯笑句「哈哈。」整句转 `(laughs)` 后字幕译文列**空白**（`_strip_voice_tags`
+  剥后空串）。修=`_caption_text`（字幕/落库口径）：剥后空/纯标点→本地化占位
+  「（笑）/(laughs)」；web 侧 `subText` 同口径。
+- 病灶③（上下文层）：本地 Hy-MT2 对模板外指示无视（2026-09-16 实测留档）——
+  确定性层兜底两车道；云端/回退 LLM 车道 `_translation_instructions` 加语气规则
+  （笑声/叹气/咳嗽按语境转标记,至多 1 枚/句）。门关路径 `_speech_text` 也剥
+  （云端 MT 产出的标记在非 2.8 档念出来=假人念稿）。
+- 病灶④（W4c 列语义）：Ethan 拍板「我说的原文和译文是一列的,对方说的原文和
+  译文是一列的」。旧版译文按**译文语言**分列（原文译文分家,pairSubtitles 同侧
+  配对恒落空=孤儿泡满屏）+ `Object.values(Map)` 恒空（livekit `trackPublications`
+  是 Map）→ trackSid 查找**从未生效**、全部译文落 fallback（flow 都错）。修=
+  `whoIs` 按 flow 分侧（fwd 译文→我方列）+ Map `.values()` 迭代 + 列头语言对
+  源→译；whoIs 入 node 测试标记区（结构化 SubRoomLike 替身,14/14）。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，
