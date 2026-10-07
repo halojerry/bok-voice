@@ -372,6 +372,30 @@ audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修
 - W5 验收面更新：`BOK_SPEAKER_LOCK=1` 实弹一通（观测 SPEAKER_LOCK_ENROLL 后播
   环境音段验证零幻听轮）留下窗；模块 docstring/测试头已带勘误段防旧口径回流。
 
+**第五波（session-20261007-165220-1a9f，PR #198 main=f9a0263）**：
+- **W5 实弹收官**：栈 `BOK_SPEAKER_LOCK=1 BOK_LOCAL_ASR=1`（探针仪器位）跑
+  canto E2E **PASS 1/1**；`SPEAKER_LOCK_ENROLL dur≈2.4-2.5s chars=8-10` 每通
+  必落、**零 DROP/零 RELOCK**（E2E 单一合成嗓音零误杀）。全云档跑探针须
+  `BOK_LOCAL_TTS=1 BOK_LOCAL_ASR=1` 双仪器位（:8788 渲染+:8787 语言判定腿）。
+- **票①死气窗（74ebce3）**：第一性定案=风暴状态机观察「抢话」不观察「停嘴」
+  ——惰性过期撞上停嘴客户=无限静默,风暴盲 nudge 升级 farewell+no_response
+  把刚讲完的客户误诊挂断。修=engage/续期处 arm 到期钟（quiet_s 到点自清+零
+  starve+三语回收线 storm-reclaim 车道,迟到 no-op,resume/cap/teardown 收钟）
+  +nudge 风暴让位（风暴活期间整体跳过、短周期重挂不拆錶）。新 env
+  `BOK_INTERRUPT_STORM_EXPIRY_RESUME`（缺省开,_FORWARD_ENV 263→264）。
+- **票②复读误杀（2a3b2ce）**：SubK 账本假设**证伪**（starve-ack gen=script 被
+  reply_ledger 只回 llm+ack 锚豁免双重过滤）——真凶=`_on_item_for_context`
+  无条件 set_last_reply/record_reply,风暴打断的半截碎片进锚,重生成同答案首句
+  vs 自家碎片 ≥0.9→头冻结→6s 看门狗→33 字死在 REPEAT_GUARD_CANCEL_DROP。
+  修=`item.interrupted` 复用 ack 豁免通道（锚/账本/摘要三面让开;prefill 喂入
+  与 chat ctx 真历史不动）。
+- 全量 **4910 passed**（+5）；commit 分层经 reset+重放保证（重组树 reflog
+  逐字节验证）。两张票实弹验收=单测+源级 pin（无风暴剧本 E2E,下一窗可加
+  barge_in 连发脚本顺带观测 `[storm] expiry-resume` 行）。
+- **事故记录**：harness shell 因 cwd 停在已删 worktree 目录 spawn 全灭
+  （ENOENT-on-dead-cwd）——解法=Write 工具原地重建该目录复活 cwd（勿用定时
+  任务绕）。
+
 **第二波待办**（合流后）：
 - 实弹剧本验收：barge_in 基线不变 + 短应承/假打断连发探针轮 + `MINIMAX_TTS_ZERO_AUDIO_PAD` 频率观测 + `BOK_AMBIENT_SCENE=callcenter` 实弹一通 + 挂断 10 通零 DataStreamError。
 - W2c 后置门：probe_cloud_asr 四语小语料实测（豆包宣发≠实测）。
