@@ -8284,9 +8284,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # FINAL 的 fallback 正是它——agent 的 on_user_turn_completed/
                     # _on_conversation_item 在本 FINAL 之后才跑,那时已是新的一段)。
                     fallback_tail = self._turn_partial_for_fallback()
+                    # 段末收口:灰区整段复核判丢→吞 FINAL 尾巴(幻听轮不成);
+                    # 登记钩(首段确证文本)照走。
+                    if not self._gate.segment_end(text):
+                        payload = ""
                     self._reset()
-                    # 登记钩：首段确证文本（finish 全文；≥4 实词字符）登记通话对象。
-                    self._gate.segment_end(text)
                     if payload:
                         # 只给真发出去的 FINAL 重贴;短尾/纯 dump/迟到护栏丢弃=无
                         # FINAL → 保持空(no-op 亦不会把空贴上)。
@@ -8383,8 +8385,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         if self._session_epoch == _epoch_at_hold:
             # pre-reset 快照(同上停嘴路径):本段 partial 末稿。
             fallback_tail = self._turn_partial_for_fallback()
+            # 段末收口:灰区整段复核判丢→吞 FINAL 尾巴;登记钩照走(同停嘴路径)。
+            if not self._gate.segment_end(text):
+                payload = ""
             self._reset()
-            self._gate.segment_end(text)
             if payload:
                 self._publish_turn_partial(fallback_tail)
         # else: finish 等待期间 START 已开新 sidecar 会话——新会话状态属续讲段照常

@@ -290,9 +290,11 @@ def has_enroll_text(text: str, min_chars: int = 4) -> bool:
 
 
 # 早期判定窗（墙钟秒，含 VAD 前导 padding）：段首攒够即做**一次** admit 判定。
-# 1.5s 的取法=扣除 silero 前导 ~0.5-0.6s 后净语音 ~0.9s——与标定素材（≥1s 语音段）
-# 同量级；更短的窗判定材料不足（误杀通话对象=最坏结局，宁晚勿错），更长的窗
-# 泄漏 interim/已喂音频增多。短于窗的段（「嗯」类 backchannel）结构性不判=放行。
+# 1.5s 的取法=扣除 silero 前导 ~0.5-0.6s 后净语音 ~0.9s；短于窗的段（「嗯」类
+# backchannel）结构性不判=放行。**前缀只裁两档**（2026-10-07 probe_storm_expiry
+# 实弹勘误：标定用整段(同人+0dB ≥0.859)、门判前缀方差更大——同人前缀实测可落
+# 0.75 灰区误杀真客户）：<relock_sim 清弃（白噪/键盘形）早丢省成本；灰区**不早丢**
+# （继续喂 ASR），段末**整段复核**（与标定同形状）裁决，复核判丢才吞 FINAL。
 GATE_WINDOW_S = 1.5
 
 
@@ -302,15 +304,17 @@ class SegmentSpeakerGate:
     车道侧三调用点契约::
 
         START_OF_SPEECH:  gate.segment_start()
-        每块段内 PCM:      ok = gate.feed(pcm)   # False=判非通话对象：丢这块且
-                                                 # 本段剩余恒 False（调用方不喂 ASR）
-        END_OF_SPEECH 后:  gate.segment_end(text) # 正常段=登记钩（首段确证文本）；
-                                                 # 被丢段传 ""（只清段态）
+        每块段内 PCM:      ok = gate.feed(pcm)    # False=清弃(<relock_sim)：丢这块且
+                                                  # 本段剩余恒 False（调用方不喂 ASR）
+        END_OF_SPEECH 后:  ok = gate.segment_end(text)  # 灰区段在此整段复核：
+                                                  # False=复核判丢，调用方吞 FINAL；
+                                                  # 正常段=登记钩（首段确证文本）；
+                                                  # 被丢段传 ""（只清段态）
 
     行为铁律：
     - ``lock`` 为 None 或总闸关 → ``feed`` 恒 True、零累积零 DSP（缺省档字节零漂移）；
-    - 判定**一次性**：段首攒够 ``window_s`` 即 admit 一次并缓存判定——同段不重判
-      （VAD 段=单人连续话流，中途换人不建模）；
+    - 前缀判定**一次性**：段首攒够 ``window_s`` 即 admit 一次——同段不重判（VAD 段=
+      单人连续话流）；前缀灰区(relock≤sim<drop)=不早丢，段末整段复核裁决；
     - 未登记段恒放行（SpeakerLock.admit 语义）；登记只发生在**段末**且要求
       ``has_enroll_text(text)``（首段真说话才算「确证语音」，防幻听锚噪声）；
     - 打点单源：DROP/RELOCK/ENROLL 三行全从这里出，车道不再各自 print。
@@ -330,6 +334,7 @@ class SegmentSpeakerGate:
         self._buf = bytearray()
         self._dropped = False
         self._verdict = ""
+        self._grey = False  # 前缀落灰区(relock≤sim<drop)=不早丢,段末整段复核
         self._off = True  # segment_start 按总闸实况翻（恒守 admit 的 env 语义）
 
     @property
@@ -342,42 +347,71 @@ class SegmentSpeakerGate:
         self._buf.clear()
         self._dropped = False
         self._verdict = ""
+        self._grey = False
         self._off = self.lock is None or not _gate_enabled()
 
     def feed(self, pcm: bytes) -> bool:
-        """段内音频块把门；False=判非通话对象（本段后续恒 False，调用方丢块）。"""
+        """段内音频块把门；False=判非通话对象（本段后续恒 False，调用方丢块）。
+
+        前缀判定的两档（2026-10-07 probe_storm_expiry 实弹勘误:标定用**整段**
+        (同人+0dB 底噪 ≥0.859),门判**前缀**(净语音 ~0.9s)方差更大——同人前缀
+        可落到 0.75 灰区=误杀真客户):**清弃**(<relock_sim,白噪/键盘形)才早丢
+        省成本;**灰区不早丢**(继续喂 ASR),段末整段复核(与标定同形状)由
+        :meth:`segment_end` 裁决。"""
         if self._dropped:
             return False
         if self._off:
             return True
         self._buf.extend(pcm)
-        if self._verdict or len(self._buf) < self._window_bytes:
-            return True  # 已判放行 / 未攒够判定窗
+        if self._verdict or self._grey or len(self._buf) < self._window_bytes:
+            return True  # 已判放行 / 灰区待段末 / 未攒够判定窗
         ok, reason = self.lock.admit(bytes(self._buf))
         self._verdict = reason
         if not ok:
+            _sim = self.lock.last_sim if self.lock.last_sim is not None else 0.0
+            if _sim >= self.lock.relock_sim:
+                self._grey = True  # 灰区:证据不足不早丢——段末整段复核裁决
+                return True
             self._dropped = True
             print(
-                speaker_lock_drop_line(
-                    self.lock.last_sim if self.lock.last_sim is not None else 0.0,
-                    len(self._buf) / (2.0 * self.sample_rate),
-                ),
+                speaker_lock_drop_line(_sim, len(self._buf) / (2.0 * self.sample_rate)),
                 flush=True,
             )
         elif reason == "relock":
             print(speaker_relock_line(self.lock.last_relock_streak), flush=True)
         return ok
 
-    def segment_end(self, text: str) -> None:
-        """段末收口：正常段吃登记钩（首个确证文本段），随后清段态。"""
+    def segment_end(self, text: str) -> bool:
+        """段末收口，返回 **FINAL 是否放行**（False=复核判丢，调用方吞 FINAL）。
+
+        三件事：①灰区段整段复核（前缀方差大，整段才是标定形状——复核 sim 仍
+        <drop_sim 才真丢，此时 ASR 已喂过但 FINAL 吞掉=幻听轮照样不成）；②正
+        常段吃登记钩（首个确证文本段）；③清段态。"""
         try:
-            if self._off or self._dropped or self.lock is None:
-                return
+            if self._off or self.lock is None:
+                return True
+            if self._dropped:
+                return False
+            if self._grey:
+                ok, _reason = self.lock.admit(bytes(self._buf))
+                if not ok:
+                    self._dropped = True
+                    print(
+                        speaker_lock_drop_line(
+                            self.lock.last_sim if self.lock.last_sim is not None else 0.0,
+                            len(self._buf) / (2.0 * self.sample_rate),
+                        )
+                        + " src=segment_end",
+                        flush=True,
+                    )
+                    return False
             if not self.lock.enrolled and _gate_enabled() and has_enroll_text(text):
                 dur_s = len(self._buf) / (2.0 * self.sample_rate)
                 if dur_s >= ENROLL_MIN_SECONDS and self.lock.enroll(bytes(self._buf)):
                     print(f"SPEAKER_LOCK_ENROLL dur={dur_s:.1f}s chars={len(text)}", flush=True)
+            return True
         finally:
             self._buf.clear()
             self._dropped = False
             self._verdict = ""
+            self._grey = False

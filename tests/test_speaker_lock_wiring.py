@@ -243,3 +243,17 @@ def test_local_lane_env_off_byte_identical(monkeypatch, capsys):
     assert "SPEAKER_LOCK_DROP" not in out
     assert "SPEAKER_LOCK_ENROLL" not in out
     assert "SPEAKER_LOCK_SUPPRESS" not in out
+
+
+def test_grey_recheck_veto_wiring_source_pins():
+    """源级 pin（2026-10-07 灰区段末复核）：两车道共三处消费 segment_end 的
+    FINAL 否决权（豆包 END 1 处+本地线停嘴/hold-flush 2 处）——灰区复核判丢
+    时 FINAL 必须被吞（幻听轮不成）。"""
+    lp_src = (ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(
+        encoding="utf-8"
+    )
+    da_src = (ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "doubao_asr.py").read_text(
+        encoding="utf-8"
+    )
+    assert lp_src.count("if not self._gate.segment_end(text):") == 2, "本地线停嘴+hold-flush 两处否决"
+    assert da_src.count("if not self._gate.segment_end(text):") == 1, "豆包 END 一处否决"

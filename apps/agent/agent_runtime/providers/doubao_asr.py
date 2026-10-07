@@ -662,8 +662,9 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(cloud)",
                         flush=True,
                     )
-                    # 登记钩：首段确证文本（≥4 实词字符）登记通话对象声纹。
-                    self._gate.segment_end(text)
+                    # 段末收口：灰区整段复核判丢→吞 FINAL（幻听轮不成）；登记钩照走。
+                    if not self._gate.segment_end(text):
+                        text = ""
                     started = False
                     self._finishing = False
                     self._reset_segment()

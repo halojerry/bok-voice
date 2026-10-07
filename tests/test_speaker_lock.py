@@ -555,3 +555,54 @@ def test_segment_gate_relock_after_streak(gate_on, capsys):
     assert "SPEAKER_RELOCK after=3" in out
     assert "SPEAKER_LOCK_DROP" not in out
     assert lock.enrolled is True
+
+
+# ---------------------------------------------------------------- 8. 灰区段末整段复核
+# （2026-10-07 probe_storm_expiry 实弹勘误：标定用整段、门判前缀——同人前缀可落
+# 0.75 灰区误杀真客户；灰区不早丢，段末整段复核裁决，复核判丢才吞 FINAL。）
+
+
+def test_segment_gate_grey_prefix_not_dropped_early(gate_on, capsys):
+    """前缀灰区(0.65≤sim<0.78)：feed 恒放行不早丢、无 DROP 打点；段末复核仍灰
+    → segment_end 返回 False（吞 FINAL）+ DROP src=segment_end 打点。"""
+    centroid = embed_pcm(_A_SEGS[0])
+    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.72, seed=71),
+                           _vector_at_cos(centroid, 0.72, seed=72)])
+    assert lock.enroll(_A_SEGS[0])
+    gate = SegmentSpeakerGate(lock)
+    gate.segment_start()
+    verdicts = [gate.feed(c) for c in _chunks(_B_SEGS[0])]
+    assert all(v is True for v in verdicts), "灰区不早丢"
+    assert gate.dropped is False
+    assert "SPEAKER_LOCK_DROP" not in capsys.readouterr().out
+    ok = gate.segment_end("尾问句子在这里")
+    assert ok is False, "整段复核仍灰→吞 FINAL"
+    out = capsys.readouterr().out
+    assert "SPEAKER_LOCK_DROP" in out and "src=segment_end" in out
+
+
+def test_segment_gate_grey_recheck_hit_passes_final(gate_on, capsys):
+    """前缀灰区但整段复核 hit（真实场景：前缀方差大、整段回到 ≥drop_sim）→
+    segment_end 返回 True，FINAL 放行、无 DROP。"""
+    centroid = embed_pcm(_A_SEGS[0])
+    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.72, seed=81),
+                           _vector_at_cos(centroid, 0.95, seed=82)])
+    assert lock.enroll(_A_SEGS[0])
+    gate = SegmentSpeakerGate(lock)
+    gate.segment_start()
+    assert all(gate.feed(c) for c in _chunks(_A_SEGS[0]))
+    assert gate.segment_end("你好我是陈大文") is True
+    assert "SPEAKER_LOCK_DROP" not in capsys.readouterr().out
+
+
+def test_segment_gate_clear_mismatch_still_early_drop(gate_on, capsys):
+    """清弃档(<relock_sim,白噪/键盘形)不变：前缀处即早丢停喂（省成本语义保留）。"""
+    centroid = embed_pcm(_A_SEGS[0])
+    lock = _StubEmbedLock([_vector_at_cos(centroid, 0.05, seed=91)])
+    assert lock.enroll(_A_SEGS[0])
+    gate = SegmentSpeakerGate(lock)
+    gate.segment_start()
+    verdicts = [gate.feed(c) for c in _chunks(_B_SEGS[0])]
+    assert verdicts[-1] is False
+    assert gate.dropped is True
+    assert "SPEAKER_LOCK_DROP" in capsys.readouterr().out
