@@ -1028,13 +1028,14 @@ def _preemptive_generation_opts() -> dict:
 def _direction_audio_enabled(speaker_role: str) -> bool:
     """该方向译文是否合成+发布音频(纯函数,单测用)。
 
-    2026-09-12 用户拍板:同传操作台**只听我方译文(fwd TTS,给对方听)**;对方→我
-    方向(rev,speaker_role=other)只看双栏字幕,不出声——省一半 MiniMax 合成,
-    也令「两路译文分两个扬声器」的需求消失(只剩一路音频)。BOK_INTERP_REV_AUDIO=1
-    恢复双向出声(旧双端形态/未来我要听对方译文的场景)。"""
+    2026-10-08 用户翻案(拍板原话:「对方说英文 我要听到英文转普通话的翻译! 我讲
+    普通话对方听到英文的翻译!」)——同传台**双向出声**:rev(对方→我)译文合成 TTS
+    进我方耳机(译员耳语),fwd(我→对方)不变。旧 2026-09-12「单向化」拍板(rev
+    纯字幕零 TTS,省一半 MiniMax 合成)作废。``BOK_INTERP_REV_AUDIO=0`` 回退
+    单向化档(字幕仍全量;逃生口留给纯字幕同传/合成预算敏感场景)。"""
     if speaker_role != "other":
         return True
-    return os.environ.get("BOK_INTERP_REV_AUDIO", "0") == "1"
+    return os.environ.get("BOK_INTERP_REV_AUDIO", "1") != "0"
 
 
 def _session_report_payload(report_dict: dict) -> dict:
@@ -1737,7 +1738,7 @@ async def entrypoint(ctx) -> None:
     _glossary = glossary_block(glossary_pairs)
     if _glossary:
         print(f"[interp] glossary {len(glossary_pairs)} terms -> asr+mt", flush=True)
-    # B 线官方对账(2026-09-30):text-only 方向(rev 默认档)此前无条件构造并
+    # B 线官方对账(2026-09-30):text-only 方向(BOK_INTERP_REV_AUDIO=0 回退档)此前无条件构造并
     # **真连**云端 MiniMax bidi(prewarm connect_ms=446 实测)——但
     # RoomOutputOptions.audio_enabled=False 下 TTS 永不被调用=零收益连接,
     # 还与在途方向抢握手。音频向关闭的方向直接不装配 TTS。
@@ -1956,7 +1957,7 @@ async def entrypoint(ctx) -> None:
     _mt_worker = asyncio.create_task(_mt_say_worker())
 
     # —— 投机翻译装配(prewarm-and-confirm,机制见模块级块注释) ——
-    # text-only 方向(rev 默认档)无 TTS 无可预热音频=整闸不开;kill-switch 同判。
+    # text-only 方向(BOK_INTERP_REV_AUDIO=0 回退档)无 TTS 无可预热音频=整闸不开;kill-switch 同判。
     # (tts_cache 面函数级导入:interpret 模块头保持零 livekit 轻导入惯例。)
     from .tts_cache import frames_aiter, pcm_to_frames
 

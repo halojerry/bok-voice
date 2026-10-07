@@ -458,6 +458,19 @@ Dante 族）进 `device-roles` 单源；console realMic/realOut 双过滤硬排�
 补位=AB13X 真实件）。**已知残余**：stale 设备重连不自动复归（saved 只存 id,蓝牙
 重连换 id 无从匹配）——AirPods 掉线又回来需手动重选,独立票。
 
+**W4e 双向出声·译员耳语（2026-10-08 用户翻案，#212 补刀后续）**：
+- #211 补刀（#212）：saved 存量虚拟毒值清洗——旧 auto-assign 存下的 BlackHole 在
+  e1cd7550 带毒跑了 30s（me 腿吃到机器自播音频）；saved 命中枚举内虚拟设备当失效
+  清掉（麦/输出两测，`mic_virtual_reset`/`out_virtual_reset` 可观测）。
+- 3708cb53 取证：设备/翻译全对，用户听感=「听对方听到的翻译」开关（W4b）开着
+  （`their_trans_sub want:true`），fwd 英文译文进了自己的 Mac mini 扬声器——不是
+  方向错，是监听开关 + rev 无声（旧单向化）叠加出的「听不到我要的那份译文」。
+- **翻案落法**：`_direction_audio_enabled` rev 缺省翻 `!= "0"`（`BOK_INTERP_REV_AUDIO=0`
+  回退单向化档）；console 新增 `hearMyTrans` 译员耳语开关（默认开，订阅级控制
+  trans-<我方语言> 轨经 me 路 AudioContext 进我方扬声器，与 W4b 镜像同构；半双工
+  meHeld 闸原生覆盖防串译）；e2e I2 断言翻案（me **应**听到译文音轨）；
+  AGENTS/DELIVERY-MANUAL 同步。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，

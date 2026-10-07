@@ -227,3 +227,17 @@ test("末尾开口组冲账:双列各自收尾、列内保序", () => {
 test("空输入=空组", () => {
   assert.deepEqual(pairSubtitles([]), []);
 });
+
+// ---- 双向出声(2026-10-08 用户翻案:「对方说英文 我要听到英文转普通话的翻译!」)----
+// 译员耳语接线源 pin:rev 译文轨(trans-<我方语言>)订阅级控制+路由进我方扬声器,
+// 默认开(缺值=开,与 hearOrig 同为基线听感);与 W4b(trans-<对方语言>)镜像同构。
+
+test("双向出声 pin:译员耳语(rev trans-<myLang>)订阅+路由默认开", () => {
+  assert.match(source, /const revName = `trans-\$\{myLang\}`;/);
+  assert.match(source, /wlog\("my_trans_sub", \{ want: hearMyTrans \}\)/);
+  assert.match(source, /wlog\("my_trans_elem"/);
+  assert.match(source, /localStorage\.getItem\("bok_interp_hear_my_trans"\) !== "0"/);
+  // UI 开关与 props 传递在场
+  assert.match(source, /hearMyTrans=\{hearMyTrans\}/);
+  assert.match(source, /checked=\{p\.hearMyTrans\}/);
+});
