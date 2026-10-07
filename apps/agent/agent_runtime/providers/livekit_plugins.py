@@ -49,6 +49,7 @@ from ..asr_polish_runtime import polish_enabled as _polish_layer_on
 from ..asr_polish_runtime import sync_polish as _polish_sync_text
 from ..flow import STEP_DISCIPLINE_RULE, split_step_text, stable_step_key
 from ..slot_actor import build_slot_task_block, compose_slot_user_message
+from ..speaker_lock import SegmentSpeakerGate
 
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
@@ -7896,10 +7897,13 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
       直接按句提交（免等 finish 往返），再走正常停嘴路径补尾巴。
     """
 
-    def __init__(self, stt_, *, vad, conn_options):
+    def __init__(self, stt_, *, vad, conn_options, speaker_lock=None):
         super().__init__(stt=stt_, conn_options=conn_options, sample_rate=16000)
         self._stt_ = stt_  # 内层 Qwen3ASRSTT（base_url/语言状态/钉定）
         self._vad = vad
+        # W5 声纹门（BOK_SPEAKER_LOCK 默认关）：VAD 段 pre-ASR 把门，drop 段
+        # 不进 _pending/_maybe_partial（sidecar 永远看不到这段音频）。
+        self._gate = SegmentSpeakerGate(speaker_lock)
         self._session_id: str | None = None
         self._pending = bytearray()  # 尚未 POST 给 sidecar 的增量 PCM
         self._last_partial = ""  # 上一窗全文（INTERIM 去重 + 句边界稳定性参照）
@@ -8047,6 +8051,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # join-hold 期间续段嚟到:取消超时 flush。sidecar session 仲生猛
                     # (hold 唔 finish),唔好重复 start——orphan 旧会话会令拼接变两段。
                     self._cancel_join_hold()
+                    self._gate.segment_start()
                     self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
                     if not self._session_id:
                         await self._start_session()
@@ -8068,6 +8073,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                                         f"frames_n={len(event.frames)}",
                                         flush=True,
                                     )
+                                self._gate.feed(_preroll_pcm)
                                 self._pending.extend(_preroll_pcm)
                                 self._append_turn_pcm(_preroll_pcm)
                             except Exception:  # noqa: BLE001 - pre-roll 合帧失败不致命
@@ -8078,6 +8084,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 1.7 utils.merge_frames=rtc.combine_audio_frames:返回【单个】
                     # rtc.AudioFrame(不可迭代,官方 StreamAdapter 同款用法)。
                     _window_pcm = bytes(utils.merge_frames(event.frames).data)
+                    if not self._gate.feed(_window_pcm):
+                        continue  # 声纹门判丢：不进 _pending、不喂 sidecar、不出 partial
                     self._pending.extend(_window_pcm)
                     self._append_turn_pcm(_window_pcm)
                     await self._maybe_partial()
@@ -8101,6 +8109,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         self._finishing = False
                         self._reset()
                         print("QWEN3_ASR_CLOSING_SAY_SUPPRESS src=segment_eos", flush=True)
+                        continue
+                    # ---- W5 声纹门：本段已判非通话对象 → 整段抑制（镜像收线窗语义：
+                    # 不发 EOS、不 finish、不重解、不出 FINAL；_reset 收会话态）。----
+                    if self._gate.dropped:
+                        started = False
+                        self._finishing = False
+                        self._gate.segment_end("")
+                        self._reset()
+                        print("QWEN3_ASR_SPEAKER_LOCK_SUPPRESS src=segment_eos", flush=True)
                         continue
                     # ---- smart-turn 语义闸（V1，BOK_SMART_TURN=1；默认关）--------
                     # VAD 0.35s 静音只证明「停了 0.35s」——句间喘气与真停嘴同形，
@@ -8268,6 +8285,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # _on_conversation_item 在本 FINAL 之后才跑,那时已是新的一段)。
                     fallback_tail = self._turn_partial_for_fallback()
                     self._reset()
+                    # 登记钩：首段确证文本（finish 全文；≥4 实词字符）登记通话对象。
+                    self._gate.segment_end(text)
                     if payload:
                         # 只给真发出去的 FINAL 重贴;短尾/纯 dump/迟到护栏丢弃=无
                         # FINAL → 保持空(no-op 亦不会把空贴上)。
@@ -8365,6 +8384,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             # pre-reset 快照(同上停嘴路径):本段 partial 末稿。
             fallback_tail = self._turn_partial_for_fallback()
             self._reset()
+            self._gate.segment_end(text)
             if payload:
                 self._publish_turn_partial(fallback_tail)
         # else: finish 等待期间 START 已开新 sidecar 会话——新会话状态属续讲段照常
@@ -8868,7 +8888,7 @@ class Qwen3ASRLiveSTT(stt.STT):
     INTERIM/PREFLIGHT 的实时流。能力声明 streaming=True + interim_results=True。
     """
 
-    def __init__(self, *, stt_: Qwen3ASRSTT, vad_):
+    def __init__(self, *, stt_: Qwen3ASRSTT, vad_, speaker_lock=None):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
@@ -8882,6 +8902,8 @@ class Qwen3ASRLiveSTT(stt.STT):
         )
         self._vad = vad_
         self._stt = stt_
+        # W5 声纹锁（BOK_SPEAKER_LOCK 默认关）：装配点每通一把传入；None=零行为。
+        self._speaker_lock = speaker_lock
         stt_.on("metrics_collected", self._on_metrics_collected)
         # 在活流追踪(GPU 竞态专项):set_partial_ms 要即时转发到当前 stream 的
         # 开会话;WeakSet 随流 GC 自动清理,勿改强引用。
@@ -8916,7 +8938,12 @@ class Qwen3ASRLiveSTT(stt.STT):
         return await self._stt.recognize(buffer=buffer, language=language, conn_options=conn_options)
 
     def stream(self, *, language=None, conn_options=None):
-        s = _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())
+        s = _Qwen3ASRLiveStream(
+            self._stt,
+            vad=self._vad,
+            conn_options=conn_options or APIConnectOptions(),
+            speaker_lock=getattr(self, "_speaker_lock", None),
+        )
         self._live_streams.add(s)
         return s
 

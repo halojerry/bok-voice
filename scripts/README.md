@@ -100,6 +100,7 @@
 | `scripts/probes/probe_interpret_latency.py` | B 线同传延迟探针（P1 评测体系,2026-09-16）——逐句感知 lag,版本回归用。 | 2 脚本 import / agent interpret.py | 是 | 2026-09-19 |
 | `scripts/probes/probe_judge_parity.py` | 意图识别（judge）的**三方对照**（2026-09-21）：本机 9B vs DeepSeek flash vs v4-pro。 | 无(手动) | 是 | 2026-09-22 |
 | `scripts/probes/probe_killswitch.py` | 远程停机开关（killswitch）目标语义探针：把「吊销节点=即刻断供云端」的目标契约钉成可跑的红绿基线。 | CI node-handshake.yml / node_agent.py | 是 | 2026-10-04 |
+| `scripts/probes/probe_speaker_lock.py` | W5 声纹锁真实语音阈值探针（2026-10-07 接线波）：四把 macOS 嗓音×office 底噪三档 SNR 四臂，钉 0.78/0.65 双阈的「零误杀+纯环境音全判丢」——v1 不分人（C 臂 informational）。 | speaker_lock.py | 是 | 2026-10-07 |
 | `scripts/probes/probe_latency_soak.py` | 多轮多样话术延迟测试台（2026-09-17）：真实客户多轮×每轮不同措辞，量「讲到出声」。 | 4 脚本 import / test_latency_soak_report.py | 是 | 2026-10-03 |
 | `scripts/probes/probe_llm_cache.py` | LLM 缓存命中探针：一通电话内连续多轮真实对话，逐消息指纹定位 cached 分叉（TTFT 回归调查工具）。 | DELIVERY-MANUAL.md | 是 | 2026-09-23 |
 | `scripts/probes/probe_llm_contention.py` | LLM 同卡争用微基准(2026-09-24):4B prefill 单飞 vs 9B 并行时的往返膨胀。 | 无(手动) | 是 | 2026-09-26 |

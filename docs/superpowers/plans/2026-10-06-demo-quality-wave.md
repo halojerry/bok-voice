@@ -189,6 +189,9 @@ join 后 1 秒 participant disconnect——浏览器侧重连/刷新/网络抖�
   「非人声+人声但不是他」两类；③与回声守卫/键盘检测叠加不互斥（多层纵深）。
 - 验收：播环境音/旁人说话素材 10 段零成轮（账本无幻觉轮）；本人语音 0 误杀；
   开关关闭=逐字节旧路径（`test_forward_env` 立法注册）。
+  **⚠ 2026-10-07 第四波实弹改判**：「旁人声冒充」v1 嵌入做不到（真语音异人
+  0.816-0.973 与同人重叠，见执行纪要第四波）——已落地能力=环境音/键盘噪声
+  滤除；认人=v2 ECAPA 独立票。验收面同步缩为「环境音段零成轮+本人 0 误杀」。
 
 ## W6 · 全程环境音轨：可拔插场景底噪（P2，demo 真实感）
 
@@ -348,6 +351,26 @@ audition symlink 在 CP Docker web-build stage 悬空→真文件直发（CI 修
   ②风暴后首真回复被 REPEAT_GUARD 误杀（33 字投诉回复 REPEAT_GUARD_CANCEL_DROP
   ——跨轮复读账本在风暴 ack 弹幕语境下过严，考虑风暴窗内不进账本或豁免段）。
 - 四语双向候选（按语种分 ASR 车道，MiniMax 伪流式无热词）仍为独立评估票。
+
+**第四波（session-20261007-121244-fcc1，W5 接线+真语音阈值实弹）**：
+- `SegmentSpeakerGate` 接线件进 speaker_lock.py：每 VAD 段早期判定（1.5s 前缀含
+  VAD 前导，一次性 admit 缓存）、段末登记钩（`has_enroll_text`≥4 实词字符防幻听
+  锚噪声）、DROP/RELOCK/ENROLL 打点单源。**豆包线**（`_DoubaoLiveStream`：
+  START 起段/`_feed` 停喂 WS/`_maybe_interim` 抑制/END 镜像收线窗整段吞+关会话
+  止损/段末登记）与**本地线**（`_Qwen3ASRLiveStream`：INFERENCE_DONE 不进
+  `_pending` 不喂 sidecar、END+`_hold_flush` 两路镜像抑制+登记）同挂；agent.py
+  装配点每通一把双路传入（总闸关=两车道字节零漂移，缺省）。测试三面
+  （gate 单测 9/豆包 3/本地线 3）+全量 **4905 passed**。
+- **真语音阈值实弹翻案（关键勘误）**：probe_speaker_lock（四把 macOS 嗓音×
+  office 底噪 12/6/0dB）实测——同人净 0.940-0.995、同人+0dB 底噪 ≥0.859、纯
+  office 底噪 0.694-0.697、**异人嗓音 0.816-0.973 与同人带噪重叠**：合成素材的
+  0.03-0.14 异人分离度**不迁移**，v1 白化 mel 统计嵌入**只分语音/非语音、不分人**。
+  缺省阈值重标 0.55/0.40→**0.78/0.65**（旧值真语音上连纯底噪 0.69 都放行=恒
+  no-op）；探针 PASS=零误杀+纯环境音 3/3 判丢+端到端活。**能力边界改判**：v1=
+  环境音/键盘噪声滤除（15c712aa 原始痛点覆盖），「旁人声冒充」需 v2 ECAPA-ONNX
+  （独立票：ensure 可选档+单点换 embed_pcm，接线全不动）。
+- W5 验收面更新：`BOK_SPEAKER_LOCK=1` 实弹一通（观测 SPEAKER_LOCK_ENROLL 后播
+  环境音段验证零幻听轮）留下窗；模块 docstring/测试头已带勘误段防旧口径回流。
 
 **第二波待办**（合流后）：
 - 实弹剧本验收：barge_in 基线不变 + 短应承/假打断连发探针轮 + `MINIMAX_TTS_ZERO_AUDIO_PAD` 频率观测 + `BOK_AMBIENT_SCENE=callcenter` 实弹一通 + 挂断 10 通零 DataStreamError。

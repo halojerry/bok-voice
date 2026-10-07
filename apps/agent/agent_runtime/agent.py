@@ -65,6 +65,7 @@ class WatchdogTimeoutError(RuntimeError):
 # fail-open 结构性零退化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env。
 from .fillers import FillerDirector, derive_context_bucket, intent_category_hint
 from .ambience import AmbienceLoopPlayer, resolve_scene
+from .speaker_lock import SpeakerLock, gate_enabled as speaker_lock_enabled
 from .laya_judge import (
     build_qa_state,
     decide_qa_match,
@@ -4436,6 +4437,12 @@ async def entrypoint(ctx):
     # E1 词表按**本通通话语言**分域(2026-09-21 批次 3):繁体形错误形态(集運 类)在
     # cantonese 通话里是正确写法,不分域改就是双向伤害。装配期定死,每轮零语言判断。
     _snippet_merged = compile_snippet_rules(lang=greet_lang)
+    # W5 声纹锁（BOK_SPEAKER_LOCK 默认关）：每通一把、豆包/本地两 ASR 车道共用——
+    # 首个确证语音段（≥4 实词字符的 FINAL）登记通话对象，之后 VAD 段在 pre-ASR
+    # 段级把门（环境音/旁人声不喂 ASR 不成轮；总闸关=两车道字节零漂移）。
+    _speaker_lock = SpeakerLock()
+    if speaker_lock_enabled():
+        print("[agent] speaker_lock on (BOK_SPEAKER_LOCK=1)", flush=True)
     _use_doubao = asr_provider_name in ("doubao", "doubao_asr")
     _doubao_key = str(asr_cfg.get("api_key") or "").strip()
     _doubao_old_auth = bool(str(asr_cfg.get("app_id") or "").strip()) and bool(
@@ -4457,6 +4464,7 @@ async def entrypoint(ctx):
             language_state=asr_language_state,
             hotword_terms=list(_hotword_terms),
             vad_=vad_provider,
+            speaker_lock=_speaker_lock,
         )
         print(
             f"[agent] asr=doubao (cloud SAUC, resource={stt_provider._resource_id})",
@@ -4494,7 +4502,7 @@ async def entrypoint(ctx):
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
             # PREFLIGHT(抢跑 prefill) 事件;停嘴仍整句高精度转写(官方 StreamAdapter
             # 骨架的 partial 增强版)。QWEN3_ASR_STREAM=0 回退纯离线。
-            stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
+            stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider, speaker_lock=_speaker_lock)
         else:
             stt_provider = stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
     # GPU 竞态专项:仅 Live 包装可调会话级 partial 档(流式路径独有)；云档（豆包）

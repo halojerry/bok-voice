@@ -40,6 +40,8 @@ from urllib.parse import urlsplit
 
 from livekit.agents import APIConnectOptions, stt, utils, vad
 
+from ..speaker_lock import SegmentSpeakerGate
+
 # ---- 常量 ----
 DOUBAO_WS_DEFAULT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 # 官方推荐 2.0（seedasr）；1.0（bigasr）为历史版本——两者四臂矩阵实测同输出，
@@ -181,6 +183,7 @@ class DoubaoSTT(stt.STT):
         language_state=None,
         hotword_terms: list[str] | None = None,
         vad_=None,
+        speaker_lock=None,
         connect_timeout: float = _CONNECT_TIMEOUT_S,
         final_timeout: float = _FINAL_TIMEOUT_S,
     ):
@@ -207,6 +210,8 @@ class DoubaoSTT(stt.STT):
             dict.fromkeys(str(t).strip() for t in (hotword_terms or []) if str(t).strip())
         )
         self._vad = vad_
+        # W5 声纹锁（BOK_SPEAKER_LOCK 默认关）：每通一把、装配点传入；None=零行为。
+        self._speaker_lock = speaker_lock
         self._connect_timeout = float(connect_timeout)
         self._final_timeout = float(final_timeout)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
@@ -378,6 +383,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._session_error = ""
         self._finishing = False
         self._saw_last = False           # 本段是否收到服务端末包（正常定稿）
+        # W5 声纹门（总闸关=零行为）：VAD 段 pre-ASR 把门，drop 段不发包不成轮。
+        self._gate = SegmentSpeakerGate(getattr(stt_, "_speaker_lock", None))
         # 会话状态
         self._ws = None
         self._send_q: asyncio.Queue | None = None
@@ -498,6 +505,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
     def _maybe_interim(self, text: str) -> None:
         if not text or text == self._last_interim_emitted:
             return
+        if self._gate.dropped:
+            return  # 声纹门已判丢：interim 也不外泄（喂 LLM 抢跑/字幕全免）
         # PrefillSpeculator 稳定前缀喂点（A 线对偶件 2026-10-07）：与上一 interim
         # 的公共前缀=尚未被服务端修订的保守前缀（后续请求 user 文本的稳定头）。
         # 回调异常绝不影响 interim 事件流（镜像 Qwen3 侧挂点纪律）。
@@ -531,6 +540,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._seg_pcm.extend(pcm)
         if len(self._seg_pcm) > _SEG_CAP_BYTES:
             del self._seg_pcm[: len(self._seg_pcm) - _SEG_CAP_BYTES]
+        if not self._gate.feed(pcm):
+            return  # 声纹门判丢：不再喂 WS（服务端空闲，段末关会话整段抑制）
         if self._session_alive and self._send_q is not None:
             self._send_q.put_nowait(pcm)
 
@@ -590,6 +601,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH)
                     )
+                    self._gate.segment_start()
                     await self._open_session()
                     if event.frames:
                         # 前导喂会话（silero prefix padding + min_speech 确认窗帧）
@@ -613,6 +625,15 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         self._finishing = False
                         self._reset_segment()
                         print("DOUBAO_ASR_CLOSING_SAY_SUPPRESS src=segment_eos", flush=True)
+                        continue
+                    # ---- W5 声纹门：本段已判非通话对象 → 整段抑制（镜像收线窗语义：
+                    # 不发 EOS、不 finish、不重试、不出 FINAL；关会话止损）。----
+                    if self._gate.dropped:
+                        started = False
+                        self._finishing = False
+                        await self._close_session()
+                        self._gate.segment_end("")
+                        self._reset_segment()
                         continue
                     self._finishing = True
                     speech_end_time = (
@@ -641,6 +662,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(cloud)",
                         flush=True,
                     )
+                    # 登记钩：首段确证文本（≥4 实词字符）登记通话对象声纹。
+                    self._gate.segment_end(text)
                     started = False
                     self._finishing = False
                     self._reset_segment()

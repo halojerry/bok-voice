@@ -21,7 +21,10 @@
 音节包络+气息噪声，同人=同 f0/共振峰族不同文本节奏）：
   同人异文本 0.844-0.977 | 异嗓音(f0 130→220/共振峰位移) 0.026-0.136 |
   键盘 click 串 0.046-0.128 | 白噪 -0.32..-0.29 | 同人低通 4k 0.830-0.932。
-  0.55/0.40 双阈在两侧各留 >0.29/>0.26 余量——保守偏不误杀。
+  ⚠ 真语音勘误（同日 probe_speaker_lock）：合成素材的异人分离度不迁移——真嗓音
+  异人 0.816-0.973 与同人带噪重叠（v1 只分语音/非语音，不分人）；缺省阈值已按
+  真语音分布重标 0.78/0.65（纯 office 底噪 ≤0.70 全判丢、合成同人 ≥0.83 仍全
+  放行——本文件全部合成分布断言在新阈值下依旧成立，这就是下面的回归面）。
 """
 
 from __future__ import annotations
@@ -40,10 +43,13 @@ from agent_runtime.speaker_lock import (  # noqa: E402
     DEFAULT_RELOCK_SIM,
     DEFAULT_RELOCK_STREAK,
     ENROLL_MIN_SECONDS,
+    GATE_WINDOW_S,
     SPEAKER_LOCK_ENV,
+    SegmentSpeakerGate,
     SpeakerLock,
     cosine,
     embed_pcm,
+    has_enroll_text,
     speaker_lock_drop_line,
     speaker_relock_line,
 )
@@ -197,9 +203,10 @@ def test_cosine_guards_zero_vector():
 
 
 def test_default_constants_pin():
-    """缺省阈值单源钉死（0.55/0.40/3 为合成标定值，改动须过全部素材断言）。"""
-    assert DEFAULT_DROP_SIM == 0.55
-    assert DEFAULT_RELOCK_SIM == 0.40
+    """缺省阈值单源钉死（0.78/0.65/3=2026-10-07 真语音重标值，改动须过全部素材
+    断言+probe_speaker_lock PASS——见模块 docstring 勘误段）。"""
+    assert DEFAULT_DROP_SIM == 0.78
+    assert DEFAULT_RELOCK_SIM == 0.65
     assert DEFAULT_RELOCK_STREAK == 3
     assert ENROLL_MIN_SECONDS == 1.0
 
@@ -292,8 +299,8 @@ def test_gray_zone_preserves_but_not_counts_streak(gate_on):
     """[relock, drop) 灰区=丢、连击不清零也不计入：[严重,灰,严重,严重] 第 4 段 relock。"""
     anchor = embed_pcm(_A_SEGS[0], SR)
     seq = [
-        _vector_at_cos(anchor, 0.10, seed=11),  # 严重（<0.40）→ 丢，连击 1
-        _vector_at_cos(anchor, 0.50, seed=12),  # 灰区（0.40≤sim<0.55）→ 丢，连击仍 1
+        _vector_at_cos(anchor, 0.10, seed=11),  # 严重（<0.65）→ 丢，连击 1
+        _vector_at_cos(anchor, 0.70, seed=12),  # 灰区（0.65≤sim<0.78）→ 丢，连击仍 1
         _vector_at_cos(anchor, 0.10, seed=13),  # 严重 → 丢，连击 2
         _vector_at_cos(anchor, 0.10, seed=14),  # 严重 → 连击 3 ≥ 3 → relock
     ]
@@ -308,7 +315,7 @@ def test_gray_zone_preserves_but_not_counts_streak(gate_on):
 def test_gray_zone_drop_is_loss_not_pass(gate_on):
     """灰区段必须丢（不喂 ASR）——保守语义的另一面：不确定 ≠ 放行。"""
     anchor = embed_pcm(_A_SEGS[0], SR)
-    lock = _StubEmbedLock([_vector_at_cos(anchor, 0.52, seed=21)], relock_streak=3)
+    lock = _StubEmbedLock([_vector_at_cos(anchor, 0.72, seed=21)], relock_streak=3)
     lock.enroll(_A_SEGS[0])
     assert lock.admit(b"x") == (False, "drop")
 
@@ -396,3 +403,155 @@ def test_admit_returns_reason_enum():
     lock.enroll(_A_SEGS[0])
     reasons = {lock.admit(pcm)[1] for pcm in _A_SEGS[1:] + _B_SEGS[:2] + _KB_SEGS[:1]}
     assert reasons <= {"enroll", "hit", "drop", "relock"}
+
+
+# ---------------------------------------------------------------- 7. SegmentSpeakerGate（接线件）
+
+def _chunks(pcm: bytes, chunk_s: float = 0.2) -> list[bytes]:
+    step = max(2, int(chunk_s * SR) * 2)
+    return [pcm[i : i + step] for i in range(0, len(pcm), step)]
+
+
+def test_has_enroll_text_gates_hallucination_fragments():
+    assert has_enroll_text("嗯。") is False            # 单语气词：幻听高危碎片
+    assert has_enroll_text("") is False
+    assert has_enroll_text("   。！？") is False        # 纯标点空白
+    assert has_enroll_text("abc") is False              # 3 实词差一个
+    assert has_enroll_text("你好我是陈大文") is True
+    assert has_enroll_text("打打键盘的声音") is True     # 长幻听照样过（文本门只防短碎片）
+
+
+def test_segment_gate_none_lock_passthrough():
+    gate = SegmentSpeakerGate(None)
+    gate.segment_start()
+    assert all(gate.feed(c) for c in _chunks(_A_SEGS[0])) is True
+    assert gate.dropped is False
+    assert len(gate._buf) == 0  # lock=None 零累积
+    gate.segment_end("你好世界")  # no-op 不炸
+
+
+def test_segment_gate_env_off_zero_cost(gate_off):
+    """总闸关：feed 恒放行、零累积、段末不登记（缺省档字节零行为）。"""
+    gate = SegmentSpeakerGate(SpeakerLock())
+    gate.segment_start()
+    assert all(gate.feed(c) for c in _chunks(_A_SEGS[0])) is True
+    assert len(gate._buf) == 0
+    gate.segment_end("你好我是陈大文")
+    assert gate.lock.enrolled is False
+
+
+def test_segment_gate_enroll_on_confirmed_text(gate_on, capsys):
+    """首段：窗内放行（未登记），段末凭确证文本登记并打点。"""
+    gate = SegmentSpeakerGate(SpeakerLock())
+    gate.segment_start()
+    assert all(gate.feed(c) for c in _chunks(_A_SEGS[0])) is True
+    gate.segment_end("喂你好我是陈大文")
+    assert gate.lock.enrolled is True
+    assert "SPEAKER_LOCK_ENROLL" in capsys.readouterr().out
+
+
+def test_segment_gate_enroll_requires_text_and_duration(gate_on):
+    gate = SegmentSpeakerGate(SpeakerLock())
+    gate.segment_start()
+    for c in _chunks(_A_SEGS[0]):
+        gate.feed(c)
+    gate.segment_end("嗯。")  # 无确证文本：不登记
+    assert gate.lock.enrolled is False
+    gate.segment_start()
+    gate.feed(_A_SEGS[1][: int(0.6 * SR) * 2])  # <1s：时长不够
+    gate.segment_end("你好我是陈大文")
+    assert gate.lock.enrolled is False
+
+
+def test_segment_gate_drop_cross_voice_and_recover(gate_on, capsys):
+    """登记 A 后：B 段在判定窗处翻转 False、后续恒 False、段末清态；A 段照常。"""
+    gate = SegmentSpeakerGate(SpeakerLock())
+    gate.segment_start()
+    for c in _chunks(_A_SEGS[0]):
+        assert gate.feed(c) is True
+    gate.segment_end("你好我是陈大文")
+    capsys.readouterr()
+
+    gate.segment_start()
+    verdicts = [gate.feed(c) for c in _chunks(_B_SEGS[0])]
+    assert False in verdicts                       # 窗处翻转
+    assert verdicts[-1] is False                   # 翻转后恒 False
+    assert gate.dropped is True
+    gate.segment_end("")
+    assert gate.dropped is False                   # 段末清态
+    out = capsys.readouterr().out
+    assert "SPEAKER_LOCK_DROP" in out
+    assert speaker_lock_drop_line(0.05, 1.5).startswith("SPEAKER_LOCK_DROP")
+
+    gate.segment_start()                           # A 段照常放行（hit）
+    assert all(gate.feed(c) for c in _chunks(_A_SEGS[1])) is True
+
+
+def test_segment_gate_short_segment_never_judged(gate_on):
+    """< 判定窗的段（「嗯」类 backchannel）结构性不判=放行（fail-open 不误杀）。"""
+    gate = SegmentSpeakerGate(SpeakerLock())
+    gate.segment_start()
+    for c in _chunks(_A_SEGS[0]):
+        gate.feed(c)
+    gate.segment_end("你好我是陈大文")
+    gate.segment_start()
+    assert int(GATE_WINDOW_S * SR) * 2 <= len(_A_SEGS[0])  # 标定段确在窗上（前提自检）
+    short_b = _B_SEGS[0][: int(GATE_WINDOW_S * SR) * 2 - 3200]  # 恒差 0.2s 进不了窗
+    assert all(gate.feed(c) for c in _chunks(short_b)) is True
+    assert gate.dropped is False
+
+
+def test_segment_gate_judges_once_per_segment(gate_on):
+    class _CountingLock(SpeakerLock):
+        n_embeds = 0
+
+        def _embed(self, pcm):
+            type(self).n_embeds += 1
+            return super()._embed(pcm)
+
+    lock = _CountingLock()
+    gate = SegmentSpeakerGate(lock)
+    gate.segment_start()
+    for c in _chunks(_A_SEGS[0]):
+        gate.feed(c)
+    gate.segment_end("你好我是陈大文")
+    gate.segment_start()
+    for c in _chunks(_A_SEGS[1]):
+        gate.feed(c)
+    gate.segment_end("第二句话")
+    gate.segment_start()
+    for c in _chunks(_B_SEGS[0]):
+        gate.feed(c)  # 判丢
+    gate.segment_end("")
+    assert lock.n_embeds == 2  # 每段恰一次：hit 段 1+drop 段 1（enroll 直调
+    # embed_pcm 不经 _embed 钩、首段未登记 admit 在 _embed 前返回——都不计）
+
+
+def test_segment_gate_relock_after_streak(gate_on, capsys):
+    """连续严重不匹配段数到 relock_streak：触发段放行、打点 SPEAKER_RELOCK after=3。"""
+    centroid = embed_pcm(_A_SEGS[0])
+    vecs = [_vector_at_cos(centroid, 0.05, 900 + i) for i in range(3)]
+    lock = _StubEmbedLock(vecs)
+    assert lock.enroll(_A_SEGS[0])
+    gate = SegmentSpeakerGate(lock)
+
+    for _ in range(2):  # 前两段严重不匹配：drop（streak 1→2，未到 3）
+        gate.segment_start()
+        verdicts = [gate.feed(c) for c in _chunks(_B_SEGS[0])]
+        assert verdicts[-1] is False
+        assert gate.dropped is True
+        gate.segment_end("")
+        assert gate.dropped is False
+    out = capsys.readouterr().out
+    assert "SPEAKER_LOCK_DROP" in out
+    assert "SPEAKER_RELOCK" not in out
+
+    gate.segment_start()  # 第 3 段：触发重锁——触发段即新锚，放行
+    verdicts = [gate.feed(c) for c in _chunks(_B_SEGS[0])]
+    assert verdicts[-1] is True
+    assert gate.dropped is False
+    gate.segment_end("")
+    out = capsys.readouterr().out
+    assert "SPEAKER_RELOCK after=3" in out
+    assert "SPEAKER_LOCK_DROP" not in out
+    assert lock.enrolled is True

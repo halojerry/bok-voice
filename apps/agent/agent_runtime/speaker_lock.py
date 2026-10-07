@@ -16,16 +16,19 @@ log 域两件处理的目的：相对地板保证无 -inf 且对录音增益完�
 同人 0.99 与异人/噪声 0.8+ 挤在一起没有分离度，归零后只留带间相对形状——
 共振峰/谐波结构说话，白噪/键盘噪声塌向近零向量）。
 
-**v1 精度边界（明账）**：这是统计声纹，不是神经声纹（resemblyzer/ECAPA 级）——
-①区分「同一说话人 vs 键盘噪声/白噪/另一把基频共振峰不同的嗓音」够用（合成素材
-下同人/异人/噪声的相似度分布钉在 tests/test_speaker_lock.py）；②跨信道（蓝牙
-耳机带宽受限）与强噪声底会拉低同人相似度——阈值保守设置+强烈偏向不误杀：段太短
-/未登记/总闸关一律放行（fail-open），只有「已登记且相似度明确低于 drop 阈」才丢；
-③非司法级，不防录音回放/变声欺骗。
-
-**v2 升级路径**：若实弹误杀率高（同人相似度掉进 drop 阈以下），换 ECAPA-TDNN
-ONNX 小模型（CPU 每段 ~20ms，模型入 ensure 可选档不默认下载）——单点替换
-``embed_pcm`` 即可，cosine/门状态机/接线全部不动。
+**v1 精度边界（2026-10-07 真语音实弹改判，probe_speaker_lock 四把 macOS 嗓音×
+office 底噪三档 SNR）**：白化 mel 统计嵌入在真嗓音上**只分「语音 vs 非语音」，
+不分「谁在说话」**——同人净音频 0.940-0.995、同人+底噪(0dB SNR) ≥0.859、纯
+office 底噪段 0.694-0.697、**异人嗓音 0.816-0.973 与同人带噪区间重叠**（男女声
+之间也 0.85+；早期手搓谐波栈素材的 0.03-0.14 异人分离度**不迁移**到真嗓音，
+已勘误）。因此 v1 的诚实能力=**环境音/键盘噪声滤除**（Ethan 的原始痛点：
+call-15c712aa 键盘噪声被 ASR 幻听成轮），阈值按真语音分布重标 0.78/0.65；
+**「旁人声冒充通话对象」的区分需要 v2 神经声纹**（ECAPA-TDNN ONNX，CPU 每段
+~20ms，模型入 ensure 可选档；单点替换 :func:`embed_pcm`，cosine/门状态机/
+接线全部不动——那是独立票，落地前勿对本模块抱「认人」预期）。跨信道（蓝牙
+带宽受限）会拉低同人相似度——阈值保守+强烈偏向不误杀：段太短/未登记/总闸关
+一律放行（fail-open），只有「已登记且相似度明确低于 drop 阈」才丢；非司法级，
+不防录音回放/变声欺骗。
 
 接线点建议（本模块零 agent.py 改动，接线任务后置；doubao 与本地 ASR 两路同挂）::
 
@@ -57,11 +60,13 @@ import numpy as np
 # 总闸（唯一 env 读取面；已注册 _FORWARD_ENV，test_forward_env 扫描面内）。
 SPEAKER_LOCK_ENV = "BOK_SPEAKER_LOCK"
 
-# 默认阈值（构造参数缺省单源；0.55/0.40/3 为合成素材标定值，见
-# tests/test_speaker_lock.py 与交付报告——同人段相似度 ≥0.8、异人/噪声 <0.4，
-# 0.55/0.40 两档留足余量且强烈偏向不误杀）。
-DEFAULT_DROP_SIM = 0.55
-DEFAULT_RELOCK_SIM = 0.40
+# 默认阈值（构造参数缺省单源；**2026-10-07 真语音重标**——probe_speaker_lock
+# 四嗓音实测：同人+0dB 底噪 ≥0.859 | 纯 office 底噪 0.694-0.697 | 异人 0.816-0.973
+# （与同人重叠=不可分，见上「v1 精度边界」）。0.78/0.65=噪声上界与带噪同人下界
+# 的居中，两侧 ≥0.08 余量；能力=环境音滤除，非认人。旧 0.55/0.40 系手搓合成
+# 素材标定值，真语音上连纯底噪 0.69 都放行=恒 no-op，已废）。
+DEFAULT_DROP_SIM = 0.78
+DEFAULT_RELOCK_SIM = 0.65
 DEFAULT_RELOCK_STREAK = 3
 # enrollment 最短段（spec 定案：<1s 拒绝登记）。
 ENROLL_MIN_SECONDS = 1.0
@@ -213,6 +218,9 @@ class SpeakerLock:
         self.sample_rate = int(sample_rate)
         self._centroid: np.ndarray | None = None
         self._severe_streak = 0
+        # 观测位（打点用，admit 每次嵌入时刷新；relock 触发时刻的连击数）。
+        self.last_sim: float | None = None
+        self.last_relock_streak: int = 0
 
     @property
     def enrolled(self) -> bool:
@@ -240,12 +248,14 @@ class SpeakerLock:
         if vec is None:
             return (True, "enroll")  # 段太短不可嵌入：fail-open
         sim = cosine(vec, self._centroid)
+        self.last_sim = sim
         if sim >= self.drop_sim:
             self._severe_streak = 0
             return (True, "hit")
         if sim < self.relock_sim:
             self._severe_streak += 1
             if self._severe_streak >= self.relock_streak:
+                self.last_relock_streak = self._severe_streak
                 self._centroid = vec  # 重锁=触发段即新锚
                 self._severe_streak = 0
                 return (True, "relock")
@@ -257,3 +267,117 @@ class SpeakerLock:
             return embed_pcm(pcm, self.sample_rate)
         except ValueError:
             return None
+
+
+def gate_enabled() -> bool:
+    """总闸公开面（与 :func:`_gate_enabled` 同一读取点；装配层打点用）。"""
+    return _gate_enabled()
+
+
+def has_enroll_text(text: str, min_chars: int = 4) -> bool:
+    """登记文本门：实词字符（字母/数字，CJK 象形文字 ``isalnum`` 亦真）≥ min_chars。
+
+    防键盘/环境噪声的 ASR 幻听短碎片（「嗯。」「哒。」）把锁锚到噪声上——首段
+    要登记，必须真说了话。标点/空白不计。
+    """
+    n = 0
+    for ch in text or "":
+        if ch.isalnum():
+            n += 1
+            if n >= min_chars:
+                return True
+    return False
+
+
+# 早期判定窗（墙钟秒，含 VAD 前导 padding）：段首攒够即做**一次** admit 判定。
+# 1.5s 的取法=扣除 silero 前导 ~0.5-0.6s 后净语音 ~0.9s——与标定素材（≥1s 语音段）
+# 同量级；更短的窗判定材料不足（误杀通话对象=最坏结局，宁晚勿错），更长的窗
+# 泄漏 interim/已喂音频增多。短于窗的段（「嗯」类 backchannel）结构性不判=放行。
+GATE_WINDOW_S = 1.5
+
+
+class SegmentSpeakerGate:
+    """Per-VAD-段早期声纹门（豆包/本地两 ASR 车道共用接线件，2026-10-07 W5 接线波）。
+
+    车道侧三调用点契约::
+
+        START_OF_SPEECH:  gate.segment_start()
+        每块段内 PCM:      ok = gate.feed(pcm)   # False=判非通话对象：丢这块且
+                                                 # 本段剩余恒 False（调用方不喂 ASR）
+        END_OF_SPEECH 后:  gate.segment_end(text) # 正常段=登记钩（首段确证文本）；
+                                                 # 被丢段传 ""（只清段态）
+
+    行为铁律：
+    - ``lock`` 为 None 或总闸关 → ``feed`` 恒 True、零累积零 DSP（缺省档字节零漂移）；
+    - 判定**一次性**：段首攒够 ``window_s`` 即 admit 一次并缓存判定——同段不重判
+      （VAD 段=单人连续话流，中途换人不建模）；
+    - 未登记段恒放行（SpeakerLock.admit 语义）；登记只发生在**段末**且要求
+      ``has_enroll_text(text)``（首段真说话才算「确证语音」，防幻听锚噪声）；
+    - 打点单源：DROP/RELOCK/ENROLL 三行全从这里出，车道不再各自 print。
+    """
+
+    def __init__(
+        self,
+        lock: SpeakerLock | None,
+        *,
+        window_s: float = GATE_WINDOW_S,
+        sample_rate: int = 16000,
+    ) -> None:
+        self.lock = lock
+        self.window_s = float(window_s)
+        self.sample_rate = int(sample_rate)
+        self._window_bytes = max(1, int(self.window_s * self.sample_rate) * 2)
+        self._buf = bytearray()
+        self._dropped = False
+        self._verdict = ""
+        self._off = True  # segment_start 按总闸实况翻（恒守 admit 的 env 语义）
+
+    @property
+    def dropped(self) -> bool:
+        """本段是否已判丢（END 分支据此整段抑制：不发 EOS/FINAL、关会话、reset）。"""
+        return self._dropped
+
+    def segment_start(self) -> None:
+        """VAD START：清段态并按总闸实况决定本段是否把门。"""
+        self._buf.clear()
+        self._dropped = False
+        self._verdict = ""
+        self._off = self.lock is None or not _gate_enabled()
+
+    def feed(self, pcm: bytes) -> bool:
+        """段内音频块把门；False=判非通话对象（本段后续恒 False，调用方丢块）。"""
+        if self._dropped:
+            return False
+        if self._off:
+            return True
+        self._buf.extend(pcm)
+        if self._verdict or len(self._buf) < self._window_bytes:
+            return True  # 已判放行 / 未攒够判定窗
+        ok, reason = self.lock.admit(bytes(self._buf))
+        self._verdict = reason
+        if not ok:
+            self._dropped = True
+            print(
+                speaker_lock_drop_line(
+                    self.lock.last_sim if self.lock.last_sim is not None else 0.0,
+                    len(self._buf) / (2.0 * self.sample_rate),
+                ),
+                flush=True,
+            )
+        elif reason == "relock":
+            print(speaker_relock_line(self.lock.last_relock_streak), flush=True)
+        return ok
+
+    def segment_end(self, text: str) -> None:
+        """段末收口：正常段吃登记钩（首个确证文本段），随后清段态。"""
+        try:
+            if self._off or self._dropped or self.lock is None:
+                return
+            if not self.lock.enrolled and _gate_enabled() and has_enroll_text(text):
+                dur_s = len(self._buf) / (2.0 * self.sample_rate)
+                if dur_s >= ENROLL_MIN_SECONDS and self.lock.enroll(bytes(self._buf)):
+                    print(f"SPEAKER_LOCK_ENROLL dur={dur_s:.1f}s chars={len(text)}", flush=True)
+        finally:
+            self._buf.clear()
+            self._dropped = False
+            self._verdict = ""

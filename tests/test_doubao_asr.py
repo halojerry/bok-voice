@@ -377,3 +377,123 @@ def test_live_retry_on_connect_fail(monkeypatch):
     finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
     assert finals == ["重试全文"]
     assert calls["n"] == 2  # live 连接失败 → 整段单发重试一次
+
+
+# ---- W5 声纹门（BOK_SPEAKER_LOCK，默认关；长 PCM 段驱动器）--------------------
+
+from agent_runtime.speaker_lock import SpeakerLock  # noqa: E402
+from test_speaker_lock import _A_SEGS, _B_SEGS  # noqa: E402
+
+
+async def _drive_segment_pcm(stt: DoubaoSTT, vad: _FakeVad, pcm: bytes) -> list[tuple[str, str]]:
+    """与 _drive_segment 同骨架，但喂整段长 PCM（preroll 0.5s + 0.2s 窗逐块）——
+    判定窗 1.5s 需要真长段才能跨越。"""
+    stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if vad.streams:
+            break
+    vs = vad.streams[-1]  # 同一 FakeVad 多次驱动：取本流（基类每流新 vad.stream()）
+    got: list[tuple[str, str]] = []
+
+    async def _collect() -> None:
+        try:
+            while True:
+                ev = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+                text = ev.alternatives[0].text if getattr(ev, "alternatives", None) else ""
+                got.append((ev.type.name, text))
+        except (asyncio.TimeoutError, StopAsyncIteration):
+            return
+
+    collector = asyncio.create_task(_collect())
+    preroll_n = int(0.5 * 16000) * 2
+    vs.q.put_nowait(
+        _ev(da.vad.VADEventType.START_OF_SPEECH, frames=[types.SimpleNamespace(data=pcm[:preroll_n])])
+    )
+    await asyncio.sleep(0.02)
+    rest = pcm[preroll_n:]
+    for i in range(0, len(rest), 6400):
+        vs.q.put_nowait(
+            _ev(da.vad.VADEventType.INFERENCE_DONE, frames=[types.SimpleNamespace(data=rest[i : i + 6400])])
+        )
+        await asyncio.sleep(0.01)
+    vs.q.put_nowait(_ev(da.vad.VADEventType.END_OF_SPEECH))
+    await asyncio.sleep(0.4)
+    stream._input_ch.close()
+    try:
+        await asyncio.wait_for(collector, 3)
+    except asyncio.TimeoutError:
+        collector.cancel()
+    await stream.aclose()
+    return got
+
+
+def _audio_frames_sent(ws) -> int:
+    return sum(1 for f in ws.sent if parse_server_frame(f)["type"] == MSG_AUDIO_ONLY_REQ
+               and (parse_server_frame(f)["seq"] or 0) > 0)
+
+
+def test_speaker_lock_gate_drops_cross_voice_segment(monkeypatch, capsys):
+    """登记 A 后 B 段：判定窗处停发音频、EOS/FINAL/interim 全抑制、关会话止损；
+    紧接的 A 段照常出 FINAL（门不误杀通话对象）。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("BOK_SPEAKER_LOCK", "1")
+    calls = _make_connect(monkeypatch, connect_fail=False, full_text="键盘幻听不该成轮")
+    vad = _FakeVad()
+    lock = SpeakerLock()
+    assert lock.enroll(_A_SEGS[0])
+    stt = DoubaoSTT(api_key="k", vad_=vad, speaker_lock=lock)
+
+    events = asyncio.run(_drive_segment_pcm(stt, vad, _B_SEGS[1]))
+    names = [n for n, _ in events]
+    # EOS/FINAL 全被吞；INTERIM 只允许判定窗前的泄漏（1.5s 前本就放行）
+    assert names[0] == "START_OF_SPEECH", names
+    assert "END_OF_SPEECH" not in names and "FINAL_TRANSCRIPT" not in names, names
+    assert names.count("INTERIM_TRANSCRIPT") <= 1, names
+    assert "SPEAKER_LOCK_DROP" in capsys.readouterr().out
+    # 判定窗后停发：音频包 ≤ 窗内量（1.5s≈8 包 200ms），远小于整段 1.6s+preroll
+    assert _audio_frames_sent(calls["ws"]) <= 8
+    assert calls["ws"].closed is True  # 段末关会话止损
+
+    # 同一把锁：A 段照常（hit，不误杀）
+    events = asyncio.run(_drive_segment_pcm(stt, vad, _A_SEGS[2]))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["键盘幻听不该成轮"]  # fake 服务端文本（内容无关紧要，FINAL 要出）
+    assert calls["ws"] is not None
+
+
+def test_speaker_lock_enroll_on_first_confirmed_text(monkeypatch, capsys):
+    """首段（未登记=放行）出 FINAL 后凭确证文本登记；随后异嗓音段被丢。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("BOK_SPEAKER_LOCK", "1")
+    _make_connect(monkeypatch, connect_fail=False, full_text="你好我系陈大文啊")
+    vad = _FakeVad()
+    lock = SpeakerLock()
+    assert lock.enrolled is False
+    stt = DoubaoSTT(api_key="k", vad_=vad, speaker_lock=lock)
+
+    events = asyncio.run(_drive_segment_pcm(stt, vad, _A_SEGS[0]))
+    assert [t for n, t in events if n == "FINAL_TRANSCRIPT"] == ["你好我系陈大文啊"]
+    assert lock.enrolled is True
+    assert "SPEAKER_LOCK_ENROLL" in capsys.readouterr().out
+
+    events = asyncio.run(_drive_segment_pcm(stt, vad, _B_SEGS[2]))
+    names = [n for n, _ in events]
+    assert names[0] == "START_OF_SPEECH", names  # 已登记 → 异嗓音整段抑制
+    assert "FINAL_TRANSCRIPT" not in names and "END_OF_SPEECH" not in names, names
+
+
+def test_speaker_lock_env_off_byte_identical(monkeypatch, capsys):
+    """总闸关（缺省）：同一把锁传入，异嗓音段照旧走全链路出 FINAL=零行为。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.delenv("BOK_SPEAKER_LOCK", raising=False)
+    _make_connect(monkeypatch, connect_fail=False, full_text="正常出稿")
+    vad = _FakeVad()
+    lock = SpeakerLock()
+    lock.enroll(_A_SEGS[0])
+    stt = DoubaoSTT(api_key="k", vad_=vad, speaker_lock=lock)
+
+    events = asyncio.run(_drive_segment_pcm(stt, vad, _B_SEGS[0]))
+    assert [t for n, t in events if n == "FINAL_TRANSCRIPT"] == ["正常出稿"]
+    out = capsys.readouterr().out
+    assert "SPEAKER_LOCK_DROP" not in out and "SPEAKER_LOCK_ENROLL" not in out
