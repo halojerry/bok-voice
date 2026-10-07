@@ -83,6 +83,7 @@ from .capacity import capacity_snapshot, format_limit_detail
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .errors import (
     ConflictError as PipelineConflictError,
+    PipelineError as PipelineBaseError,
     UnavailableError as PipelineUnavailableError,
     register_pipeline_error_handler,
 )
@@ -107,6 +108,7 @@ from . import ops_metrics
 from . import qa_digest as qa_digest_mod
 from . import qa_drift
 from . import silence_poke
+from . import voice_tag_pass as voice_tag_pass_mod
 from .model_routing_detect import detect_local as detect_local_endpoints
 from .auth import (
     Identity,
@@ -5935,6 +5937,44 @@ def template_revisions(template_id: str, request: Request) -> list[dict]:
     _gate_page(request, "templates")
     deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     return _repo().list_template_revisions(template_id)
+
+
+@app.post("/api/templates/{template_id}/voice-tags")
+def template_voice_tag_pass(template_id: str, request: Request) -> dict:
+    """authoring-time 语气标记 pass(2026-10-07):LLM 给步文案/开场白/收尾拼白名单
+    语气标记,**只回 draft JSON、零 DB 写**——前端把 draft 应用到编辑器表单
+    (未保存态),人类审阅后自己走既有 PUT 保存(镜像「检测本地端点」按钮的
+    draft-only 先例,绝不自动保存)。
+
+    闸链与 PUT /api/templates/{id} 逐字对齐:gate_page + deny_cross_account +
+    deny_foreign_owner(edit=True)。LLM 走 mining 车道(编排单点
+    voice_tag_pass.generate_draft);失败/超时=PipelineError 502 带 stage,
+    **绝不 500**(镜像 model-routing /test 的「informational 面不外抛」纪律)。
+    审计 template.voice_tag_pass(detail 只记 counts/模型名,不落稿文)。
+    """
+    _gate_page(request, "templates")
+    tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    try:
+        draft = voice_tag_pass_mod.generate_draft(tpl)
+    except voice_tag_pass_mod.VoiceTagPassError as exc:
+        raise PipelineBaseError(
+            f"语气标记生成失败: {exc}", stage="template.voice_tag_pass", status_code=502
+        ) from exc
+    _audit(
+        "template.voice_tag_pass",
+        subject_type="template",
+        subject_id=template_id,
+        account_id=tpl.get("account_id", ""),
+        detail={
+            "name": tpl.get("name", ""),
+            "changed": int(draft.get("changed") or 0),
+            "lines": int(draft.get("lines") or 0),
+            "draft_only": True,
+        },
+    )
+    return draft
 
 
 @app.delete("/api/templates/{template_id}")

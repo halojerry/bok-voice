@@ -1557,6 +1557,21 @@
    "reason": ""
   },
   {
+   "path": "/api/templates/{template_id}/voice-tags",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "template_voice_tag_pass",
+   "gates": [
+    "page",
+    "account",
+    "owner"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
    "path": "/api/token",
    "methods": [
     "POST"
