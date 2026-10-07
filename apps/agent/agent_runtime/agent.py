@@ -1765,6 +1765,24 @@ def _storm_ack_line(lang: str) -> str:
     return "好，您先说，我在听。"
 
 
+def _storm_reclaim_line(lang: str) -> str:
+    """风暴到期回收语(2026-10-07 死气窗票):静默时钟到点、客户停嘴无新轮 →
+    把话轮拿回来的邀请(区别于 ack 的「你讲」方向——到期时客户已讲完,该我答)。"""
+    if lang == "cantonese":
+        return "好，你講完嘅話，我嚟答你。"
+    if lang == "en":
+        return "Okay — if you're done, I'll answer now."
+    return "好的，您讲完的话，我来答复您。"
+
+
+def _storm_expiry_resume_enabled() -> bool:
+    """到期自清 timer 总闸(2026-10-07 死气窗票):旧语义=过期只在下一用户轮
+    惰性求值,客户停嘴则 agent 无限静默直至 nudge 误诊 no_response 挂断。
+    =1(缺省)=engage/续期处 arm timer,quiet_s 到点自清+回收线;0=回旧惰性行为。
+    nudge 风暴让位同受此闸(风暴活期间 silence-nudge 整体让位给 expiry timer)。"""
+    return os.environ.get("BOK_INTERRUPT_STORM_EXPIRY_RESUME", "1") == "1"
+
+
 def _storm_prune(ts: list[float], now: float, window_s: float) -> list[float]:
     """风暴滚动窗:只留 window_s 内的打断时刻(纯函数,单测用)。"""
     return [t for t in ts if now - t <= window_s]
@@ -4056,6 +4074,51 @@ async def entrypoint(ctx):
     _starve: dict = {"n": 0}
     _assistant_out: dict = {"on": True}  # assistant 轮出现即置位(item_added)
     _had_user_turn: dict = {"on": False}
+
+    # 2026-10-07 死气窗票:风暴到期自清 timer。旧语义 active_until 过期只在下一
+    # 用户轮惰性求值(_storm_on_turn 的 resume 分支)——客户讲完停嘴则无新轮可求
+    # 值,agent 无限静默;12s silence-nudge 接管并按「无响应」升级到 farewell+
+    # no_response 挂断(刚讲完一大段的客户被误诊)。timer 在 engage 与每个静听轮
+    # 续期处重拨,quiet_s 到点自清+回收线把话轮拿回来(say_script 车道不进风暴
+    # 计数);迟到 fire 撞上已清态=no-op。BOK_INTERRUPT_STORM_EXPIRY_RESUME=0 关。
+    _storm_expiry_task: dict = {"task": None}
+
+    def _cancel_storm_expiry() -> None:
+        _t = _storm_expiry_task["task"]
+        if _t is not None and not _t.done():
+            _t.cancel()
+        _storm_expiry_task["task"] = None
+
+    def _arm_storm_expiry(delay_s: float) -> None:
+        _cancel_storm_expiry()
+
+        async def _fire() -> None:
+            await asyncio.sleep(max(0.1, float(delay_s)))
+            if closed.is_set() or agent.paused:
+                return
+            _now = time.monotonic()
+            if not _storm.get("active_until", 0.0) or not _storm_active(_storm["active_until"], _now):
+                return  # 已被用户轮 resume/cap 清掉——timer 迟到 no-op
+            _storm["ts"] = []
+            _storm["rounds"] = 0
+            _storm["active_until"] = 0.0
+            _starve["n"] = 0
+            print(
+                f"[storm] expiry-resume (quiet timer {float(delay_s):.0f}s) (call {room_name})",
+                flush=True,
+            )
+            try:
+                _line = _storm_reclaim_line(language_state.lang)
+                _register_reply_lane(lane="storm-reclaim", text=_line, history=False)
+                await _say_script(session, tts_provider, _tts_cache, _line, add_to_chat_ctx=False)
+                await _ledger_ack_line("storm-reclaim", _line)
+            except Exception as exc:  # noqa: BLE001 - 回收线失败唔阻清态
+                print(f"[storm] reclaim say failed: {exc!r}", flush=True)
+
+        try:
+            _storm_expiry_task["task"] = asyncio.create_task(_fire())
+        except RuntimeError:
+            return  # 无事件循环(纯单测态)——静默不 arm
 
     def _cancel_wa_accum_flush() -> None:
         task = _wa_accum.get("task")
@@ -6900,6 +6963,7 @@ async def entrypoint(ctx):
                 if _verdict == "resume":
                     # 过期/到顶:清账已在纯函数内,starve 归零保恢复首轮完整生成。
                     _starve["n"] = 0
+                    _cancel_storm_expiry()  # 用户轮先到=timer 冗余,收掉
                     print(
                         f"[storm] resume (过期或轮数到顶,恢复完整生成) (call {room_name})",
                         flush=True,
@@ -6907,6 +6971,10 @@ async def entrypoint(ctx):
                     # 唔 raise——落穿回正常轮路径,本轮客户开口先拿真回复。
                 else:
                     _cancel_response_watchdog()  # 风暴静听=有意静默/短承接即出声
+                    if _storm_expiry_resume_enabled():
+                        # 到期钟随续期重拨(active_until=now+quiet_s 同刻)——
+                        # 客户停嘴则钟到点自清+回收线,死气窗闭合。
+                        _arm_storm_expiry(_STORM_QUIET_S)
                     _facts["storm_rounds"] += 1  # W4-T2 意向账本:静听轮消费(ack/listen 均)
                     _sm_rounds = int(_storm.get("rounds", 0))
                     if _verdict == "ack":
@@ -8739,6 +8807,13 @@ async def entrypoint(ctx):
                 return
             if _action == "stop":
                 return
+            # 2026-10-07 死气窗票:风暴静听期间 silence-nudge 整体让位——客户刚被
+            # 让过话轮,静默≠无响应(升级到 farewell+no_response 会把讲完停嘴的
+            # 客户误诊挂断);expiry timer 到点自清+回收线后先回到本路径。让位不
+            # 拆錶:短周期复查重挂,风暴一清 nudge 照常接管。
+            if _storm_active(_storm.get("active_until", 0.0), now) and _storm_expiry_resume_enabled():
+                _nudge_state["timer"] = asyncio.create_task(_fire(_NUDGE_RECHECK_S))
+                return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
             if _nudge_state["count"] >= nudge_max or (flow_ctrl.has_steps and flow_ctrl.done):
@@ -8907,6 +8982,8 @@ async def entrypoint(ctx):
                 ):
                     _storm["active_until"] = now + _STORM_QUIET_S
                     _storm["rounds"] = 0
+                    if _storm_expiry_resume_enabled():
+                        _arm_storm_expiry(_STORM_QUIET_S)  # 到期钟从 engage 起拨
                     print(
                         f"[storm] engage n={len(_storm['ts'])}/{_STORM_THRESHOLD} in "
                         f"{_STORM_WINDOW_S:.0f}s -> listen mode (call {room_name})",
@@ -9129,6 +9206,7 @@ async def entrypoint(ctx):
         await closed.wait()
     finally:
         watch_task.cancel()
+        _cancel_storm_expiry()  # 死气窗票:挂断时收掉到期钟(防迟发回收线)
         # W1g-agent 挂断顺序化(2026-10-06 demo-quality wave):session 关闭后、
         # 退房(job teardown)前,先等在途房间数据流(垫话字幕 stream_text 等)
         # 收尾——半开的 transcription 流=浏览器 DataStreamError 直接源头、
