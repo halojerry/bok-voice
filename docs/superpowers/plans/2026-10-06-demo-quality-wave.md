@@ -471,6 +471,24 @@ Dante 族）进 `device-roles` 单源；console realMic/realOut 双过滤硬排�
   meHeld 闸原生覆盖防串译）；e2e I2 断言翻案（me **应**听到译文音轨）；
   AGENTS/DELIVERY-MANUAL 同步。
 
+**B 线「A 线化」+MT 切 DeepSeek（2026-10-08 晨定案，PR #216/#217）**：
+- 定案依据：三 subagent 调研 + 框架 1.8.2 源码验证——manual FIFO 保留（播报中
+  新用户轮只有打断/丢弃，agent_activity L2774-2783，译员语义框架不提供=合法分叉）；
+  交付侧收敛 A 线（`session.say()` 原生吃 AsyncIterable 流式文本；字幕先出=
+  RoomIO `sync_transcription=False`）。
+- **Wave 1 已落地（#217）**：mt 车道 openai 档指令化（去 StatelessMTLLM 模板
+  包裹——system 指令曾被丢=ASR 纠错锁死）；`_translation_instructions` 纠错行
+  （结合上下文修同音误听/绝不虚构不硬译碎片）；kill-switch
+  `BOK_INTERP_MT_CLOUD_INSTRUCT=0` 回旧模板；`_FORWARD_ENV` 266→267。
+  mt 车道已 PUT 切 DeepSeek（deepseek-flash）。**实弹验收**：e2e 8/8（含双向
+  出声 I2/I6）；纠错实证「我成鸟解下」→ en "interested"/canto「我想了解下你哋
+  嘅產品」、「知道我讲话」→"Can you hear me"、「极度买的快递」→「急件」；
+  与 #216 确定性层叠加（极度买→寄出来 pre-MT）。**延迟代价**：mt 腿 250ms(本地)
+  →冷单发 ~950ms / 管内预热 avg 655ms（超/贴 800 预算）——Wave 2 流式 say
+  预计收回 0.3-0.5s。回切=CP 一次 PUT mt→local。
+- **Wave 2-4 见执行计划**（流式 say+字幕先出+LagLedger 源句级+INTERP_LAG 加列
+  →碎片闸→豆包 utterances gated→变体表生长/spec 命中率）。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，
