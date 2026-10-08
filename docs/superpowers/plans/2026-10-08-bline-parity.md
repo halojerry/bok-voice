@@ -157,3 +157,25 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   posture 闸（mt_local=False 跳过,同 :1235/:1237 姿势）。
 - **BOK_AMBIENT_SCENE 移除（用户指令）**：环境音轨污染探针 captured 判据
   （57s 房间底噪被当译文音频）;栈已按无 ambient 重启。
+
+## 执行纪要·追加二（2026-10-08 深夜,DeepSeek 流式归因+外部调研）
+
+- **归因探针入仓**：`scripts/probes/probe_deepseek_stream.py`（chat 流式/
+  Responses API 流式/非流式三形状逐 delta 计时+TTFB 基线+缓存臂;SSRF 白名单
+  单点=probe_voice_style_gate 同款;Responses API 思考开关=reasoning.effort
+  "none"——不传默认思考全开,烧光 max_output_tokens 纯 reasoning_text.delta
+  零 output_text,首版探针翻车点）。
+- **归因结论（23:15 轻载档）**：网络腿 TTFB 233-291ms（非瓶颈）；chat 流式
+  **真流式**——首 delta 358-600ms、delta 展宽 125-214ms、整段 565-842ms；
+  Responses API 同档（521-600 首 delta,无速度差,不换端点）；**晚峰 20:48 的
+  first_ms≈mt_ms 整包缓冲=提供商时段性行为**（同一端点同一 payload,轻载
+  恢复逐 delta）——「网络/编排/没想到」三选一的答案是第三项:时段性服务
+  行为。缓存:155-162 tok 短 prompt 重复请求 cached=0（磁盘缓存不命中
+  小 prompt,非杠杆）。生成速度本身快(21-37 字 125-242ms),瓶颈=首 token
+  排队+prefill。
+- **缓解面**：spec 投机（已修,MT 在说话时预跑,提交即播）；厂商同传源码
+  （m芯片/金喜同传,subagent 调研）佐证我们的形状（子句提交+增量喂 TTS）
+  与其 IncrementalInputPlanner 等价；**可偷新件=播放侧六级追帧**（水位
+  心跳→1.05-1.35x 变速追帧替代弃音,FFT 相位声码器）与**专用翻译端点**
+  （厂商 qwen-mt-flash 首字 265-448ms;火山 doubao-seed-translation 候选,
+  凭据已在手）——两票待拍板。
