@@ -631,7 +631,7 @@ def _mt_stream_say_enabled() -> bool:
 # 刀=我们的生成器按「子句边界 或 N 字」早放**纯文本**——MiniMax bidi 插件内部
 # 本就带 A 线同款 `_first_chunk_cut`+head-flush(BOK_TTS_FIRST_CHUNK_CHARS,
 # 对 say 流同样生效),吃到无标点头段即自行 task_flush 催产合成(地板 210-
-# 340ms)。**热修 2026-10-08:首版误 yield FlushSentinel——哨兵属 generate/
+# 340ms)。**热修 2026-10-08:首版误向 say 流产哨兵——哨兵属 generate/
 # llm_node 车道,say() 签名 AsyncIterable[str] 不认,消费端被非 str 项噎住
 # (e2e I6「gen not drained」实证);早放纯文本即全部所需,哨兵删除。**
 # N 缺省 6=A 线耳测定档;切点铁闸复用 A 线 _first_chunk_cut(数字/拉丁 run
@@ -703,7 +703,7 @@ async def _mt_stream_say(
                 # W0-2 首 chunk 早交:无标点也按字数硬切(A 线铁闸)早放文本——
                 # MiniMax bidi 插件内部的 `_first_chunk_cut`+head-flush(A 线同款,
                 # BOK_TTS_FIRST_CHUNK_CHARS 对 say 流同样生效)吃到文本即催产合成。
-                # (热修 2026-10-08:此前误 yield FlushSentinel——哨兵属 generate/
+                # (热修 2026-10-08:此前误向 say 流产哨兵——哨兵属 generate/
                 # llm_node 车道,say() 签名 AsyncIterable[str] 不认,消费端被非
                 # str 项噎住=e2e I6「gen not drained」;早放纯文本即全部所需。)
                 if first and n0 > 0:
