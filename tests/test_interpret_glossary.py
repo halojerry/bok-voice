@@ -994,3 +994,31 @@ def test_spec_wait_default_evening_deepseek():
     finally:
         if saved is not None:
             os.environ["BOK_INTERP_SPEC_WAIT_S"] = saved
+
+
+def test_mt_fatal_provider_error_classifier():
+    """W1-② 402 短路分类器:余额/鉴权=致命;超时/429/系统资源不足=瞬态不命中。"""
+    import asyncio
+
+    assert interpret._mt_fatal_provider_error(
+        RuntimeError("HTTP 402 — Insufficient Balance")
+    ) in ("insufficient balance", "402")
+    assert interpret._mt_fatal_provider_error(Exception("401 unauthorized")) != ""
+    assert interpret._mt_fatal_provider_error(Exception("invalid api key provided")) != ""
+    # 瞬态:绝不标记死道(重试有意义)
+    assert interpret._mt_fatal_provider_error(asyncio.TimeoutError()) == ""
+    assert interpret._mt_fatal_provider_error(RuntimeError("429 rate limit")) == ""
+    assert interpret._mt_fatal_provider_error(
+        RuntimeError("finish_reason=insufficient_system_resource")
+    ) == ""
+    assert interpret._mt_fatal_provider_error(ConnectionError("reset by peer")) == ""
+
+
+def test_mt_lane_dead_wiring_pins():
+    """W1-② 接线 pin:死道快败+告警行+spec 并门+Sentry 每通去重+B 线 init。"""
+    assert "_mt_lane_dead" in INTERP_SRC
+    assert "[interp] MT_LANE_DEAD reason=" in INTERP_SRC
+    assert 'if _mt_lane_dead["reason"]:' in INTERP_SRC
+    assert 'or _mt_lane_dead["reason"]' in INTERP_SRC  # spec busy 闸并门
+    assert "_sentry_event(" in INTERP_SRC  # 超时/死道/兜底事件上报
+    assert '_init_sentry("agent-worker")' in INTERP_SRC  # B 线此前从未初始化

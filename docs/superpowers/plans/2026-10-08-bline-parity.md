@@ -214,3 +214,21 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   （阈值无关，音频层）——FIFO 层 carry 治不了它。正确落点=provider VAD
   边界处理，独立票。
 - 验收：test_interp_w3bfix 11 绿 + 全量 **5049 passed/4 skipped**。
+
+## W1-② 收官（2026-10-08 深夜）
+
+- **402 黑洞短路**：`_mt_fatal_provider_error` 分类器（余额/鉴权=致命；429/超时/
+  insufficient_system_resource=瞬态不命中）+ `_mt_say_worker` 死道快败（后续句
+  零 provider 走兜底）+ spec busy 闸并门。观测 `[interp] MT_LANE_DEAD reason=`
+  （告警 grep 键）。
+- **Sentry 扩捕获（用户疑问定案）**：DSN 在/SDK 在/worker+CP 均已初始化——但
+  捕获面只有 2 点（看门狗+背景 judge），且 **B 线 interpret 入口从未
+  init_sentry**。本波：interpret 入口 init + `_sentry_event`（每通去重）挂
+  MT_TIMEOUT_FALLBACK/MT_LANE_DEAD/mt fail 三类；A 线 REPEAT_GUARD 掐句与
+  CP famine 翻转的捕获面随 W2 波后补（避免与 W2 的 agent.py 改动冲突）。
+- **方舟 MT 专模判死**（ARK key 已到）：`doubao-seed-translation-250915` 仅
+  Responses 端点（chat/completions 拒认）；**粤语目标语=InternalServiceError、
+  zh-HK=不支持、en 可用但非流式整包 2.7s**（顺丰→Shunfeng 未吃术语）——主用
+  普粤对不可用，MT 臂出局。方舟通用 DeepSeek 模型需控制台开通（账号当前全
+  404「或无权限」）。DeepSeek 官方留任待晚峰终判。
+- 全量 5040 passed/4 skipped。
