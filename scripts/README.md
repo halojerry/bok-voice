@@ -96,6 +96,8 @@
 | `scripts/probes/probe_interp_backlog.py` | B 线播放背压实弹探针（P2 `_PlaybackBacklog`，2026-09-16）。 | test_probe_backlog_count.py import / test_probe_backlog_count.py | 是 | 2026-10-02 |
 | `scripts/probes/probe_interp_continuous.py` | B 线「边说边译」连续语流探针（2026-09-17 长度触发子句提交验收）。 | test_probe_stimulus.py / security/mimosa/suppressions.json | 是 | 2026-09-21 |
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
+| `scripts/probes/probe_deepseek_stream.py` | DeepSeek 流式真伪归因探针（2026-10-08）：chat 流式/Responses API/非流式三形状逐 delta 计时+TTFB+缓存臂;Responses 思考开关=reasoning.effort "none"。 | test_scripts_index.py | 是 | 2026-10-08 |
+| `scripts/probes/probe_interp_spec_live.py` | B 线投机翻译实弹探针（2026-10-08 spec 复活验收）：多子句刺激（TTS 逗号停顿挤压到 VAD 静音线内=真人形状）→fire/CLAUSE_COMMIT/defer 日志判据。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_late_mic.py` | B 线差分探针:延迟麦克风发布 vs 即时发布(call-72112fd7 复现器)。 | 无(手动) | 是 | 2026-09-30 |
 | `scripts/probes/probe_interp_pause_commit.py` | B 线 vad-pause 提交字数门槛 A/B 探针(2026-10-06 `_pause_commit_min_chars` 评估)——子句+0.7s 真停顿刺激,量译文首声对停顿起点 lag。 | 无(手动) | 是 | 2026-10-06 |
 | `scripts/probes/probe_interpret_latency.py` | B 线同传延迟探针（P1 评测体系,2026-09-16）——逐句感知 lag,版本回归用。 | 2 脚本 import / agent interpret.py | 是 | 2026-09-19 |

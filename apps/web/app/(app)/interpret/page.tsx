@@ -5,8 +5,7 @@ import InterpretConsole from "@/components/interpret-console";
 import { useAccount } from "@/components/account-context";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
-import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
-import { buildVoiceSelectOptions } from "@/lib/voice-options";
+import { parseVoiceMap, primaryVoiceFor } from "@/lib/voice-map";
 
 /**
  * 双端同声传译(B 线 v2)——坐席一体台单模式(2026-09-12 用户拍板:同传只保留
@@ -44,48 +43,47 @@ export default function InterpretPage() {
   const { accountId: ACCOUNT } = useAccount();
   const [myLang, setMyLang] = useState("zh");
   const [otherLang, setOtherLang] = useState("en");
-  // 会话级音色(2026-09-17):我方/对方语言各选一把 MiniMax 音色,空=跟随设置。
-  const [myVoice, setMyVoice] = useState("");
-  const [otherVoice, setOtherVoice] = useState("");
-  // MiniMax 云端克隆音色（路线 B）：全语言槽可选（克隆音色无语言绑定）。
-  const [cloneVoices, setCloneVoices] = useState<Array<{ voice_id: string; label?: string }>>([]);
-  useEffect(() => {
-    api.listMinimaxVoices()
-      .then((rows) => setCloneVoices(rows.map((r) => ({ voice_id: String(r.voice_id ?? ""), label: r.label ? String(r.label) : undefined }))))
-      .catch(() => setCloneVoices([]));
-  }, []);
-  // 人设音色复用（2026-10-08）：建单可绑人设——未手动选音色的语言槽用人设的
-  // reference_audio 音色（A 线同一份解析，链位=手动音色 > 人设 > 设置 > 默认）。
-  const [personas, setPersonas] = useState<Array<{ id: string; name?: string }>>([]);
-  const [personaId, setPersonaId] = useState("");
+  // 音色=人设预设（2026-10-08 用户拍板统一）：我方/对方各选一个人设,声音跟
+  // 人设走（reference_audio 整场主音色,A 线同款 collapse）——不再有独立于
+  // 人设的音色目录下拉（此前「人设音色」+「我方/对方音色」=两套选择器,且
+  // 目录按语言切换与人设预设对不上）。配音语义：我说的译文用我的声(对方
+  // 听),对方说的译文用对方的声(我听)——每人说话保持自己的声音。
+  const [personas, setPersonas] = useState<Array<Record<string, unknown>>>([]);
+  const [myPersonaId, setMyPersonaId] = useState("");
+  const [otherPersonaId, setOtherPersonaId] = useState("");
   useEffect(() => {
     api.listPersonas()
-      .then((rows) => setPersonas(rows.map((r) => ({ id: String(r.id ?? ""), name: r.name ? String(r.name) : undefined }))))
+      .then((rows) => setPersonas(Array.isArray(rows) ? rows : []))
       .catch(() => setPersonas([]));
   }, []);
+  /** 人设 → 整场主音色（lib/voice-map 单源解析,与 A 线 agent 收敛同规则）。 */
+  function personaVoice(id: string): string {
+    const p = personas.find((r) => String(r.id ?? "") === id);
+    if (!p) return "";
+    return primaryVoiceFor(String(p.language ?? "zh"), parseVoiceMap(p.reference_audio));
+  }
+  function personaLabel(p: Record<string, unknown>): string {
+    const name = String(p.name ?? "") || String(p.id ?? "");
+    const voice = primaryVoiceFor(String(p.language ?? "zh"), parseVoiceMap(p.reference_audio));
+    return voice ? `${name} · ${voice}` : `${name}（未设音色）`;
+  }
   const [glossary, setGlossary] = useState("");
   const [callId, setCallId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** 会话级音色下拉：首项=跟随设置 + MiniMax 静态目录 + 云端克隆（全语言槽可选，
-   *  匹配槽位语言的克隆置顶）——装配统一走 lib/voice-options.buildVoiceSelectOptions。 */
-  function voiceOptions(lang: string) {
-    return buildVoiceSelectOptions({
-      catalog: MINIMAX_VOICE_ENTRIES,
-      slotLang: lang,
-      minimaxClones: cloneVoices,
-      firstOption: { value: "", label: "（默认，跟随设置）" },
-    });
-  }
-
   async function startConsole() {
     setError(null);
     setBusy(true);
     try {
+      // 配音语义映射：我方人设声=对方语言槽(对方听我说的话),对方人设声=
+      // 我方语言槽(我听对方说的话)。voices_json 键=B 线七语(_norm_lang 已
+      // 收 de/fr/ja/pt),不选人设的槽=跟随设置页分语言音色。
       const voices: Record<string, string> = {};
-      if (myVoice) voices[myLang] = myVoice;
-      if (otherVoice) voices[otherLang] = otherVoice;
+      const myV = personaVoice(myPersonaId);
+      const otherV = personaVoice(otherPersonaId);
+      if (myV) voices[otherLang] = myV;
+      if (otherV) voices[myLang] = otherV;
       const created = await api.createCall({
         account_id: ACCOUNT,
         object_id: "",
@@ -96,7 +94,6 @@ export default function InterpretPage() {
         target_lang: otherLang,
         glossary,
         voices_json: Object.keys(voices).length ? JSON.stringify(voices) : "",
-        persona_id: personaId,
       });
       const id = String((created as { id?: string }).id ?? "");
       if (!id) {
@@ -134,14 +131,7 @@ export default function InterpretPage() {
         <div className="flex gap-3">
           <label className="flex flex-1 flex-col gap-1 text-xs">
             <span className="muted">我方讲</span>
-            <select
-              className="select"
-              value={myLang}
-              onChange={(e) => {
-                setMyLang(e.target.value);
-                setMyVoice(""); // 语言换了,音色目录跟着换,旧选择重置
-              }}
-            >
+            <select className="select" value={myLang} onChange={(e) => setMyLang(e.target.value)}>
               {SOURCE_LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
@@ -151,14 +141,7 @@ export default function InterpretPage() {
           </label>
           <label className="flex flex-1 flex-col gap-1 text-xs">
             <span className="muted">对方讲</span>
-            <select
-              className="select"
-              value={otherLang}
-              onChange={(e) => {
-                setOtherLang(e.target.value);
-                setOtherVoice("");
-              }}
-            >
+            <select className="select" value={otherLang} onChange={(e) => setOtherLang(e.target.value)}>
               {TARGET_LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
@@ -169,37 +152,28 @@ export default function InterpretPage() {
         </div>
         <div className="flex gap-3">
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="muted">我方音色（可选，rev 双向出声开启时为我方译文声）</span>
-            <select className="select" value={myVoice} onChange={(e) => setMyVoice(e.target.value)}>
-              {voiceOptions(myLang).map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
+            <span className="muted">我方人设（我说话的声音——对方听到的译文用它）</span>
+            <select className="select" value={myPersonaId} onChange={(e) => setMyPersonaId(e.target.value)}>
+              <option value="">（跟随设置默认音色）</option>
+              {personas.map((p) => (
+                <option key={String(p.id)} value={String(p.id)}>
+                  {personaLabel(p)}
                 </option>
               ))}
             </select>
           </label>
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="muted">对方音色（可选，对方听到的译文声）</span>
-            <select className="select" value={otherVoice} onChange={(e) => setOtherVoice(e.target.value)}>
-              {voiceOptions(otherLang).map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
+            <span className="muted">对方人设（对方说话的声音——我听到的译文用它）</span>
+            <select className="select" value={otherPersonaId} onChange={(e) => setOtherPersonaId(e.target.value)}>
+              <option value="">（跟随设置默认音色）</option>
+              {personas.map((p) => (
+                <option key={String(p.id)} value={String(p.id)}>
+                  {personaLabel(p)}
                 </option>
               ))}
             </select>
           </label>
         </div>
-        <label className="flex flex-col gap-1 text-xs">
-          <span className="muted">人设音色（可选，未手动选音色的语言槽用人设的音色）</span>
-          <select className="select" value={personaId} onChange={(e) => setPersonaId(e.target.value)}>
-            <option value="">（不绑定）</option>
-            {personas.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name || p.id}
-              </option>
-            ))}
-          </select>
-        </label>
         <label className="flex flex-col gap-1 text-xs">
           <span className="muted">术语表（可选，治专名误听与译名漂移）</span>
           <textarea
@@ -214,7 +188,8 @@ export default function InterpretPage() {
           <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声 + 对方译文的译员耳语</strong>
           （译员耳语默认开，进房后控制台「译员耳语」开关可关）；我方译文播报时自动暂让对方麦克风防串译。
           说话中按句出译文（不必等停嘴）。语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
-          音色优先级=手动选的音色 &gt; 人设音色 &gt; 设置页「分语言音色」&gt; 默认。
+          音色跟人设走（全场同声、跨语言不换声）——我方/对方人设的音色在「人设」页预设（含克隆）；
+          不选人设=跟随设置页「分语言音色」&gt; 默认。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话

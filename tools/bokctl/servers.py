@@ -677,13 +677,22 @@ def _mlx_hf_offline_env() -> dict[str, str]:
     }
 
 
-def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path, posture: dict | None = None) -> bool:
     """B 线同传翻译 LLM(:1236,Hy-MT2 小模型):与主 LLM 分进程,prefill 互不挤占。
 
     可选服务:模型缺失/未下载直接跳过并返回 False(等待方不收 1236,B 线
     interpret 回退主 LLM :1235);端口已健康(serve 重试/生产档拉起)不重复起。
     返回 True = 预期 :1236 会就绪。
+
+    posture=调用方预算的 ``_cloud_posture()`` 结果（2026-10-08 补闸——mt 车道
+    openai 云档却仍因「模型在盘」起 :1236:主树白白常驻一颗闲置本地模型违全云
+    指令,worktree/干净树缺 sidecar venv 直接 FileNotFoundError 打死 serve）。
+    mt_local=False 时整条跳过（BOK_LOCAL_LLM=1 强制回本地档,闸在 posture 里）。
     """
+    p = posture if posture is not None else _cloud_posture()
+    if not p["mt_local"]:
+        print(f"[bok] mt :1236 skipped (cloud: {p['mt_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        return False
     if core.healthy(1236):
         return True
     mt_model = models._mt_llm_model(current)
@@ -1027,7 +1036,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
         print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
 
     _start_llm(current, run_dir, log_dir, posture)
-    want_mt = _start_mt_llm(current, run_dir, log_dir)
+    want_mt = _start_mt_llm(current, run_dir, log_dir, posture)
     want_settle = _start_settle_llm(current, run_dir, log_dir, posture)
     # W1b embedding sidecar(:8789,bge-m3 MLX):意图语义车道可选增强——镜像
     # mt/settle 的「模型在盘才起」姿势;venv/模型/端口三缺一即跳过,agent 装配

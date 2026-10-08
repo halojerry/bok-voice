@@ -963,3 +963,34 @@ def test_mt_stream_say_first_chunk_wiring_pins():
     # 代码级禁令:哨兵不得出现在 say 车道(注释里的热修史料不算)
     assert "yield FlushSentinel" not in INTERP_SRC
     assert "import FlushSentinel" not in INTERP_SRC
+
+
+def test_spec_raw_interim_feed_wiring_pins():
+    """W1×spec 饥饿修复接线 pin(call-21739d55 整通零开火):豆包档 spec 检测器
+    由 provider 原文挂点直喂(会话级 interim 只带剥前缀尾巴=候选第二次目击
+    永远缺失);挂点在位时会话层不重复喂(双喂打乱候选坐标系)。拆挂点/恢复
+    会话层喂法即红。"""
+    assert "raw_interim_listener" in INTERP_SRC
+    assert "stt_provider.raw_interim_listener = spec_ctl.on_interim" in INTERP_SRC
+    assert "_spec_raw_fed" in INTERP_SRC
+    # 防双喂:会话层 interim 分支必须带 raw-fed 让位闸
+    assert "if not _spec_raw_fed:" in INTERP_SRC
+
+
+def test_spec_wait_default_evening_deepseek():
+    """C2 等窗缺省 2.0(晚档 DeepSeek 假流式 542-2131ms 实证,call-21739d55):
+    等待必中体永不劣于兜底(兜底=重新付全价 MT);env 可回旧档。"""
+    import os
+
+    saved = os.environ.pop("BOK_INTERP_SPEC_WAIT_S", None)
+    try:
+        assert interpret._interp_spec_wait_s() == 2.0
+        os.environ["BOK_INTERP_SPEC_WAIT_S"] = "0.6"
+        assert interpret._interp_spec_wait_s() == 0.6
+        os.environ["BOK_INTERP_SPEC_WAIT_S"] = "9"
+        assert interpret._interp_spec_wait_s() == 3.0  # 上限钳
+        os.environ["BOK_INTERP_SPEC_WAIT_S"] = "junk"
+        assert interpret._interp_spec_wait_s() == 2.0
+    finally:
+        if saved is not None:
+            os.environ["BOK_INTERP_SPEC_WAIT_S"] = saved

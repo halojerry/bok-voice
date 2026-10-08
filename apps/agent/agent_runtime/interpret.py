@@ -1619,14 +1619,18 @@ def _interp_clause_commit_enabled() -> bool:
 # 实测:spec miss 主因=not_ready(短句 span fire 离句尾近,held PCM 全量排干
 # 赶不上 final)——sim 已过门=必中体,却立刻 miss 付全价 MT。刀=confirm 时对
 # 必中体有界等待(done_callback 到货即 HIT 零合成直播;超时/失败兜底正常
-# 入队)。等待秒 env 可调,缺省 0.6,钳 [0,3];0=关(旧行为逐字节)。
+# 入队)。等待秒 env 可调,钳 [0,3];0=关(旧行为逐字节)。
+# 缺省 0.6→2.0(2026-10-08 晚档 call-21739d55 复盘):DeepSeek 假流式+晚峰
+# 首 token 542-2131ms、TTS 排干再 +0.5-1s——0.6s 等窗几乎必超时=必中体
+# 白白回落「重新付一遍全价 MT」。等待永不劣于兜底(兜底=从零再跑一次同款
+# MT+TTS),按 MT 晚峰 p95 抬 2.0;env 一键回旧档。
 _SPEC_WAIT_ENV = "BOK_INTERP_SPEC_WAIT_S"
-_SPEC_WAIT_DEFAULT_S = 0.6
+_SPEC_WAIT_DEFAULT_S = 2.0
 _SPEC_WAIT_MAX_S = 3.0
 
 
 def _interp_spec_wait_s() -> float:
-    """必中体等待秒(纯函数,单测直喂):坏值回缺省 0.6;负数钳 0;上限 3.0。"""
+    """必中体等待秒(纯函数,单测直喂):坏值回缺省 2.0;负数钳 0;上限 3.0。"""
     raw = os.environ.get(_SPEC_WAIT_ENV, "")
     try:
         v = float(raw) if raw else _SPEC_WAIT_DEFAULT_S
@@ -1833,7 +1837,11 @@ class _SpecMtDetector:
     候选=interim 文本里「最后边界标点收尾的前缀」;同一候选跨 ≥2 次 interim
     不变(或首见后 ≥0.5s)判稳定。开火后记账 last_spec,再开火须比它长 ≥6 字
     (doubao 累积流=同段渐进;本地尾巴流=候选身份变化即稳定性重计,天然防
-    坐标系切换误开火)。每段预算 reset_segment 清——final 到达即切段。"""
+    坐标系切换误开火)。每段预算 reset_segment 清——final 到达即切段。
+    字数门口径(2026-10-08 饥饿修复随刀)=len(cand) 含边界标点,与 W1 提交闸
+    ``_find_clause_cut`` 的 len(sentence)≥6 同口径——「坐地铁到啊，」(5 正字+1
+    标点)提交闸放行、投机闸也放行;旧口径剥标点数 5=闸下 miss,同一子句
+    「提交了却不投机」=碎片照样付全价 MT(call-21739d55 第 6 句实证)。"""
 
     MIN_CLAUSE_CHARS = 6
     REFIRE_GROWTH_CHARS = 6
@@ -1856,7 +1864,7 @@ class _SpecMtDetector:
         if not text:
             return None
         cand = _spec_clause_prefix(text)
-        if cand is None or _spec_content_chars(cand) < self.MIN_CLAUSE_CHARS:
+        if cand is None or len(cand) < self.MIN_CLAUSE_CHARS:
             return None
         if _SPEC_DIGIT_RUN_RE.search(cand):
             return None  # 号码高危:数字串 span 永不投机(镜像 flow 数字 run 族)
@@ -2686,18 +2694,30 @@ async def entrypoint(ctx) -> None:
         say_cached=_spec_say_cached,
         enqueue=_spec_enqueue,
     )
+    # W1×spec 饥饿修复(2026-10-08,call-21739d55 整通零开火定案):豆包档
+    # clause-commit 在 interim 更新点先跑、会话级 interim 只带剥前缀尾巴,
+    # spec 检测器候选第二次目击到不了。豆包 STT 改由 provider 原文挂点直喂
+    # (tail+刚提交子句坐标,见 doubao_asr._emit_spec_feed),会话级 interim
+    # **不再重复喂**(防双喂坐标漂移)。本地 ASR 无挂点=旧会话级喂法逐字节。
+    _spec_raw_fed = False
+    if _spec_on and hasattr(stt_provider, "raw_interim_listener"):
+        stt_provider.raw_interim_listener = spec_ctl.on_interim
+        _spec_raw_fed = True
+        print("[interp] spec feed=raw-interim (clause-commit coords)", flush=True)
 
     def _on_user_input(ev) -> None:
         # STT 句级 FINAL 是 manual 模式下唯一句子入口(空串过滤);interim 事件
         # 此前直接丢弃——投机翻译(2026-10-06)把它当 detector 输入(kill-switch
         # BOK_INTERP_SPEC_MT=0 时 on_interim/on_final 零动作=旧路径逐字节)。
         # 原文行即时落库,翻译进单消费队列;final 先过投机确认(HIT=held PCM
-        # 直播+余段入队,跳过整句正常路径)。
+        # 直播+余段入队,跳过整句正常路径)。豆包原文挂点在位时 interim 不再
+        # 经会话层喂 spec(挂点已喂,双喂会打乱候选坐标系)。
         text = str(getattr(ev, "transcript", "") or "").strip()
         if not text:
             return
         if not getattr(ev, "is_final", False):
-            spec_ctl.on_interim(text)
+            if not _spec_raw_fed:
+                spec_ctl.on_interim(text)
             return
         last_user["text"] = text
         _spawn_ledger(_add_turn(f"原文：{text}", source_lang))
