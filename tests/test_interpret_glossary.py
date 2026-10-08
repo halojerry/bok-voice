@@ -25,6 +25,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 import agent_runtime.interpret as interpret  # noqa: E402
@@ -737,3 +739,144 @@ def test_mt_stream_say_wiring_pins():
     assert "first_ms={_mt_first.get('ms') or 0}" in INTERP_SRC
     # 回退路径(旧整句 say)保留
     assert "if not _streamed:" in INTERP_SRC
+
+
+# ---- Wave 3a 碎片闸(hold-and-merge) ----
+
+
+class _StubBacklog:
+    """_frag_absorb 单测背压桩:take_source_drops 一次性吐 drops 条。"""
+
+    def __init__(self, drops: int = 0):
+        self._drops = drops
+
+    def take_source_drops(self) -> int:
+        d = self._drops
+        self._drops = 0
+        return d
+
+
+def test_interp_frag_is_ack():
+    """碎片判据:纯语气/纯应承/人称单字/英文应承词=True;实词/数字 run=False。"""
+    assert interpret._interp_frag_is_ack("啊。")
+    assert interpret._interp_frag_is_ack("嗯嗯。")
+    assert interpret._interp_frag_is_ack("你。")
+    assert interpret._interp_frag_is_ack("No.")
+    assert interpret._interp_frag_is_ack("okay.")
+    assert interpret._interp_frag_is_ack("…")  # 纯标点→剥后空
+    assert not interpret._interp_frag_is_ack("我想问一下价格")
+    assert not interpret._interp_frag_is_ack("1234")  # 数字 run 永不闸
+    assert not interpret._interp_frag_is_ack("我唔知")  # 实词
+    assert not interpret._interp_frag_is_ack("the order is 55012")
+
+
+def test_frag_join():
+    """并入保序(碎片恒前):带句界标点=CJK 直连/拉丁补空格;裸碎片补逗号。"""
+    assert interpret._frag_join("啊。", "我想问一下价格") == "啊。我想问一下价格"
+    assert interpret._frag_join("啊", "我想问一下价格") == "啊，我想问一下价格"
+    assert interpret._frag_join("Oh.", "I want to ask") == "Oh. I want to ask"
+    assert interpret._frag_join("oh", "I want to ask") == "oh, I want to ask"
+    assert interpret._frag_join("", "abc") == "abc"
+
+
+def test_frag_hold_s_env(monkeypatch):
+    """调窗:缺省 0.6;坏值回缺省;负钳 0;上限 2.0。"""
+    assert interpret._interp_frag_hold_s() == pytest.approx(0.6)
+    monkeypatch.setenv("BOK_INTERP_FRAG_HOLD_S", "0.25")
+    assert interpret._interp_frag_hold_s() == pytest.approx(0.25)
+    monkeypatch.setenv("BOK_INTERP_FRAG_HOLD_S", "abc")
+    assert interpret._interp_frag_hold_s() == pytest.approx(0.6)
+    monkeypatch.setenv("BOK_INTERP_FRAG_HOLD_S", "-1")
+    assert interpret._interp_frag_hold_s() == 0.0
+    monkeypatch.setenv("BOK_INTERP_FRAG_HOLD_S", "9")
+    assert interpret._interp_frag_hold_s() == pytest.approx(2.0)
+
+
+def test_frag_absorb_merge():
+    """下段在窗内到=并成一句;账本 drop×(N-1) 补偿,锚=末段(内容段)。"""
+
+    async def _run():
+        q = asyncio.Queue()
+        lag = interpret._LagLedger()
+        # 碎片已被 worker 弹出=种子;队列只装后继段(仿真 FIFO 真实状态)
+        lag.note_src("啊。")
+        q.put_nowait("我想问一下价格")
+        lag.note_src("我想问一下价格")
+        merged, n, hold_ms = await interpret._frag_absorb(
+            "啊。", q=q, backlog=_StubBacklog(), lag=lag, hold_s=0.2
+        )
+        return lag, merged, n, hold_ms
+
+    lag, merged, n, hold_ms = asyncio.run(_run())
+    assert merged == "啊。我想问一下价格"
+    assert n == 1
+    assert len(lag._src) == 1 and lag._src[0][1] == len("我想问一下价格")
+    assert hold_ms < 200.0
+
+
+def test_frag_absorb_timeout_flush():
+    """窗内无下段=碎片独立放行(不并),账本零动作。"""
+
+    async def _run():
+        q = asyncio.Queue()
+        lag = interpret._LagLedger()
+        lag.note_src("啊。")
+        return await interpret._frag_absorb("啊。", q=q, backlog=_StubBacklog(), lag=lag, hold_s=0.05)
+
+    merged, n, hold_ms = asyncio.run(_run())
+    assert (merged, n) == ("啊。", 0)
+    assert hold_ms >= 40.0
+
+
+def test_frag_absorb_chain_caps():
+    """链式纯应承碎片:并入段数帽 _FRAG_MAX_ABSORB=3,第 4 起留队列。"""
+
+    async def _run():
+        q = asyncio.Queue()
+        lag = interpret._LagLedger()
+        # 种子碎片已弹出;队列=后继链(嗯。哦。呀。皆应承,我想问价格=内容)
+        lag.note_src("啊。")
+        for t in ("嗯。", "哦。", "呀。", "我想问价格"):
+            q.put_nowait(t)
+            lag.note_src(t)
+        merged, n, _ = await interpret._frag_absorb(
+            "啊。", q=q, backlog=_StubBacklog(), lag=lag, hold_s=0.05
+        )
+        return q, lag, merged, n
+
+    q, lag, merged, n = asyncio.run(_run())
+    assert n == 3
+    assert merged == "啊。嗯。哦。呀。"
+    assert q.qsize() == 1  # 我想问价格 未消费
+    assert len(lag._src) == 2  # drop×3:剩 呀。+我想问价格 两锚
+
+
+def test_frag_absorb_skip_next():
+    """hold 中弹出的下段命中背压摘译:该段照旧 drop(不并入不译),碎片独立放行。"""
+
+    async def _run():
+        q = asyncio.Queue()
+        lag = interpret._LagLedger()
+        for t in ("啊。", "积压句"):
+            q.put_nowait(t)
+            lag.note_src(t)
+        merged, n, _ = await interpret._frag_absorb(
+            "啊。", q=q, backlog=_StubBacklog(drops=1), lag=lag, hold_s=0.2
+        )
+        return lag, merged, n
+
+    lag, merged, n = asyncio.run(_run())
+    assert (merged, n) == ("啊。", 0)
+    assert len(lag._src) == 1  # 积压句被 drop_src,剩碎片自己的锚
+
+
+def test_frag_gate_wiring_pins():
+    """接线 pin:闸位=skip 检查后、t0 前(hold 不进 mt_ms/first_ms 口径);
+    账本补偿全在 _frag_absorb 内;观测行 merge/flush 在场(命中率数据面)。"""
+    assert "if _interp_frag_merge_enabled() and _interp_frag_is_ack(text):" in INTERP_SRC
+    assert "text, _frag_n, _frag_hold_ms = await _frag_absorb(" in INTERP_SRC
+    gate_pos = INTERP_SRC.index("if _interp_frag_merge_enabled() and _interp_frag_is_ack(text):")
+    t0_pos = INTERP_SRC.index("t0 = time.perf_counter()", gate_pos)
+    assert t0_pos > gate_pos
+    assert "INTERP_FRAG merge n=" in INTERP_SRC
+    assert "INTERP_FRAG flush chars=" in INTERP_SRC
