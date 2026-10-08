@@ -816,6 +816,26 @@ _FORWARD_ENV = (
     #    （豆包四语 24/24 幻听实测；MiniMax 24/24 CER≤0.08）总闸（缺省开，
     #    0=回旧装配链逐字节；B 线 worker 专属，_interp_env 透传白名单同键） ——
     "BOK_MINIMAX_ASR",
+    # —— W3b spec busy 闸放宽（2026-10-08，命中率 4/108 主刀）：spec 开火的 FIFO
+    #    深度门（qsize ≥ depth 才算忙）；缺省 2=深度门（正常说话节奏闸恒开），
+    #    1=旧「非空即封」档一键回退；坏值回 2/<1 钳 1；_interp_env 透传白名单同键 ——
+    "BOK_INTERP_SPEC_BUSY_DEPTH",
+    # —— W3b 刀2/刀3（2026-10-08，体检:回声重复 34+26 次/结巴照译）：
+    #    BOK_INTERP_ECHO_DEDUP 本向回声/重复判重总闸（默认 1；0=关回旧行为）；
+    #    BOK_INTERP_ECHO_DUP_WINDOW_S dup-final 判重窗（默认 8.0；坏值回缺省）；
+    #    BOK_INTERP_STUTTER_FIX 确定性结巴折叠（只进 MT 输入副本；默认 1）。
+    #    三键 _interp_env 透传白名单同键。
+    "BOK_INTERP_ECHO_DEDUP",
+    "BOK_INTERP_ECHO_DUP_WINDOW_S",
+    "BOK_INTERP_STUTTER_FIX",
+    # —— W3b 豆包官方三臂（2026-10-08，huoshan SAUC 文档；默认全关、A/B 耳测
+    #    定档；provider 请求体层读取，A/B 线共表）：
+    #    BOK_DOUBAO_NONSTREAM=enable_nonstream 二遍识别（final 更准+spec 确认更稳）；
+    #    BOK_DOUBAO_DDC=enable_ddc 语义顺滑（会剥语气词——与语气标记 v2 冲突，只做臂）；
+    #    BOK_DOUBAO_FIRST_TOKEN_BOOST=enable_accelerate_text+score3 首字加速。
+    "BOK_DOUBAO_NONSTREAM",
+    "BOK_DOUBAO_DDC",
+    "BOK_DOUBAO_FIRST_TOKEN_BOOST",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
@@ -988,6 +1008,14 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # B 线 spec 必中体有界等待 2026-10-08 时效波 C2：缺省 0.6，0=关（旧
         # not_ready 即 miss 档；B 线 worker 专属）。
         "BOK_INTERP_SPEC_WAIT_S",
+        # W3b spec busy 闸放宽 2026-10-08：FIFO 深度门（缺省 2；1=旧非空即封档；
+        # B 线 worker 专属，_FORWARD_ENV 已登记）。
+        "BOK_INTERP_SPEC_BUSY_DEPTH",
+        # W3b 刀2/刀3 2026-10-08：本向回声/重复判重（总闸+判重窗）+结巴折叠
+        #（B 线 worker 专属，_FORWARD_ENV 已登记）。
+        "BOK_INTERP_ECHO_DEDUP",
+        "BOK_INTERP_ECHO_DUP_WINDOW_S",
+        "BOK_INTERP_STUTTER_FIX",
         # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",

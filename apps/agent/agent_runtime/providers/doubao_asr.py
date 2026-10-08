@@ -360,6 +360,20 @@ class DoubaoSTT(stt.STT):
                     {"hotwords": [{"word": t} for t in terms]}, ensure_ascii=False
                 )
             }
+        # W3b 官方三臂（2026-10-08，huoshan SAUC 文档；全部默认关、A/B 耳测定档）：
+        # ① enable_nonstream 二遍识别——句末服务端重识别换更准 final（官方推荐开；
+        #   收益面=ASR 误听下降+spec 确认前缀更稳；改动 final/interim 一致性面，先臂后定）。
+        if os.environ.get("BOK_DOUBAO_NONSTREAM", "") == "1":
+            request["enable_nonstream"] = True
+        # ② enable_ddc 语义顺滑——服务端删停顿词/语气词/重复词（结巴照译的官方版；
+        #   会剥语气词，与 B 线语气标记 v2 冲突 → 只做 A/B 臂，绝不缺省开）。
+        if os.environ.get("BOK_DOUBAO_DDC", "") == "1":
+            request["enable_ddc"] = True
+        # ③ 首字加速——ASR 首个 interim 提前（代价=首字准确率；accelerate_score
+        #   文档「值越大首字越快」，取 3 温和档）。
+        if os.environ.get("BOK_DOUBAO_FIRST_TOKEN_BOOST", "") == "1":
+            request["enable_accelerate_text"] = True
+            request["accelerate_score"] = 3
         return {
             "user": {"uid": "bok-agent"},
             "audio": {"format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1},
