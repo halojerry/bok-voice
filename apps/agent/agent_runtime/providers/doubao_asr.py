@@ -163,6 +163,20 @@ def _ws_host_ok(url: str) -> bool:
     return bool(ip.is_global)
 
 
+def _emit_spec_feed(stt_, feed: str) -> None:
+    """B 线投机翻译原文挂点派发(镜像 stable_prefix_listener 纪律):回调异常
+    绝不影响 interim 事件流;挂点缺席(None)或空文本=零动作。"""
+    if not feed:
+        return
+    cb = getattr(stt_, "raw_interim_listener", None)
+    if cb is None:
+        return
+    try:
+        cb(feed)
+    except Exception as exc:  # noqa: BLE001
+        print(f"BOK_INTERP_SPEC listener error: {exc!r}", flush=True)
+
+
 def _find_clause_cut(
     text: str,
     start: int,
@@ -236,6 +250,15 @@ class DoubaoSTT(stt.STT):
     # （语义镜像 Qwen3ASRLiveSTT 的 PREFLIGHT 挂点：稳定前缀=下一请求 user
     # 文本的保守前缀）。类级缺省 None=零行为。
     stable_prefix_listener = None
+
+    # B 线投机翻译(SpecMt)原文挂点(2026-10-08 W1×spec 饥饿修复,call-21739d55
+    # 定案):interpret.py 按会话覆写。背景=W1 clause-commit 在 interim 更新点
+    # 先跑、会话级 interim 事件只带剥掉已提交前缀的「尾巴」→ spec 检测器候选的
+    # 第二次目击永远到不了(候选首见于 interim k-1,k 时被 commit 剥走)=整通零
+    # 开火。本挂点让流层直接喂「上一提交坐标之后的尾巴+本次刚提交的子句」——
+    # 即与「下一个 FINAL(EOS 尾巴或下一子句)」同坐标系的投机视角,刚提交子句
+    # 恰好构成候选的第二次目击。类级缺省 None=零行为(A 线不设,逐字节旧路)。
+    raw_interim_listener = None
 
     def __init__(
         self,
@@ -627,13 +650,22 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     print(f"BOK_PREFILL_SPEC listener error: {exc!r}", flush=True)
         # 说话中成句（B 线 W1 clause-commit）：闸命中即发 FINAL（说话中 MT 起跑）。
         # 事件序=FINAL(已稳定子句) → INTERIM(未提交剩余)；关旗=零行为逐字节旧路。
+        # spec 原文挂点(饥饿修复)喂「上一提交坐标之后的尾巴+本次刚提交子句」:
+        # 本次 commit **之前**的坐标快照——候选第二次目击恰好在 commit 发生的
+        # 那个 interim 可见(会话级 display 已剥走),而后续 interim 的 spec 视角
+        # 自动回到「下一 FINAL 同坐标系」(余段视角),不会对已提交子句重复开火。
+        _spec_feed = text
         if self._clause_commit:
+            _spec_base = self._cc_committed_len
             self._maybe_clause_commit(text, _prev)
             display = self._clause_tail(text)
+            _spec_feed = text[_spec_base:]
             if not display:
+                _emit_spec_feed(self._stt_, _spec_feed)
                 return  # 已见文本全部提交/对齐重置吞显：本轮无剩余可出
         else:
             display = text
+        _emit_spec_feed(self._stt_, _spec_feed)
         try:
             self._event_ch.send_nowait(
                 stt.SpeechEvent(

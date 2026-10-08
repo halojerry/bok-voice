@@ -69,6 +69,19 @@ def test_spec_content_chars_strips_punct_only():
     assert _spec_content_chars("，。！") == 0
 
 
+def test_detector_threshold_counts_len_incl_boundary_punct():
+    """字数门口径=提交闸同款 len 含边界标点(call-21739d55 第 6 句实证:「坐
+    地铁到啊，」5 正字+1 逗号——提交闸放行、投机闸也须放行;旧剥标点口径
+    数 5=同一子句「提交了却不投机」,碎片照样付全价 MT)。"""
+    det = _SpecMtDetector(clock=lambda: 100.0)
+    assert det.feed("坐地铁到啊，", now=100.0) is None  # 首见
+    assert det.feed("坐地铁到啊，广州去玩", now=100.2) == "坐地铁到啊，"  # 第二次目击即开火
+    # 纯标点+短内容仍挡:「好的，」len 3 < 6
+    det2 = _SpecMtDetector(clock=lambda: 100.0)
+    assert det2.feed("好的，", now=100.0) is None
+    assert det2.feed("好的，请问", now=100.2) is None
+
+
 def test_spec_norm_mirrors_ticket_norm_shape():
     assert _spec_norm("你好，世界！ A") == "你好世界a"
     assert _spec_norm("") == ""

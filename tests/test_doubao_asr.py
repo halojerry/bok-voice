@@ -759,6 +759,58 @@ def test_clause_commit_mid_speech_final(monkeypatch, capsys):
     assert "clause_commits=1" in out
 
 
+def test_clause_commit_raw_interim_listener_feeds_spec_coords(monkeypatch):
+    """W1×spec 饥饿回归钉(call-21739d55 整通零开火):clause-commit 剥前缀的
+    display 让 spec 检测器候选的第二次目击永远缺失。raw_interim_listener 拿到
+    「上一提交坐标之后的尾巴+本次刚提交子句」——commit interim 的 spec 视角仍
+    含刚提交子句(第二次目击可见),后续 interim 回到余段坐标(不对已提交子句
+    重复开火);会话级 interim display 剥离语义逐字节不变。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=["你好呀我想问一下，", "你好呀我想问一下，帮我查下订单"],
+        final_text="你好呀我想问一下，帮我查下订单。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+    seen: list[str] = []
+    stt.raw_interim_listener = seen.append
+
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))
+    # commit interim(第 2 帧):display 已剥成尾巴,spec 视角仍含刚提交子句
+    assert "你好呀我想问一下，帮我查下订单" in seen
+    # definite 定稿帧:回到余段坐标(已提交前缀不再喂)
+    assert seen[-1] == "帮我查下订单。"
+    # 会话级 interim display 语义零漂移(剥前缀尾巴)
+    assert [t for n, t in events if n == "INTERIM_TRANSCRIPT"] == [
+        "你好呀我想问一下，", "帮我查下订单", "帮我查下订单。",
+    ]
+
+
+def test_clause_commit_raw_interim_listener_none_is_noop(monkeypatch):
+    """挂点缺席(None,=A 线/旧测试)=零行为;回调抛异常也不影响 interim 流。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=["你好呀我想问一下，", "你好呀我想问一下，帮我查下订单"],
+        final_text="你好呀我想问一下，帮我查下订单。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+
+    def _boom(_text: str) -> None:
+        raise RuntimeError("listener exploded")
+
+    stt.raw_interim_listener = _boom
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))  # 异常被吞,流照走
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，", "帮我查下订单。"]
+
+
 def test_clause_commit_align_tolerates_punct_revision(monkeypatch, capsys):
     """committed-prefix 对齐·归一化臂：服务端在已提交区改标点（你好呀→你好呀，）
     →归一化前缀对齐容错：已发 FINAL 不重发、剩余尾巴照出、零 RESET。"""

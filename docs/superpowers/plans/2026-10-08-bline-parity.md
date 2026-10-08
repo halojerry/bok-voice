@@ -109,3 +109,38 @@ e2e 8/8；A 线零漂移（旗不传）；402/429 监控（请求变多、缓存
 
 W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pytest+CI+真栈 e2e+
 探针读数；A 线全程零漂移。
+
+## 执行纪要·追加（2026-10-08 晚，call-21739d55 复盘波）
+
+- **W1×spec 结构性饥饿（真因，真人通话实锤）**：Ethan 真人同传「长句切碎+
+  不追嘴」。turns=16 轮全 me 侧；perceived 2977-4742ms；**整通 INTERP_SPEC
+  零开火**（armed 但 silent）。代码序定案：`_maybe_interim` 里 clause-commit
+  先跑、会话级 interim 只带 `_clause_tail` 剥前缀尾巴 → spec 检测器候选首见
+  于 interim k-1、k 时被 commit 剥走=第二次目击永不到场。10-06 spec 实弹
+  在 W1 之前，故当时能命中；W1 部署（10-08）后 spec 全饿死。
+- **第二把刀=字数口径劈叉**：提交闸 len(sentence)≥6 含标点（「坐地铁到啊，」
+  放行）vs spec 闸剥标点数内容字 5<6（不开火）——同一子句「提交了却不投机」，
+  碎片照样付全价 MT。已统一为 len 含边界标点。
+- **第三刀=C2 等窗 0.6→2.0**：晚档 DeepSeek 假流式首 token 542-2131ms+
+  TTS 排干——0.6s 等窗必中体几乎必超时回落「重新付全价 MT」；等待永不劣于
+  兜底。env 可回旧档。
+- **修复形状**：DoubaoSTT 新挂点 `raw_interim_listener`（镜像
+  stable_prefix_listener 纪律）——流层喂「上一提交坐标之后的尾巴+本次刚
+  提交子句」（=下一 FINAL 同坐标系；commit interim 恰构成候选第二次目击，
+  后续自动回余段坐标不重复开火）；interpret 豆包档挂点直喂+会话层 interim
+  让位防双喂；本地 ASR 无挂点=旧喂法逐字节。
+- **音色选择器统一（用户拍板翻案）**：「我方/对方音色」下拉与「人设音色」
+  下拉=两套选择器且与人设预设对不上——砍掉目录下拉+人设下拉，改
+  「我方人设/对方人设」两个选择器，配音语义（我说的译文用我的声、对方说
+  的用对方的声，人设页预设/克隆音色，全场同声跨语言不换声）；voices_json
+  直接按 myLang/otherLang 填（B 线七语 _norm_lang 已收）；web 停发
+  persona_id（worker B2 层保留给 API 派发）。parseVoiceMap/primaryVoiceFor
+  收编 lib/voice-map.ts 单源（personas 页拷贝删除）。
+- **晚档基线读数（fwd zh→canto）**：ASR_MS 233-796 / DeepSeek mt_ms 542-
+  2131（first_ms≈mt_ms 8/8=假流式再证）/ TTS 首 548-1075（cold 1075）/
+  INTERP_BACKLOG depth=2 无 drop；「嗯。」纯应承走 FRAG hold 600ms 超时
+  单发（perceived 3317——产品项：纯应承是否直杀待议）。
+- **验收**：定向三件 119 绿→全量 **5040 passed/2 skipped**（+5：豆包挂点
+  双测+接线 pin+等窗缺省+口径）；web tsc+build 绿+voice-map node 测试 2/2。
+  回退：`BOK_INTERP_SPEC_MT=0`（spec 整链关）或摘挂点（会话层喂法自动回
+  旧路=饥饿形态回归,勿单独摘）；`BOK_INTERP_SPEC_WAIT_S=0.6` 回旧等窗。

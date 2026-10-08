@@ -8,6 +8,7 @@ import { useToast } from "@/components/toast";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
 import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
 import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
+import { parseVoiceMap, primaryVoiceFor } from "@/lib/voice-map";
 import { previewVoice as synthesizePreview } from "@/lib/preview";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "", tts_provider: "" };
@@ -50,25 +51,6 @@ function suggestVoiceFor(
   const match = clonedVoices.find((c) => c.lang === lang);
   if (match) return match.id;
   return speakers?.[0] ?? "";
-}
-
-function parseVoiceMap(raw: unknown): Record<string, string> {
-  if (typeof raw !== "string" || !raw.trim().startsWith("{")) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed as Record<string, string> : {};
-  } catch {
-    return {};
-  }
-}
-
-/** 从语音映射选「整场主音色」：优先人设主语言，缺则 zh→cantonese→首个非空（与 agent 收敛同规则）。 */
-function primaryVoiceFor(lang: string, voiceMap: Record<string, string>): string {
-  const keys = [lang, "zh", "cantonese", "en"];
-  for (const k of keys) {
-    if (voiceMap[k]) return voiceMap[k];
-  }
-  return Object.values(voiceMap)[0] ?? "";
 }
 
 /** 云端单音色保存时写回 reference_audio（沿用 {zh,cantonese,en} 兼容结构，全场同声）。 */
