@@ -780,6 +780,11 @@ _FORWARD_ENV = (
     #    0.2，坏值回 0.2/钳 [0,3]；_interp_env 透传白名单同键；B 线专用） ——
     "BOK_INTERP_UTT_MERGE",
     "BOK_INTERP_UTT_WAIT_S",
+    # —— B 线豆包说话中成句（2026-10-08 W1 clause-commit「跟 A 线一样快」主刀）：
+    #    interim 子句级闸（A 线标点档移植，单点 import 零第二份）命中即发
+    #    FINAL——说话中 MT 起跑；committed-prefix 对齐防重发；0=回「停嘴成句」
+    #    档（B 线专用，A 线装配不传旗；_interp_env 透传白名单同键） ——
+    "BOK_INTERP_CLAUSE_COMMIT",
     # —— B 线 MT 首 chunk 早交（2026-10-08 W0 时效波）：流式 say 首段按字数
     #    硬切 + FlushSentinel（官方硬段边界，MiniMax 立即起合成）；缺省 6=
     #    A 线耳测定档，0=回旧行为；_interp_env 透传白名单同键 ——
@@ -973,6 +978,10 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # 静默到底定稿（总闸缺省开，0=旧路径逐字节；UTT_WAIT_S 调窗，B 线专用）。
         "BOK_INTERP_UTT_MERGE",
         "BOK_INTERP_UTT_WAIT_S",
+        # B 线豆包说话中成句 2026-10-08 W1：interim 子句级闸命中即发 FINAL——
+        # 说话中 MT 起跑（总闸缺省开，0=回「停嘴成句」档；B 线专用，A 线装配
+        # 不传旗；_FORWARD_ENV 已登记）。
+        "BOK_INTERP_CLAUSE_COMMIT",
         # B 线 MT 首 chunk 早交 2026-10-08 W0：FlushSentinel 硬段边界立即合成
         #（缺省 6=A 线耳测定档；0=回旧行为，B 线 worker 专属）。
         "BOK_INTERP_MT_FIRST_CHUNK_CHARS",

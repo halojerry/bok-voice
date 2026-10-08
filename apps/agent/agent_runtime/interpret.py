@@ -1597,6 +1597,20 @@ def _interp_utt_wait_s() -> float:
     return min(max(v, 0.0), _UTT_WAIT_MAX_S)
 
 
+# —— B 线豆包说话中成句（W1 clause-commit，2026-10-08「跟 A 线一样快」主刀）-----
+# interim result.text ~400ms 更新=快车道（W1 调研定案）：子句级闸（A 线
+# _sentence_boundary 标点档移植，provider 内单点 import 零第二份）命中即发
+# FINAL——manual FIFO 的句子入口在说话中就起跑 MT+TTS，不等停嘴。
+# committed-prefix 对齐（剥已提交前缀）防重复；VAD END/尾窗只补未提交尾巴。
+# **B 线专用**（装配点传 clause_commit=True；A 线 agent.py 不传=逐字节旧路）。
+# kill-switch BOK_INTERP_CLAUSE_COMMIT=0 回「停嘴成句」档（_FORWARD_ENV 已登记，
+# _interp_env 透传白名单同键）。限速/字数参数沿 A 线 env（B 线 worker 已收
+# 1.0s/6 字档，见 bokctl env._interp_env 三收紧段）。
+def _interp_clause_commit_enabled() -> bool:
+    """豆包 lane 说话中成句总闸(默认开;0=旧路径逐字节——FINAL 只在停嘴/尾窗到期)。"""
+    return os.environ.get("BOK_INTERP_CLAUSE_COMMIT", "1") == "1"
+
+
 # —— C2·spec not_ready 有界延迟交付(2026-10-08 时效波) --------------------------
 # 实测:spec miss 主因=not_ready(短句 span fire 离句尾近,held PCM 全量排干
 # 赶不上 final)——sim 已过门=必中体,却立刻 miss 付全价 MT。刀=confirm 时对
@@ -2282,12 +2296,17 @@ async def entrypoint(ctx) -> None:
             # _interp_utt_* 纯函数块注释。
             utt_merge=_interp_utt_merge_enabled(),
             utt_wait_s=_interp_utt_wait_s(),
+            # B 线 W1 说话中成句(A 线不传=逐字节旧路);总闸见
+            # _interp_clause_commit_enabled 注释块。
+            clause_commit=_interp_clause_commit_enabled(),
         )
         print(
             f"[interp] asr=doubao (cloud SAUC, resource={stt_provider._resource_id}"
             + (
-                f", utt-merge wait={_interp_utt_wait_s():g}s)" if _interp_utt_merge_enabled() else ")"
-            ),
+                f", utt-merge wait={_interp_utt_wait_s():g}s" if _interp_utt_merge_enabled() else ""
+            )
+            + (", clause-commit=on" if _interp_clause_commit_enabled() else "")
+            + ")",
             flush=True,
         )
     else:

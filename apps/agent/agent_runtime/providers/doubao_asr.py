@@ -20,6 +20,12 @@
   （auto 三语实测全通，zh 0.0 / 粤 0.084 / en 0.073）。
 - **热词**：``request.corpus.context`` 直传热词（100 token 上限，取前 40 词）。
 - 收线/告别直念窗（F4）：``set_closing_say(True)`` 期间整段丢弃（不发 EOS/FINAL）。
+- **说话中成句（clause_commit，B 线 W1 2026-10-08）**：interim ``result.text``
+  （~400ms 更新=快车道）上跑 A 线句级闸标点档（``_find_clause_cut`` 单点
+  import ``livekit_plugins`` 纯函数族，零第二份）——稳定子句前缀即发
+  FINAL_TRANSCRIPT（说话中 MT 起跑）；committed-prefix 对齐剥已交前缀
+  （partial 修订绝不回滚已发出的 FINAL：失配记日志+重置对齐）；VAD END 只补
+  未提交尾巴。``clause_commit=False``（A 线缺省不传）=逐字节旧路。
 
 总闸 ``BOK_DOUBAO_ASR``（缺省开，=0 时装配点回退本地 Qwen3-ASR；装配点读法见
 agent.py / interpret.py 的 provider 分支）。凭据/端点由设置面（asr 段）经装配点
@@ -35,6 +41,7 @@ import json
 import os
 import struct
 import time
+import unicodedata
 import uuid
 from urllib.parse import urlsplit
 
@@ -156,6 +163,64 @@ def _ws_host_ok(url: str) -> bool:
     return bool(ip.is_global)
 
 
+def _find_clause_cut(
+    text: str,
+    start: int,
+    prev_full: str,
+    *,
+    last_commit_at: float,
+    now: float,
+) -> int | None:
+    """说话中子句级提交闸（A 线 ``_sentence_boundary`` 标点档移植——纯函数，
+    实现单点 import ``livekit_plugins`` 纯函数族，**禁止第二份**）。
+
+    扫 ``[start:]`` 找第一个过全部门的标点边界（强句 。！？!? 或子句 ，、；,;），
+    返回边界后坐标（排他）或 None。门（参数沿 A 线语义，缺一不可）：
+    - 限速：距上次提交 < ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S``（B 线 worker
+      env=1.0；A 线缺省 1.5——本闸只在 clause_commit 流生效）不提交；
+    - 字数：强句边界候选 ≥ ``_ASR_SENTENCE_MIN_CHARS``(6)；子句边界候选 ≥
+      ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS``（B 线 worker env=6）；
+    - 数字 run 保护：候选段含 ≥4 位连续 ASCII 字母/数字 run（单号/号码高危）
+      → 该边界不切、继续往后扫同段必再败 → 整段留给 EOS 尾巴兜底；
+    - 跨 interim 稳定：上一 interim 全文同坐标与当前逐字一致（首现不提交，
+      防滑窗修订 flicker——A 线 prev_full 同款）。
+    """
+    from .livekit_plugins import (  # noqa: PLC0415 - 懒 import：本模块保持轻导入面
+        _ASR_SENTENCE_MIN_CHARS,
+        _SENTENCE_STRONG_PUNCT,
+        _SENTENCE_WEAK_PUNCT,
+        _clause_commit_min_chars,
+        _has_latin_or_digit_run,
+        _sentence_commit_min_interval_s,
+    )
+
+    if now - last_commit_at < _sentence_commit_min_interval_s():
+        return None
+    if start >= len(text):
+        return None
+    i = start
+    while i < len(text):
+        strong = text[i] in _SENTENCE_STRONG_PUNCT
+        weak = text[i] in _SENTENCE_WEAK_PUNCT
+        if strong or weak:
+            punct = _SENTENCE_STRONG_PUNCT if strong else _SENTENCE_WEAK_PUNCT
+            j = i + 1
+            while j < len(text) and text[j] in punct:
+                j += 1
+            min_chars = _ASR_SENTENCE_MIN_CHARS if strong else _clause_commit_min_chars()
+            sentence = text[start:j]
+            if (
+                len(sentence) >= min_chars
+                and not _has_latin_or_digit_run(sentence, min_len=4)
+                and prev_full[start:j] == sentence
+            ):
+                return j
+            # 该边界不够格（太短/数字 run/未稳定）→ 继续扫下一边界（短句排队
+            # 累积；未稳定边界下个 interim 自然变稳定）。
+        i += 1
+    return None
+
+
 class DoubaoSTT(stt.STT):
     """豆包 SAUC 流式 ASR（LiveKit STT；A/B 线共用）。
 
@@ -188,6 +253,7 @@ class DoubaoSTT(stt.STT):
         final_timeout: float = _FINAL_TIMEOUT_S,
         utt_merge: bool = False,
         utt_wait_s: float = 0.45,
+        clause_commit: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -223,6 +289,9 @@ class DoubaoSTT(stt.STT):
         # (VAD min_silence + utt_wait_s) 才切句：0.45+0.45=0.9s 档。
         self._utt_merge = bool(utt_merge)
         self._utt_wait_s = min(max(float(utt_wait_s or 0.0), 0.0), 3.0)
+        # 说话中成句（B 线 W1 clause-commit，2026-10-08）：interim 子句级闸命中
+        # 即发 FINAL（说话中 MT 起跑）；False（A 线缺省不传）=逐字节旧路。
+        self._clause_commit = bool(clause_commit)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
         # 回复在途旗、收线窗旗、本轮 partial 末稿。云档语义见各方法 docstring。
         self._partial_ms_override: int | None = None
@@ -415,6 +484,15 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._tail_task: asyncio.Task | None = None
         self._tail_finalizing = False    # 尾窗已到期、负 seq 定稿在途（START 让路）
         self._utt_merges = 0             # 本 utterance 内并掉的微停顿数（观测）
+        # 说话中成句状态（clause_commit，B 线 W1）：已提交前缀坐标（全文char）、
+        # 已提交前缀原文（对齐基线）、限速钟（跨段保留=A 线同款）、段锚钟与
+        # 提交计数（观测；_reset_segment 清）。
+        self._clause_commit = bool(getattr(stt_, "_clause_commit", False))
+        self._cc_committed_len = 0
+        self._cc_committed_text = ""
+        self._cc_last_commit_at = 0.0
+        self._cc_seg_t0 = 0.0
+        self._cc_commits = 0
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
@@ -547,15 +625,107 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     _spec_cb(_prev[:_common_len])
                 except Exception as exc:  # noqa: BLE001
                     print(f"BOK_PREFILL_SPEC listener error: {exc!r}", flush=True)
+        # 说话中成句（B 线 W1 clause-commit）：闸命中即发 FINAL（说话中 MT 起跑）。
+        # 事件序=FINAL(已稳定子句) → INTERIM(未提交剩余)；关旗=零行为逐字节旧路。
+        if self._clause_commit:
+            self._maybe_clause_commit(text, _prev)
+            display = self._clause_tail(text)
+            if not display:
+                return  # 已见文本全部提交/对齐重置吞显：本轮无剩余可出
+        else:
+            display = text
         try:
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    alternatives=[stt.SpeechData(language=self._stt_._lang(), text=text)],
+                    alternatives=[stt.SpeechData(language=self._stt_._lang(), text=display)],
                 )
             )
         except Exception:  # noqa: BLE001 - 流已关：迟到 interim 丢弃
             pass
+
+    def _maybe_clause_commit(self, text: str, prev_full: str) -> None:
+        """interim 更新点的子句级提交：``_find_clause_cut`` 命中即发 FINAL。
+
+        坐标系=服务端全文（result.text 单调累积）；已提交前缀记账在
+        ``_cc_committed_len/_cc_committed_text``，后续 interim 展示与 EOS 尾巴
+        都经 :meth:`_clause_tail` 对齐剥除。``lag_ms``=首个 interim 进闸到本次
+        提交的毫秒（utterance 内提交时点观测）。"""
+        now = time.monotonic()
+        if self._cc_seg_t0 <= 0.0:
+            self._cc_seg_t0 = now
+        cut = _find_clause_cut(
+            text,
+            self._cc_committed_len,
+            prev_full,
+            last_commit_at=self._cc_last_commit_at,
+            now=now,
+        )
+        if cut is None:
+            return
+        clause = text[self._cc_committed_len:cut]
+        self._cc_committed_len = cut
+        self._cc_committed_text = text[:cut]
+        self._cc_last_commit_at = now
+        self._cc_commits += 1
+        try:
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[
+                        stt.SpeechData(language=self._stt_._lang(), text=clause)
+                    ],
+                )
+            )
+        except Exception:  # noqa: BLE001 - 流已关：迟到 commit 丢弃
+            return
+        print(
+            f"[doubao] CLAUSE_COMMIT chars={len(clause)} "
+            f"lag_ms={(now - self._cc_seg_t0) * 1000:.0f} prefix_len={self._cc_committed_len}",
+            flush=True,
+        )
+
+    def _clause_tail(self, text: str) -> str:
+        """committed-prefix 对齐：剥已提交前缀后的剩余尾巴（interim 展示与
+        EOS 定稿共用同一坐标系）。
+
+        台阶（A 线 ``_uncommitted`` 同思想；HF speech-to-speech snapshot 纪律
+        ——partial 修订**绝不回滚已发出的 FINAL**）：
+        ① 严格前缀 startswith（主路径：单调累积极少改写已稳定头）；
+        ② 归一化前缀（去标点/空白逐字对齐——服务端标点改写不算新内容）；
+        ③ 双失配 → 记 ``DOUBAO_CLAUSE_ALIGN_RESET`` + 重置对齐：把已见全文认作
+           已主张领地（committed=全文）。宁可漏掉修订 delta，绝不重发已交内容
+           （重发=下游 MT 重复烧一整句，比漏一两个字更糟）。
+        """
+        if not self._cc_committed_text:
+            return text
+        if text.startswith(self._cc_committed_text):
+            return text[self._cc_committed_len:]
+        from .livekit_plugins import (  # noqa: PLC0415 - 同 _find_clause_cut 懒 import
+            _UNCOMMITTED_LEADING_WEAK_PUNCT,
+            _strip_punct_space,
+        )
+
+        norm_c = _strip_punct_space(self._cc_committed_text)
+        norm_t = _strip_punct_space(text)
+        if norm_c and norm_t.startswith(norm_c):
+            # 归一化对齐截尾：raw 里跳过标点/空白吃掉 norm_c 长度的正字，剩余是真尾巴。
+            need = len(norm_c)
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                need -= 1
+                if need == 0:
+                    return text[i + 1:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+            return ""
+        print(
+            f"DOUBAO_CLAUSE_ALIGN_RESET committed={self._cc_committed_text[:40]!r} "
+            f"text={text[:40]!r}",
+            flush=True,
+        )
+        self._cc_committed_text = text
+        self._cc_committed_len = len(text)
+        return ""
 
     def _feed(self, pcm: bytes) -> None:
         if not pcm:
@@ -601,6 +771,11 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._last_interim_emitted = ""
         self._session_error = ""
         self._saw_last = False
+        # 说话中成句坐标随段清零（限速钟 _cc_last_commit_at 跨段保留=A 线同款）。
+        self._cc_committed_len = 0
+        self._cc_committed_text = ""
+        self._cc_seg_t0 = 0.0
+        self._cc_commits = 0
         # 暴露位随段清零；FINAL 发出点按 pre-reset 快照重贴（与 Qwen3 版契约一致）。
         self._stt_._turn_partial_text = ""
 
@@ -614,16 +789,21 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         t0 = time.monotonic()
         partial_snapshot = self._last_server_text
         text = await self._finish_segment()
-        if text:
+        # 说话中成句（B 线 W1）：已提交子句不随定稿重复入历史——FINAL 只补
+        # 未提交尾巴（committed-prefix 对齐；可能为空则不发）。关旗=全文逐字节旧路。
+        tail = self._clause_tail(text) if (self._clause_commit and text) else text
+        if tail:
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     alternatives=[
-                        stt.SpeechData(language=self._stt_._lang(), text=text)
+                        stt.SpeechData(language=self._stt_._lang(), text=tail)
                     ],
                 )
             )
         suffix = f" utt_merges={self._utt_merges}" if self._utt else ""
+        if self._clause_commit and self._cc_commits:
+            suffix += f" clause_commits={self._cc_commits}"
         print(
             f"DOUBAO_ASR_TEXT {text[:120]!r} {self._stt_._lang()} "
             f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(cloud){suffix}",

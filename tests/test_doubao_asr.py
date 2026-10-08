@@ -648,3 +648,272 @@ def test_utt_merge_interpret_wiring_pins():
     os.environ["BOK_INTERP_UTT_MERGE"] = "0"
     assert interpret._interp_utt_merge_enabled() is False
     del os.environ["BOK_INTERP_UTT_MERGE"]
+
+
+# ---- 说话中成句（W1 clause-commit，B 线专用 2026-10-08）----
+
+
+def test_clause_commit_flag_default_off():
+    """缺省不传旗=A 线姿势逐字节旧路；显式 True（B 线装配）才生效。"""
+    assert DoubaoSTT(api_key="k")._clause_commit is False
+    assert DoubaoSTT(api_key="k", clause_commit=True)._clause_commit is True
+
+
+async def _drive_clause(stt: DoubaoSTT, vad: _FakeVad, *, packets: int, settle_s: float = 0.4):
+    """clause-commit 驱动：START→逐包 INFERENCE（每包 200ms=一条 fake interim）
+    →END→等定稿；返回 (事件名, 文本) 序列。"""
+    stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if vad.streams:
+            break
+    vs = vad.streams[-1]
+    got: list[tuple[str, str]] = []
+
+    async def _collect() -> None:
+        try:
+            while True:
+                ev = await asyncio.wait_for(stream.__anext__(), timeout=0.8)
+                text = ev.alternatives[0].text if getattr(ev, "alternatives", None) else ""
+                got.append((ev.type.name, text))
+        except (asyncio.TimeoutError, StopAsyncIteration):
+            return
+
+    collector = asyncio.create_task(_collect())
+    vs.q.put_nowait(_ev(da.vad.VADEventType.START_OF_SPEECH,
+                        frames=[types.SimpleNamespace(data=b"\x11\x11" * 800)]))
+    await asyncio.sleep(0.03)
+    for _ in range(packets):
+        vs.q.put_nowait(_ev(da.vad.VADEventType.INFERENCE_DONE,
+                            frames=[types.SimpleNamespace(data=b"\x22\x22" * 3200)]))
+        await asyncio.sleep(0.08)  # fake 即回；留事件泵轮转窗
+    vs.q.put_nowait(_ev(da.vad.VADEventType.END_OF_SPEECH))
+    await asyncio.sleep(settle_s)
+    stream._input_ch.close()
+    try:
+        await asyncio.wait_for(collector, 3)
+    except asyncio.TimeoutError:
+        collector.cancel()
+    await stream.aclose()
+    return got
+
+
+def test_find_clause_cut_pure_gates(monkeypatch):
+    """纯函数直喂：跨 interim 稳定 / 强弱标点双门槛 / ≥4 位数字 run 否决 /
+    无边界 None / 限速头闸。"""
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    now = 100.0
+    # 首现不提交（跨 interim 稳定门：上一 interim 无此候选）
+    assert da._find_clause_cut("你好呀我想问一下，", 0, "", last_commit_at=0.0, now=now) is None
+    # 上一 interim 同坐标逐字一致 → 提交，返回边界后坐标（逗号后）
+    assert da._find_clause_cut(
+        "你好呀我想问一下，帮我", 0, "你好呀我想问一下，", last_commit_at=0.0, now=now
+    ) == 9
+    # 强句边界门槛 6：「好啊。」3 字不够格（继续扫无边界 → None）
+    assert da._find_clause_cut(
+        "好啊。帮我查下", 0, "好啊。帮我查下", last_commit_at=0.0, now=now
+    ) is None
+    # 候选段含 ≥4 位数字 run → 边界不切（整段留给 EOS 兜底）
+    assert da._find_clause_cut(
+        "我的单号1234，帮我", 0, "我的单号1234，帮我", last_commit_at=0.0, now=now
+    ) is None
+    # start 之后无任何标点边界 → None
+    assert da._find_clause_cut(
+        "没有标点的尾巴", 0, "没有标点的尾巴", last_commit_at=0.0, now=now
+    ) is None
+    # 限速头闸：刚提交过（窗 99s 未到）→ 整体 None
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "99")
+    assert da._find_clause_cut(
+        "你好呀我想问一下，帮我", 0, "你好呀我想问一下，帮我",
+        last_commit_at=now - 1, now=now,
+    ) is None
+
+
+def test_clause_commit_mid_speech_final(monkeypatch, capsys):
+    """主刀路径：稳定子句在说话中发出 FINAL（不带 EOS）；剩余尾巴继续 INTERIM；
+    VAD END→只补未提交尾巴；EOS 事件只在 VAD END 发一次；观测行+段账齐全。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=["你好呀我想问一下，", "你好呀我想问一下，帮我查下订单"],
+        final_text="你好呀我想问一下，帮我查下订单。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))
+    names = [n for n, _ in events]
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，", "帮我查下订单。"]
+    assert names.count("END_OF_SPEECH") == 1
+    assert names.index("FINAL_TRANSCRIPT") < names.index("END_OF_SPEECH")  # 说话中先发
+    assert [t for n, t in events if n == "INTERIM_TRANSCRIPT"] == [
+        "你好呀我想问一下，", "帮我查下订单", "帮我查下订单。",
+    ]  # 末条=definite 定稿帧（比上一 interim 长）照旧出尾巴 interim（旧路同款）
+    out = capsys.readouterr().out
+    assert "[doubao] CLAUSE_COMMIT chars=9 lag_ms=" in out
+    assert "prefix_len=9" in out
+    assert "clause_commits=1" in out
+
+
+def test_clause_commit_align_tolerates_punct_revision(monkeypatch, capsys):
+    """committed-prefix 对齐·归一化臂：服务端在已提交区改标点（你好呀→你好呀，）
+    →归一化前缀对齐容错：已发 FINAL 不重发、剩余尾巴照出、零 RESET。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=[
+            "你好呀我想问一下，",                     # 首见（稳定门挡）
+            "你好呀我想问一下，帮我查下订单",           # 子句1 提交（跨 interim 稳定）
+            "你好呀，我想问一下，帮我查下订单",         # 已提交区标点改写（你好呀→你好呀，）
+        ],
+        final_text="你好呀，我想问一下，帮我查下订单",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+
+    events = asyncio.run(_drive_clause(stt, vad, packets=3))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，", "帮我查下订单"]
+    assert "DOUBAO_CLAUSE_ALIGN_RESET" not in capsys.readouterr().out
+
+
+def test_clause_commit_align_reset_on_prefix_rewrite(monkeypatch, capsys):
+    """committed-prefix 对齐·失配臂：已提交前缀正字被改写（问→请，归一化也失配）
+    →记 DOUBAO_CLAUSE_ALIGN_RESET + 重置对齐（已见全文认作已主张领地）——
+    已发 FINAL 绝不重发；snap 后新话继续流动；EOS 只补 snap 之后真尾巴。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=[
+            "你好呀我想问一下，",
+            "你好呀我想问一下，帮我查下订单",
+            "你好呀我想请问一下，帮我查下订单",
+            "你好呀我想请问一下，帮我查下订单谢谢",
+        ],
+        final_text="你好呀我想请问一下，帮我查下订单谢谢。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+
+    events = asyncio.run(_drive_clause(stt, vad, packets=4))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，", "谢谢。"]
+    assert [t for n, t in events if n == "INTERIM_TRANSCRIPT"] == [
+        "你好呀我想问一下，", "帮我查下订单", "谢谢", "谢谢。",
+    ]
+    assert "DOUBAO_CLAUSE_ALIGN_RESET" in capsys.readouterr().out
+
+
+def test_clause_tail_alignment_ladder():
+    """对齐台阶直喂：①exact 前缀 ②归一化前缀（标点改写）③双失配→日志+重置
+    （committed=已见全文=已主张领地，尾巴空）。"""
+    async def scenario():
+        stt = DoubaoSTT(api_key="k", clause_commit=True)
+        stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+        stream._cc_committed_len = 9
+        stream._cc_committed_text = "你好呀我想问一下，"
+        r1 = stream._clause_tail("你好呀我想问一下，帮我查下")
+        r2 = stream._clause_tail("你好呀，我想问一下，帮我查下")
+        r3 = stream._clause_tail("你好呀我想请问一下，帮我查下")
+        snap_text, snap_len = stream._cc_committed_text, stream._cc_committed_len
+        await stream.aclose()
+        return r1, r2, r3, snap_text, snap_len
+
+    r1, r2, r3, snap_text, snap_len = asyncio.run(scenario())
+    assert r1 == "帮我查下"
+    assert r2 == "帮我查下"
+    assert r3 == ""
+    assert snap_text == "你好呀我想请问一下，帮我查下"
+    assert snap_len == 14
+
+
+def test_clause_commit_gates_negative(monkeypatch):
+    """字数门/数字 run 门负例：不够格不说话中 FINAL，整段留给 EOS 整段兜底。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+
+    # 字数门：「好啊。」<6 字 → 不切，EOS 整段单条 FINAL。
+    _make_connect_replies(
+        monkeypatch, replies=["好啊。", "好啊。帮我查下"], final_text="好啊。帮我查下订单。"
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))
+    assert [t for n, t in events if n == "FINAL_TRANSCRIPT"] == ["好啊。帮我查下订单。"]
+
+    # 数字 run 门：候选段含 ≥4 位数字串 → 边界不切，EOS 整段单条 FINAL。
+    _make_connect_replies(
+        monkeypatch,
+        replies=["我的单号1234，", "我的单号1234，帮我查下"],
+        final_text="我的单号1234，帮我查下。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))
+    assert [t for n, t in events if n == "FINAL_TRANSCRIPT"] == ["我的单号1234，帮我查下。"]
+
+
+def test_clause_commit_rate_limit_blocks_second(monkeypatch):
+    """限速门：距上次提交 < 限速窗（99s 档放大）→ 后续稳定子句不提交，并入 EOS。"""
+    _fake_merge(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "99")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    _make_connect_replies(
+        monkeypatch,
+        replies=[
+            "你好呀我想问一下，",
+            "你好呀我想问一下，帮我查下订单",       # 首提交（首次不吃限速窗）
+            "你好呀我想问一下，帮我查下订单。好吗",  # 跨 interim 稳定但限速窗内 → 不提交
+        ],
+        final_text="你好呀我想问一下，帮我查下订单。好吗。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, clause_commit=True)
+    events = asyncio.run(_drive_clause(stt, vad, packets=3))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，", "帮我查下订单。好吗。"]
+
+
+def test_clause_commit_off_is_legacy(monkeypatch, capsys):
+    """旗关（=0 / A 线不传）：interim 全文照旧、FINAL 只在 EOS 整段一条=逐字节旧路。"""
+    _fake_merge(monkeypatch)
+    _make_connect_replies(
+        monkeypatch,
+        replies=["你好呀我想问一下，", "你好呀我想问一下，帮我查下订单"],
+        final_text="你好呀我想问一下，帮我查下订单。",
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad)  # 不传旗=A 线姿势
+    events = asyncio.run(_drive_clause(stt, vad, packets=2))
+    names = [n for n, _ in events]
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好呀我想问一下，帮我查下订单。"]  # 单条整段
+    assert names.index("END_OF_SPEECH") < names.index("FINAL_TRANSCRIPT")
+    assert "CLAUSE_COMMIT" not in capsys.readouterr().out
+
+
+def test_clause_commit_interpret_wiring_pins():
+    """接线 pin：B 线装配传 clause_commit；A 线 agent.py 装配零触碰（逐字节旧路）；
+    env 纯函数缺省开 / 0=关。"""
+    import os
+
+    import agent_runtime.interpret as interpret
+
+    base = Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime"
+    interp_src = (base / "interpret.py").read_text(encoding="utf-8")
+    agent_src = (base / "agent.py").read_text(encoding="utf-8")
+    assert "clause_commit=_interp_clause_commit_enabled()," in interp_src
+    assert "clause_commit" not in agent_src.split("stt_provider = DoubaoSTT(")[1].split(")")[0]
+    assert interpret._interp_clause_commit_enabled() is True
+    os.environ["BOK_INTERP_CLAUSE_COMMIT"] = "0"
+    assert interpret._interp_clause_commit_enabled() is False
+    del os.environ["BOK_INTERP_CLAUSE_COMMIT"]
