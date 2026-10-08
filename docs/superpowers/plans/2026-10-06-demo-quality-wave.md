@@ -489,6 +489,40 @@ Dante 族）进 `device-roles` 单源；console realMic/realOut 双过滤硬排�
 - **Wave 2-4 见执行计划**（流式 say+字幕先出+LagLedger 源句级+INTERP_LAG 加列
   →碎片闸→豆包 utterances gated→变体表生长/spec 命中率）。
 
+## 执行纪要·Wave 2/3a（2026-10-08，#220/#221）
+
+- **Wave 2 流式交付已落地（#220）**：`_mt_stream_say` MT SSE 流逐子句切
+  （`_cut_clause_piece`，数字/拉丁 run 防劈）喂 `session.say(AsyncIterable)` 框架
+  自切句首子句即合成；首子句语言门（不过门零播报回退整句路径）；
+  `sync_transcription=not _mt_stream_say_enabled()` 字幕先出；INTERP_LAG 加
+  `first_ms` 列；kill-switch `BOK_INTERP_MT_STREAM_SAY=0` 逐字节回退。实弹：
+  e2e 8/8、first_ms 490-688ms（长句收益、15 字内短句 first≈mt 无差）。
+- **Wave 3a 碎片闸已落地（#221，main=ca12e03）**：纯应承碎片（复用 A 线
+  `_PURE_ACK_TAIL_CHARS`+人称/英文应承词）hold-and-merge——`_frag_absorb`
+  hold ≤`BOK_INTERP_FRAG_HOLD_S`(0.6s) 并下段一次翻译，账本 drop×(N-1) 补偿
+  锚=末段，`INTERP_FRAG merge|flush` 观测行；kill-switch
+  `BOK_INTERP_FRAG_MERGE=0`；`_FORWARD_ENV` 270→272。全量 5008 绿；
+  e2e 8/8（云档 `E2E_INTERP_READBACK=0`——全云姿势 :8787 不拉）。
+  **实弹第一手（Ethan 真人测试当日）**：16 片 INTERP_FRAG 全 flush 零 merge
+  ——实测应承碎片全是「独立成句」（间隔>0.6s），谓词内碎片并段机会少；
+  内容碎片（我现在。/点点。）不在谓词内=仍独立过链（设计如此）。
+- **2026-10-08「切得碎」诊断定案（Ethan 实测 call-a5d/e2d）**：①豆包 lane
+  只按 VAD 静音切句（B 线 min_silence=0.45 已是宽档），思考停顿即 FINAL，
+  me 侧中位 9-11 字、1/3 为 2-6 字段——本地 lane 的句级提交闸（clause/长度/
+  join-hold/数字累积）在云 lane 全部 DORMANT；②每段独立烧全链
+  ASR(0.35s)+DeepSeek MT(p50 0.8s/p95 1.2s)+TTS 首包(~0.4s)≈1.6s/段，段间隔
+  1-2s → 对方听感=一粒粒断续（DeepSeek 比本地 MT2 每段多 ~550ms=切碎感
+  放大器，「B 线快过 A 线」与 DeepSeek 质量在打架）；③同房双设备回声：rev
+  ASR 原样转写我方声音（原文行两侧逐字重复 8+ 次）→rev MT→译员耳语复读
+  「耳机重复我的话」（声纹锁当日未武装，日志零行）；④管线本身干净：
+  76/76 原文→译文全配对、0 失败 0 丢句、backlog depth≤2（先前数的 43 条
+  mt/say failed 是 9 月历史账，日志跨天累积须切片再数）。
+  **刀序**：mt A/B 回本地 MT2（CP 一次 PUT，耳朵定夺）→ 3b 豆包 utterances
+  合并（`show_utterances:true` 已在请求、响应被丢——同 utterance 内 finals
+  短窗归并，段数砍半摊薄 MT 延迟，spec 命中率连带受益）→ 测试姿势戴耳机/
+  分房 + 声纹锁 enrollment。内容碎片 blind-hold 收益小（continuation 间隔
+  实测 1.7s+ 居多）不做。
+
 ## 风险与不做的事
 
 - A 线语言三态立法不动（粤语规范值 `cantonese` 全栈唯一拼写——新语种只进 B 线语言面，
