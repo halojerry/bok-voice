@@ -329,3 +329,41 @@ def test_player_instant_fade_jumps_to_target(tmp_path):
     assert new_cur == pytest.approx(p._target_db)
     assert gains[0] == pytest.approx(-28.0)  # 首样本=当前电平(过渡起点)
     assert np.allclose(gains[1:], p._target_db)  # 次样本起瞬时到位
+
+
+# ---- custom 档(2026-10-08 用户拍板「内置合成底噪像电流,自己上传音频」)----
+
+
+def test_resolve_scene_custom_file(tmp_path):
+    """custom=真房间录音循环:BOK_AMBIENT_FILE 绝对路径在场 → 条目带 gain 钳制;
+    缺省增益 -28dB 与内置轨同轨;custom_gain_db 可覆盖。"""
+    wav = tmp_path / "room.wav"
+    wav.write_bytes(b"RIFF")  # 内容不校验(装载在 player,此处只判在场)
+    e = ambience.resolve_scene("custom", custom_file=str(wav))
+    assert e is not None and e["scene"] == "custom"
+    assert e["file"] == str(wav)
+    assert e["gain_db"] == -28.0
+    e2 = ambience.resolve_scene("custom", custom_file=str(wav), custom_gain_db=-20.0)
+    assert e2["gain_db"] == -20.0
+    # 越界钳到天花板(底噪绝不抢道硬边界)
+    e3 = ambience.resolve_scene("custom", custom_file=str(wav), custom_gain_db=6.0)
+    assert e3["gain_db"] == ambience.GAIN_DB_CEIL
+
+
+def test_resolve_scene_custom_missing_or_relative_zero_behavior(tmp_path):
+    """宁缺宁炸:未设/非绝对路径/不在盘 → None 零行为(与 manifest 纪律同);
+    custom 不进 SCENES/manifest 目录(目录↔清单 parity 钉零影响)。"""
+    assert ambience.resolve_scene("custom", custom_file="") is None
+    assert ambience.resolve_scene("custom", custom_file="room.wav") is None  # 相对路径拒
+    assert ambience.resolve_scene("custom", custom_file=str(tmp_path / "nope.wav")) is None
+    assert "custom" not in ambience.SCENES
+
+
+def test_player_loads_custom_absolute_path(tmp_path):
+    """播放器装载:绝对路径 wav 直接吃(Path 拼接绝对路径自替换),可用=available。"""
+    _write_tiny_wav(tmp_path)
+    wav = tmp_path / "office.wav"  # _write_tiny_wav 固定写这个名字
+    entry = {"scene": "custom", "file": str(wav), "gain_db": -28.0}
+    p = ambience.AmbienceLoopPlayer(None, entry=entry)
+    # available 还要求 player 在场(轨道句柄);此处只钉资产装载:pcm 已按绝对路径吃进
+    assert p._pcm is not None and len(p._pcm) > 0

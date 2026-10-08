@@ -136,16 +136,47 @@ def resolve_scene(
     manifest: dict[str, dict] | None = None,
     *,
     assets_dir: Path | str | None = None,
+    custom_file: str | None = None,
+    custom_gain_db: float | None = None,
 ) -> dict | None:
     """BOK_AMBIENT_SCENE 值 → 场景条目;none/空/未知/清单缺失 → None(零行为)。
 
     双门:①名字必须在 SCENES 目录(运行时合法名单);②必须在 manifest 且有
     资产文件(运行时真相)——目录认得但资产没生成 = None,绝不空转播。
     返回条目为 manifest 条目的拷贝(含 scene/file/gain_db/loop_s)。
-    """
+
+    **custom 档(2026-10-08,用户拍板「底噪像电流,自己上传音频」)**:内置三场景
+    是种子化程序合成(褐噪声+HVAC 嗡——合成味的来源);真房间录音走本分支:
+    ``BOK_AMBIENT_SCENE=custom`` + ``BOK_AMBIENT_FILE=/abs/path/room.wav``
+    (可选 ``BOK_AMBIENT_GAIN_DB`` 覆盖播放衰减,缺省 -28dB 与内置同轨)。文件
+    不在/非文件 → None 零行为(宁缺宁炸纪律同 manifest);loop_s 由播放器按实际
+    PCM 长度计,条目不预填。env 分支不进 SCENES/manifest(test_ambience 的
+    目录↔清单 parity 钉零影响)。"""
     name = str(env_value or "").strip().lower()
     if not name or name in ("none", "off", "0"):
         return None
+    if name == "custom":
+        import os
+
+        path = str(custom_file if custom_file is not None else os.environ.get("BOK_AMBIENT_FILE", "")).strip()
+        p = Path(path).expanduser()
+        if not path or not p.is_absolute() or not p.is_file():
+            print(f"BOK_AMBIENT custom: BOK_AMBIENT_FILE 未设/非绝对路径/不在盘({path[:60]}) — 零行为", flush=True)
+            return None
+        gain = custom_gain_db
+        if gain is None:
+            import os as _os
+
+            try:
+                gain = clamp_gain_db(float(_os.environ.get("BOK_AMBIENT_GAIN_DB", "")))
+            except (TypeError, ValueError):
+                gain = DEFAULT_GAIN_DB
+        return {
+            "scene": "custom",
+            "file": str(p),
+            "gain_db": clamp_gain_db(gain),
+            "license": "user-provided",
+        }
     if name not in SCENES:
         return None
     if manifest is None:
