@@ -3662,6 +3662,18 @@ async def entrypoint(ctx):
     # DSN 缺席/SDK 缺席=完整 no-op,绝不阻 job)。
     _init_sentry("agent-worker")
 
+    # W2 刀1(2026-10-08):粤语音系补位依赖预 import——qa_phonetic 的 vendored
+    # ToJyutping 首用 import 触发 trie 解析 ~160-280ms(账本 465 次 "event loop
+    # blocked"),惰性点在首个粤语 QA 查询=通话中烧算力。挪到 job 启动早段
+    # (会话建立前付清,运行时纯缓存命中);失败静默=补位层原惰性路径逐字节
+    # 兜底。纯启动期时机移动,零运行时行为变化,无 kill-switch。
+    try:
+        from bok_voice_core.qa_phonetic import warm_up as _qa_phonetic_warm_up
+
+        _qa_phonetic_warm_up()
+    except Exception:  # noqa: BLE001 - 预热失败唔阻通话(惰性路径照旧)
+        pass
+
     # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
     # run_agent()/worker 主进程的安装对 serving 进程无效。
     from .preemptive_debug import install_preemptive_debug

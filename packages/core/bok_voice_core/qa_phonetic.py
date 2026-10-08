@@ -25,7 +25,8 @@ zh 线(拼音)实测精确率仅 54%@0.80(「怎么截图→怎么赔」半同�
 
 无 env 读取(kill-switch 在 agent_runtime.qa_gate——test_forward_env 扫描面);
 trie 解析 ~160ms 是一次性 import 成本,由 qa_gate 侧惰性 import 兜住(真有
-粤语条目才付)。
+粤语条目才付);worker 进程可用 ``warm_up()`` 在启动早段预付(2026-10-08
+W2 刀1,治首次粤语查询 160-280ms 阻塞 event loop)。
 """
 
 from __future__ import annotations
@@ -47,6 +48,23 @@ def _converter():
     from .tojyutping_vendor.ToJyutping.Jyutping import Jyutping
 
     return get_jyutping_list, get_jyutping_candidates, Jyutping
+
+
+def warm_up() -> bool:
+    """启动期预 import vendored ToJyutping(W2 刀1,2026-10-08)。
+
+    trie 解析 ~160-280ms 是 ``_converter`` 首用的一次性 import 成本——惰性点
+    在首个粤语 QA 查询(通话中)=阻塞 event loop 的主源之一(2026-10-08 账本
+    465 次 "event loop blocked")。worker 进程 entrypoint 早段调用本函数把
+    解析挪到启动期,运行时纯缓存命中。失败返回 False=补位层按原惰性路径
+    退避(运行时行为零变化);本函数绝不抛。无 env 读取(kill-switch 在
+    qa_gate 侧,本函数只是时机移动)。
+    """
+    try:
+        _converter()
+        return True
+    except Exception:  # noqa: BLE001 - 预热失败唔阻装配,惰性路径照旧兜底
+        return False
 
 
 def text_to_syllables(text: str) -> list:
