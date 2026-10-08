@@ -771,6 +771,11 @@ _FORWARD_ENV = (
     "BOK_INTERRUPT_INSTANT_ABANDON",
     #    W6 全程场景底噪（none 缺省 / office / callcenter / car，可拔插循环音轨）——
     "BOK_AMBIENT_SCENE",
+    #    W6+ 自定义底噪（2026-10-08 用户拍板「内置合成底噪像电流,自己上传音频」）：
+    #    BOK_AMBIENT_SCENE=custom + BOK_AMBIENT_FILE=/abs/room.wav（真房间录音循环），
+    #    BOK_AMBIENT_GAIN_DB 可选覆盖播放衰减（缺省 -28dB 同内置轨）——
+    "BOK_AMBIENT_FILE",
+    "BOK_AMBIENT_GAIN_DB",
     #    W5 声纹锁通话对象（默认 0 关；enrollment+VAD 段相似度 pre-ASR 门）——
     "BOK_SPEAKER_LOCK",
     "BOK_SPEAKER_LOCK_MODEL",
