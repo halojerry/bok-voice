@@ -907,11 +907,9 @@ def test_mt_first_chunk_env(monkeypatch):
     assert interpret._interp_mt_first_chunk_chars() == 0
 
 
-def test_mt_stream_say_first_chunk_early_flush(monkeypatch):
-    """W0-2:无标点短句首段按字数硬切,yield 首段+FlushSentinel(官方硬段边界
-    =MiniMax 立即起合成),余段照常流式;full=全文不变。"""
-    from livekit.agents import FlushSentinel
-
+def test_mt_stream_say_first_chunk_early_cut(monkeypatch):
+    """W0-2(热修后):无标点短句首段按字数硬切**早放纯文本**——MiniMax bidi 插件
+    内建 head-flush 吃到即催产;余段照常流式;full=全文不变;全程纯 str。"""
     monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
     monkeypatch.delenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", raising=False)
     text = "你好呀我想问一下你们的产品"  # 14 字无标点
@@ -927,18 +925,17 @@ def test_mt_stream_say_first_chunk_early_flush(monkeypatch):
     out = asyncio.run(_run())
     assert out["state"] == "clean" and out["yielded"] is True
     assert out["full"] == text
-    # 首段=前 6 字硬切,紧随官方哨兵
+    # 首段=前 6 字硬切(纯 str,say() 流不认非 str 项)
     assert sess.yields[0] == "你好呀我想问"
-    assert isinstance(sess.yields[1], FlushSentinel)
+    assert all(isinstance(x, str) for x in sess.yields)
     # 余段照常(尾段 flush)
-    assert "".join(x for x in sess.yields if isinstance(x, str)) == text
+    assert "".join(sess.yields) == text
 
 
 def test_mt_stream_say_first_chunk_off_legacy(monkeypatch):
-    """W0-2 kill-switch=0:零哨兵、无字数硬切——旧流式形状逐字节。"""
+    """W0-2 kill-switch=0:无字数硬切——旧流式形状逐字节。"""
     monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
     monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "0")
-    from livekit.agents import FlushSentinel
 
     text = "你好呀我想问一下你们的产品"
     stream = _FakeMTStream([text])
@@ -952,14 +949,17 @@ def test_mt_stream_say_first_chunk_off_legacy(monkeypatch):
 
     out = asyncio.run(_run())
     assert out["state"] == "clean" and out["full"] == text
-    assert not any(isinstance(x, FlushSentinel) for x in sess.yields)
+    assert all(isinstance(x, str) for x in sess.yields)
     # 旧行为:无标点 → 整句一 yield(流结束尾段)
     assert sess.yields == [text]
 
 
 def test_mt_stream_say_first_chunk_wiring_pins():
-    """接线 pin:哨兵车在位+首 chunk 字数经 A 线铁闸(_first_chunk_cut 复用,
-    非第二份拷贝)+env 立法。"""
-    assert "yield FlushSentinel()" in INTERP_SRC
+    """接线 pin:字数早切经 A 线铁闸(_first_chunk_cut 复用,非第二份拷贝);
+    **say() 车道禁 FlushSentinel**(哨兵属 generate/llm_node,热修实证)——
+    重引入即红。"""
     assert "_first_chunk_cut(buf, n0)" in INTERP_SRC
     assert "from .providers.livekit_plugins import _first_chunk_cut" in INTERP_SRC
+    # 代码级禁令:哨兵不得出现在 say 车道(注释里的热修史料不算)
+    assert "yield FlushSentinel" not in INTERP_SRC
+    assert "import FlushSentinel" not in INTERP_SRC

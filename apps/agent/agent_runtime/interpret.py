@@ -625,16 +625,18 @@ def _mt_stream_say_enabled() -> bool:
     return os.environ.get("BOK_INTERP_MT_STREAM_SAY", "1") == "1"
 
 
-# —— W0-2 MT 首 chunk 早交(2026-10-08 时效波) -----------------------------------
+# —— W0-2 MT 首 chunk 早交(2026-10-08 时效波;热修见下) -------------------------
 # ③号基线实锤:B 线 MT 腿结构性缺口 +224ms(890 vs A 666)——短句无子句切点,
 # `_cut_clause_piece` 憋到流结束才放,first_ms≈mt_ms(等整句翻完才进 TTS)。
-# 刀=官方 FlushSentinel 车(livekit 1.8.2 say()/TTS 转发路径原生支持:硬段边界
-# 逐段独立合成、下段合成与上段播放重叠):首段按「子句边界 或 N 字」切出即
-# yield 文本 + FlushSentinel() → MiniMax 立即合成(bidi 攒句被官方哨兵打断,
-# 同 A 线 head-flush 语义)。N 缺省 6=A 线 BOK_TTS_FIRST_CHUNK_CHARS 耳测定档;
-# 切点铁闸复用 A 线 _first_chunk_cut(数字/拉丁 run 绝不劈,句界就近 N+6 容差
-# 内让位);首段语言门软失败=弃早交回落子句路径(不误触发整句回退)。
-# kill-switch BOK_INTERP_MT_FIRST_CHUNK_CHARS=0 整档回旧行为。
+# 刀=我们的生成器按「子句边界 或 N 字」早放**纯文本**——MiniMax bidi 插件内部
+# 本就带 A 线同款 `_first_chunk_cut`+head-flush(BOK_TTS_FIRST_CHUNK_CHARS,
+# 对 say 流同样生效),吃到无标点头段即自行 task_flush 催产合成(地板 210-
+# 340ms)。**热修 2026-10-08:首版误向 say 流产哨兵——哨兵属 generate/
+# llm_node 车道,say() 签名 AsyncIterable[str] 不认,消费端被非 str 项噎住
+# (e2e I6「gen not drained」实证);早放纯文本即全部所需,哨兵删除。**
+# N 缺省 6=A 线耳测定档;切点铁闸复用 A 线 _first_chunk_cut(数字/拉丁 run
+# 绝不劈,句界就近 N+6 容差内让位);首段语言门软失败=弃早交回落子句路径
+# (不误触发整句回退)。kill-switch BOK_INTERP_MT_FIRST_CHUNK_CHARS=0 回旧行为。
 _MT_FIRST_CHUNK_ENV = "BOK_INTERP_MT_FIRST_CHUNK_CHARS"
 _MT_FIRST_CHUNK_DEFAULT = 6
 
@@ -660,9 +662,10 @@ async def _mt_stream_say(
 
     开流→delta 缓冲→子句切割→首子句语言门(E5 启发式:looks_like_language,
     违约在 **yield 前**抛出=零播报)→session.say(async 生成器)逐子句喂出。
-    **W0-2 首 chunk 早交**:首段额外按字数硬切(A 线 _first_chunk_cut 铁闸)并
-    yield FlushSentinel()——官方硬段边界,MiniMax 立即起合成(下段边翻边合成
-    与上段播放重叠);早切段语言门软失败=弃早交回落子句路径(不误回退整句)。
+    **W0-2 首 chunk 早交**:首段额外按字数硬切(A 线 _first_chunk_cut 铁闸)
+    早放纯文本——MiniMax bidi 插件内建的 head-flush 吃到即催产合成(哨兵版
+    已热修删除:say() 不认 FlushSentinel);早切段语言门软失败=弃早交回落
+    子句路径(不误回退整句)。
     返回 {full, first_ms, yielded, state}:
     - ``clean``     流自然结束(full=全文);
     - ``gate``      首子句语言门违约(零播报)→调用方回退 _mt_once(保留其
@@ -672,8 +675,6 @@ async def _mt_stream_say(
                     播报),full=已出部分,账本照常配对。
     语气标记按子句块换算(_apply_voice_tags 幂等,块内 token 不跨切点=换算完整);
     引号剥除在 provider 层(_StripMTQuoteStream 包流,流式天然继承)。"""
-    from livekit.agents import FlushSentinel
-
     from .providers.livekit_plugins import _first_chunk_cut
 
     out: dict = {"full": "", "first_ms": 0, "yielded": False, "state": "clean"}
@@ -699,8 +700,12 @@ async def _mt_stream_say(
                 if not content:
                     continue
                 buf += content
-                # W0-2 首 chunk 早交:无标点也按字数硬切(A 线铁闸),切出即
-                # yield + FlushSentinel → 官方硬段边界,合成立即起跑。
+                # W0-2 首 chunk 早交:无标点也按字数硬切(A 线铁闸)早放文本——
+                # MiniMax bidi 插件内部的 `_first_chunk_cut`+head-flush(A 线同款,
+                # BOK_TTS_FIRST_CHUNK_CHARS 对 say 流同样生效)吃到文本即催产合成。
+                # (热修 2026-10-08:此前误向 say 流产哨兵——哨兵属 generate/
+                # llm_node 车道,say() 签名 AsyncIterable[str] 不认,消费端被非
+                # str 项噎住=e2e I6「gen not drained」;早放纯文本即全部所需。)
                 if first and n0 > 0:
                     cut = _first_chunk_cut(buf, n0)
                     if cut:
@@ -720,7 +725,6 @@ async def _mt_stream_say(
                             emitted = _apply_voice_tags(piece) if tags else piece
                             parts.append(emitted)
                             yield emitted
-                            yield FlushSentinel()
                 piece, buf = _cut_clause_piece(buf)
                 while piece:
                     if first:
