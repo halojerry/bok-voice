@@ -780,6 +780,10 @@ _FORWARD_ENV = (
     #    [0,3]；_interp_env 透传白名单同键；B 线专用，A 线装配不传旗） ——
     "BOK_INTERP_UTT_MERGE",
     "BOK_INTERP_UTT_WAIT_S",
+    # —— B 线 spec 必中体有界等待（2026-10-08 时效波 C2）：not_ready 但 sim 过
+    #    门=必中，有界等合成落地再 HIT（done_callback+定时兜底入队）；缺省 0.6，
+    #    0=关（旧行为逐字节）；钳 [0,3]；_interp_env 透传白名单同键） ——
+    "BOK_INTERP_SPEC_WAIT_S",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
@@ -965,6 +969,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # 静默到底定稿（总闸缺省开，0=旧路径逐字节；UTT_WAIT_S 调窗，B 线专用）。
         "BOK_INTERP_UTT_MERGE",
         "BOK_INTERP_UTT_WAIT_S",
+        # B 线 spec 必中体有界等待 2026-10-08 时效波 C2：缺省 0.6，0=关（旧
+        # not_ready 即 miss 档；B 线 worker 专属）。
+        "BOK_INTERP_SPEC_WAIT_S",
         # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",

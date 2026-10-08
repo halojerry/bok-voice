@@ -217,6 +217,7 @@ def _mk_controller(
     say_calls=None,
     enqueue_calls=None,
     detector=None,
+    spec_wait_s=None,
 ):
     loop = _FakeLoop()
     hold = _SpecMtHold()
@@ -229,6 +230,7 @@ def _mk_controller(
         say_cached=lambda final_src, text, pcm: say_calls.append((final_src, text, pcm)),
         enqueue=lambda rest: enqueue_calls.append(rest),
         log=loop.log,
+        spec_wait_s=spec_wait_s,
     )
     return ctl, hold, loop
 
@@ -319,7 +321,8 @@ def test_controller_hit_plays_cached_and_enqueues_remainder():
 
 
 def test_controller_miss_not_ready_cancels_inflight():
-    """final 到达时 MT/TTS 未就绪 → cancel 在途任务、slot 弃、say 不调、旧路径。"""
+    """final 到达时 MT/TTS 未就绪且 C2 关档(spec_wait_s=0,旧行为)→ cancel
+    在途任务、slot 弃、say 不调、旧路径。"""
     say_calls: list = []
     enqueue_calls: list = []
 
@@ -328,7 +331,7 @@ def test_controller_miss_not_ready_cancels_inflight():
         return ("x", b"y")
 
     ctl, hold, loop = _mk_controller(run_spec=slow_run, say_calls=say_calls,
-                                     enqueue_calls=enqueue_calls)
+                                     enqueue_calls=enqueue_calls, spec_wait_s=0.0)
 
     async def main():
         _fire_ctl(ctl)
@@ -344,6 +347,90 @@ def test_controller_miss_not_ready_cancels_inflight():
     asyncio.run(main())
     assert any("INTERP_SPEC miss" in x and "not_ready" in x for x in loop.logs)
     assert any("INTERP_SPEC abort" in x for x in loop.logs)
+
+
+# ---- C2:必中体有界延迟交付(2026-10-08 时效波) ----
+
+
+def test_controller_defer_hit_delivers_when_task_lands():
+    """not_ready 但 sim 过门=必中:等在途合成落地 → HIT 零合成直播(延迟档)。
+    final 即刻回 True(调用方跳过正常路径),交付由 done_callback 完成。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def slow_run(span):
+        await asyncio.sleep(0.08)  # 晚一点落地(模拟 PCM 排干赶不上 final)
+        return ("hello there", b"PCM")
+
+    ctl, hold, loop = _mk_controller(run_spec=slow_run, say_calls=say_calls,
+                                     enqueue_calls=enqueue_calls, spec_wait_s=0.5)
+
+    async def main():
+        _fire_ctl(ctl)
+        assert hold.task is not None and not hold.task.done()
+        await asyncio.sleep(0.01)
+        # final 到达:slot 未就绪但必中 → 延迟交付(回 True)。
+        assert ctl.on_final("你好呀我想问一下，请问你们这个集运怎么收费的") is True
+        assert say_calls == []  # 尚未播(等落地)
+        await asyncio.sleep(0.2)  # 过 0.08s 落地点
+        assert say_calls and say_calls[0][1] == "hello there"
+        assert enqueue_calls == ["请问你们这个集运怎么收费的"]  # 余段照排
+        assert ctl._deferred is None
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC defer " in x for x in loop.logs)
+    assert any("INTERP_SPEC hit" in x and "deferred=1" in x for x in loop.logs)
+
+
+def test_controller_defer_fallback_enqueues_on_timeout():
+    """必中体等满上限仍未落地 → 兜底正常入队(final 全文),零播放。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(run_spec=never_run, say_calls=say_calls,
+                                     enqueue_calls=enqueue_calls, spec_wait_s=0.05)
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final("你好呀我想问一下，请问你们这个集运怎么收费的") is True
+        await asyncio.sleep(0.3)  # 过 0.05s 兜底点
+        assert say_calls == []
+        assert enqueue_calls == ["你好呀我想问一下，请问你们这个集运怎么收费的"]
+        assert ctl._deferred is None
+        assert hold.task is None
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC defer-fallback" in x for x in loop.logs)
+
+
+def test_controller_defer_blocks_new_fires_till_settled():
+    """延迟交付在途=on_interim 不开火(防 hold 被新 span 顶掉竞态)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def slow_run(span):
+        await asyncio.sleep(0.1)
+        return ("hello there", b"PCM")
+
+    ctl, hold, loop = _mk_controller(run_spec=slow_run, say_calls=say_calls,
+                                     enqueue_calls=enqueue_calls, spec_wait_s=0.5)
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final("你好呀我想问一下，请问你们这个集运怎么收费的") is True
+        # 在途期:新 interim 全部哑火。
+        ctl.on_interim("全新的另一句话呀，")
+        assert hold.task is None and hold.src == ""
+        await asyncio.sleep(0.25)
+        assert say_calls  # 原必中体照常交付
+
+    asyncio.run(main())
 
 
 def test_controller_miss_similarity_discards_ready_slot():

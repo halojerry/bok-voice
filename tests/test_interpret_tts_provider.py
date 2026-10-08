@@ -606,17 +606,39 @@ def test_build_tts_provider_persona_layer(monkeypatch):
 
 def test_persona_voice_assembly_wiring_pins():
     """接线 pin：装配点拉 persona（meta.persona_id → cp.get_persona →
-    parse_voice_map）并传入 _build_tts_provider；agent 侧 A 线 _parse_voice_map
-    别名=core 单源（防第二份拷贝回潮）。"""
+    _persona_voice_map=A 线 collapse 同款三语同把声）并传入 _build_tts_provider；
+    agent 侧 A 线 _parse_voice_map/_collapse_voice_map 别名=core 单源。"""
     src = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(encoding="utf-8")
     assert '_persona_id = str(meta.get("persona_id") or "").strip()' in src
     assert "await cp.get_persona(_persona_id)" in src
-    assert "persona_voices = parse_voice_map(_persona.get(\"reference_audio\"))" in src
+    assert "_persona_voices = _persona_voice_map(_persona)" in src
     assert "persona_voices=_persona_voices" in src
 
-    from agent_runtime.agent import _parse_voice_map
-    from bok_voice_core.voice_map import parse_voice_map
+    from agent_runtime.agent import _collapse_voice_map, _parse_voice_map
+    from bok_voice_core.voice_map import collapse_voice_map, parse_voice_map
 
     assert _parse_voice_map is parse_voice_map  # A 线别名=core 单源对象
+    assert _collapse_voice_map is collapse_voice_map
+
+
+def test_persona_voice_map_collapses_to_single_voice():
+    """B2(2026-10-08 用户拍板「三语言跟 A 线一样的人设音色」):collapse 整场同声
+    ——取人设主语言音色,三语目标同把声;非按语言分把。"""
+    # 主语言 zh → zh 键音色三语同用
+    m = interpret._persona_voice_map(
+        {"language": "zh", "reference_audio": '{"zh": "v-zh", "cantonese": "v-canto", "en": "v-en"}'}
+    )
+    assert m == {"zh": "v-zh", "cantonese": "v-zh", "en": "v-zh"}
+    # 主语言 cantonese → 粤键优先,缺 zh 回落链
+    m2 = interpret._persona_voice_map(
+        {"language": "cantonese", "reference_audio": '{"cantonese": "v-canto", "en": "v-en"}'}
+    )
+    assert set(m2.values()) == {"v-canto"}
+    # 裸字符串单音色
+    assert set(interpret._persona_voice_map({"reference_audio": "single-id"}).values()) == {"single-id"}
+    # 空/坏形状 → 空 map(层缺席回落)
+    assert interpret._persona_voice_map({}) == {}
+    assert interpret._persona_voice_map(None) == {}
+    assert interpret._persona_voice_map({"reference_audio": "  "}) == {}
 
 

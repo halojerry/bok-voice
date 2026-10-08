@@ -35,8 +35,9 @@ from pathlib import Path
 
 # 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
-# 人设音色 map 解析（单源 core，2026-10-08 B 线人设音色复用；A 线同源）。
-from bok_voice_core.voice_map import parse_voice_map
+# 人设音色 map 解析+整场同声收敛（单源 core，2026-10-08 B 线人设音色复用；
+# A 线同源——B 线三语言=A 线同款人设音色由 collapse 语义保证）。
+from bok_voice_core.voice_map import collapse_voice_map, parse_voice_map
 
 # B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
@@ -1540,6 +1541,43 @@ def _interp_utt_wait_s() -> float:
     return min(max(v, 0.0), _UTT_WAIT_MAX_S)
 
 
+# —— C2·spec not_ready 有界延迟交付(2026-10-08 时效波) --------------------------
+# 实测:spec miss 主因=not_ready(短句 span fire 离句尾近,held PCM 全量排干
+# 赶不上 final)——sim 已过门=必中体,却立刻 miss 付全价 MT。刀=confirm 时对
+# 必中体有界等待(done_callback 到货即 HIT 零合成直播;超时/失败兜底正常
+# 入队)。等待秒 env 可调,缺省 0.6,钳 [0,3];0=关(旧行为逐字节)。
+_SPEC_WAIT_ENV = "BOK_INTERP_SPEC_WAIT_S"
+_SPEC_WAIT_DEFAULT_S = 0.6
+_SPEC_WAIT_MAX_S = 3.0
+
+
+def _interp_spec_wait_s() -> float:
+    """必中体等待秒(纯函数,单测直喂):坏值回缺省 0.6;负数钳 0;上限 3.0。"""
+    raw = os.environ.get(_SPEC_WAIT_ENV, "")
+    try:
+        v = float(raw) if raw else _SPEC_WAIT_DEFAULT_S
+    except ValueError:
+        return _SPEC_WAIT_DEFAULT_S
+    return min(max(v, 0.0), _SPEC_WAIT_MAX_S)
+
+
+def _persona_voice_map(persona: dict) -> dict:
+    """B 线人设音色 → 三语言同把声(纯函数,单测直喂;A 线同款整场同声语义)。
+
+    用户拍板(2026-10-08):「模型音色三语言跟 A 线使用的是一样的人设音效」——
+    即 collapse 语义:取人设主语言(reference_audio 分语言 map,缺则
+    zh→cantonese→en 链)单音色,三语目标同用一把声,而非按目标语言分把。
+    返回 {zh,cantonese,en: 同一音色 ID};人设空/无有效音色={}。"""
+    p = persona if isinstance(persona, dict) else {}
+    single = collapse_voice_map(
+        parse_voice_map(p.get("reference_audio")), str(p.get("language") or "")
+    ).get("zh", "")
+    single = str(single or "").strip()
+    if not single:
+        return {}
+    return {"zh": single, "cantonese": single, "en": single}
+
+
 def _interp_frag_hold_s() -> float:
     """hold 窗口秒(纯函数,单测直喂):坏值回缺省 0.6;负数钳 0;上限 2.0。"""
     raw = os.environ.get(_FRAG_HOLD_ENV, "")
@@ -1802,6 +1840,8 @@ class _SpecMtController:
         say_cached: Callable,
         enqueue: Callable[[str], None],
         log: Callable[[str], None] = print,
+        note_src: Callable[[str], None] | None = None,
+        spec_wait_s: float | None = None,
     ) -> None:
         self._enabled = enabled
         self._detector = detector
@@ -1811,11 +1851,21 @@ class _SpecMtController:
         self._say_cached = say_cached  # (final_src, text, pcm) -> None(异常上抛)
         self._enqueue = enqueue  # (rest) -> None:余段入 FIFO+记账
         self._log = log
+        # C2(2026-10-08 时效波):not_ready 有界延迟交付——confirm 时 slot 在途但
+        # sim 已过门=必中,等合成落地再 HIT(有界);兜底=正常入队(note_src 先记账
+        # 保配对)。note_src 缺省 None=旧行为(不延迟,立刻 miss)。
+        self._note_src = note_src
+        self._spec_wait_s = (
+            _interp_spec_wait_s() if spec_wait_s is None else max(0.0, float(spec_wait_s))
+        )
+        self._deferred: dict | None = None  # 在途延迟交付单据(单槽)
 
     # ---- interim 入口 -----------------------------------------------------
     def on_interim(self, text: str) -> None:
         if not self._enabled or self._busy_gate():
             return
+        if self._deferred is not None:
+            return  # C2:延迟交付在途——不再开火(防 hold 被新 span 顶掉竞态)
         span = self._detector.feed(text)
         if not span:
             return
@@ -1862,19 +1912,25 @@ class _SpecMtController:
         hold.task = None
         if not span:
             return False
-        if task is not None and not task.done():
-            # 未就绪:预热没赢过说话,投机价值已失——cancel 在途 MT 让路真车道
-            # (本地=abort 即时弃流;云端=客户端断开纯丢弃)。
-            task.cancel()
         text, pcm = hold.text, hold.pcm
         hold.text = ""
         hold.pcm = b""
-        if not text or not pcm:
-            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
-            return False
         sim, rest = _spec_prefix_split(final_text, span)
         if sim < _SPEC_CONFIRM_SIM:
+            if task is not None and not task.done():
+                # sim 不过门:cancel 在途 MT 让路真车道(本地=abort;云端=纯丢弃)。
+                task.cancel()
             self._log(f"[interp] INTERP_SPEC miss chars={len(span)} sim={sim:.2f}")
+            return False
+        if not text or not pcm:
+            # C2(2026-10-08 时效波):not_ready 但 sim 已过门=必中——有界等合成
+            # 落地再 HIT(零合成直播);兜底/超时=正常入队(_enqueue 自带 note_src
+            # 保配对)。sim 先判把「必不中」的 cancel 路前置,只对必中体付等待。
+            if task is not None and not task.done() and self._spec_wait_s > 0:
+                return self._defer_hit(final_text, rest, task)
+            if task is not None and not task.done():
+                task.cancel()
+            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
             return False
         self._log(
             f"[interp] INTERP_SPEC hit chars={len(span)} rest={len(rest)} sim={sim:.2f}"
@@ -1888,9 +1944,76 @@ class _SpecMtController:
             self._enqueue(rest)
         return True
 
+    def _defer_hit(self, final_text: str, rest: str, task: asyncio.Task) -> bool:
+        """C2:必中在途的有界延迟交付(on_final 是同步回调,等=done_callback+定时)。
+
+        单据 ``_deferred`` 在途时 on_interim 不开火(防 hold 被新 span 顶掉);
+        兜底/超时/失败=``_enqueue(final_text)`` 正常管线(该闭包自带 note_src,
+        与 HIT 余段同源——on_final 已回 True,调用方跳过的记账由它补)。
+        """
+        state: dict = {"done": False, "timer": None}
+        self._deferred = state
+        self._log(
+            f"[interp] INTERP_SPEC defer chars={len(final_text)} wait_s={self._spec_wait_s:g}"
+        )
+
+        def _settle(from_cancel: bool) -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            if self._deferred is state:
+                self._deferred = None
+            timer = state.get("timer")
+            if timer is not None:
+                timer.cancel()
+            text = "" if from_cancel else self.hold.text
+            pcm = b"" if from_cancel else self.hold.pcm
+            self.hold.text = ""
+            self.hold.pcm = b""
+            if text and pcm:
+                try:
+                    self._say_cached(final_text, text, pcm)
+                    self._log(f"[interp] INTERP_SPEC hit chars={len(final_text)} deferred=1")
+                    if rest:
+                        self._enqueue(rest)
+                    return
+                except Exception as exc:  # noqa: BLE001 - 播放失败走兜底入队
+                    self._log(f"[interp] INTERP_SPEC say failed: {exc!r}")
+            self._enqueue(final_text)
+            self._log(f"[interp] INTERP_SPEC defer-fallback chars={len(final_text)}")
+
+        def _on_task_done(t: asyncio.Task) -> None:
+            try:
+                exc = t.exception()
+            except asyncio.CancelledError:
+                exc = RuntimeError("cancelled")
+            _settle(exc is not None)
+
+        task.add_done_callback(_on_task_done)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 理论不可达(事件回调必在 loop 线程)——防御直兜底
+            _settle(True)
+            return True
+        state["timer"] = loop.call_later(self._spec_wait_s, lambda: _settle(False))
+        return True
+
     # ---- 生命周期 ---------------------------------------------------------
     def cancel(self, reason: str = "shutdown") -> None:
-        """teardown/重连卫生:弃 slot + cancel 在途任务(绝不外抛)。"""
+        """teardown/重连卫生:弃 slot + cancel 在途任务(绝不外抛)。
+
+        C2:在途延迟交付单据就地终结(from_cancel=True 不播不兜底入队——
+        会话正在收线,enqueue 只会造孤儿);done_callback 照走但 state 已 done
+        =no-op。"""
+        d = self._deferred
+        if d is not None:
+            d["done"] = True
+            timer = d.get("timer")
+            if timer is not None:
+                timer.cancel()
+            self._deferred = None
+            self.hold.text = ""
+            self.hold.pcm = b""
         task = self.hold.task
         self.hold.src = ""
         self.hold.task = None
@@ -2001,9 +2124,13 @@ async def entrypoint(ctx) -> None:
     if _persona_id:
         try:
             _persona = await cp.get_persona(_persona_id)
-            _persona_voices = parse_voice_map(_persona.get("reference_audio"))
-            _keys = sorted(k for k, v in _persona_voices.items() if str(v or "").strip())
-            print(f"[interp] persona voice id={_persona_id[:16]} keys={_keys}", flush=True)
+            # A 线同款整场同声(collapse):三语言目标同一把人设声,非按语言分把。
+            _persona_voices = _persona_voice_map(_persona)
+            print(
+                f"[interp] persona voice id={_persona_id[:16]} "
+                f"voice={next(iter(_persona_voices.values()), '')[:32]!r} (A-line collapse)",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001 - 人设拉取失败不阻通话
             print(f"[interp] persona fetch failed id={_persona_id[:16]}: {exc!r}", flush=True)
     llm_cfg = settings.get("llm", {}) or {}
@@ -2404,7 +2531,10 @@ async def entrypoint(ctx) -> None:
     _mt_busy = {"flag": False}  # 真 MT 在途旗(投机 busy 闸消费,见 _mt_say_worker)
     _spec_on = _spec_mt_enabled() and tts_provider is not None
     if _spec_on:
-        print("[interp] spec_mt armed (interim prewarm-and-confirm)", flush=True)
+        print(
+            f"[interp] spec_mt armed (prewarm-and-confirm; defer-hit wait={_interp_spec_wait_s():g}s)",
+            flush=True,
+        )
 
     async def _spec_synth_pcm(text: str) -> bytes | None:
         """投机译文 TTS 全量排干成 PCM(不进 say 队列,零播放)。
