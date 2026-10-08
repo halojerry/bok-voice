@@ -880,3 +880,86 @@ def test_frag_gate_wiring_pins():
     assert t0_pos > gate_pos
     assert "INTERP_FRAG merge n=" in INTERP_SRC
     assert "INTERP_FRAG flush chars=" in INTERP_SRC
+
+
+# ---- W0 时效波（2026-10-08）：观察窗缺省 0.2 + MT 首 chunk 早交 ----
+
+
+def test_interp_utt_wait_default_w0():
+    """W0-1:观察窗缺省 0.45→0.2(窗税砍 250ms;③号基线拍板)。"""
+    import os
+
+    os.environ.pop("BOK_INTERP_UTT_WAIT_S", None)
+    assert interpret._interp_utt_wait_s() == 0.2
+
+
+def test_mt_first_chunk_env(monkeypatch):
+    """W0-2 env 解析:缺省 6(A 线耳测定档)/坏值回缺省/0 与负数=关。"""
+    monkeypatch.delenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", raising=False)
+    assert interpret._interp_mt_first_chunk_chars() == 6
+    monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "10")
+    assert interpret._interp_mt_first_chunk_chars() == 10
+    monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "abc")
+    assert interpret._interp_mt_first_chunk_chars() == 6
+    monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "0")
+    assert interpret._interp_mt_first_chunk_chars() == 0
+    monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "-3")
+    assert interpret._interp_mt_first_chunk_chars() == 0
+
+
+def test_mt_stream_say_first_chunk_early_flush(monkeypatch):
+    """W0-2:无标点短句首段按字数硬切,yield 首段+FlushSentinel(官方硬段边界
+    =MiniMax 立即起合成),余段照常流式;full=全文不变。"""
+    from livekit.agents import FlushSentinel
+
+    monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
+    monkeypatch.delenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", raising=False)
+    text = "你好呀我想问一下你们的产品"  # 14 字无标点
+    stream = _FakeMTStream([text])
+    sess = _FakeSession()
+
+    async def _run():
+        ctx = interpret._build_mt_context("", [], "源句")
+        return await interpret._mt_stream_say(
+            sess, _FakeMTLLM(stream), ctx, target_lang="zh", tags=False, t0=__import__("time").perf_counter()
+        )
+
+    out = asyncio.run(_run())
+    assert out["state"] == "clean" and out["yielded"] is True
+    assert out["full"] == text
+    # 首段=前 6 字硬切,紧随官方哨兵
+    assert sess.yields[0] == "你好呀我想问"
+    assert isinstance(sess.yields[1], FlushSentinel)
+    # 余段照常(尾段 flush)
+    assert "".join(x for x in sess.yields if isinstance(x, str)) == text
+
+
+def test_mt_stream_say_first_chunk_off_legacy(monkeypatch):
+    """W0-2 kill-switch=0:零哨兵、无字数硬切——旧流式形状逐字节。"""
+    monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
+    monkeypatch.setenv("BOK_INTERP_MT_FIRST_CHUNK_CHARS", "0")
+    from livekit.agents import FlushSentinel
+
+    text = "你好呀我想问一下你们的产品"
+    stream = _FakeMTStream([text])
+    sess = _FakeSession()
+
+    async def _run():
+        ctx = interpret._build_mt_context("", [], "源句")
+        return await interpret._mt_stream_say(
+            sess, _FakeMTLLM(stream), ctx, target_lang="zh", tags=False, t0=__import__("time").perf_counter()
+        )
+
+    out = asyncio.run(_run())
+    assert out["state"] == "clean" and out["full"] == text
+    assert not any(isinstance(x, FlushSentinel) for x in sess.yields)
+    # 旧行为:无标点 → 整句一 yield(流结束尾段)
+    assert sess.yields == [text]
+
+
+def test_mt_stream_say_first_chunk_wiring_pins():
+    """接线 pin:哨兵车在位+首 chunk 字数经 A 线铁闸(_first_chunk_cut 复用,
+    非第二份拷贝)+env 立法。"""
+    assert "yield FlushSentinel()" in INTERP_SRC
+    assert "_first_chunk_cut(buf, n0)" in INTERP_SRC
+    assert "from .providers.livekit_plugins import _first_chunk_cut" in INTERP_SRC

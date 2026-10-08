@@ -776,10 +776,14 @@ _FORWARD_ENV = (
     "BOK_INTERP_FRAG_HOLD_S",
     # —— B 线豆包尾部续说观察窗（2026-10-08 Wave 3b「切碎」主刀）：END 不立刻
     #    定稿，窗口内续讲=同会话并段（服务端 text 单调累积），静默到底才出
-    #    FINAL；0=旧路径逐字节；BOK_INTERP_UTT_WAIT_S 调窗（坏值回 0.45/钳
-    #    [0,3]；_interp_env 透传白名单同键；B 线专用，A 线装配不传旗） ——
+    #    FINAL；0=旧路径逐字节；BOK_INTERP_UTT_WAIT_S 调窗（W0 复核缺省 0.45→
+    #    0.2，坏值回 0.2/钳 [0,3]；_interp_env 透传白名单同键；B 线专用） ——
     "BOK_INTERP_UTT_MERGE",
     "BOK_INTERP_UTT_WAIT_S",
+    # —— B 线 MT 首 chunk 早交（2026-10-08 W0 时效波）：流式 say 首段按字数
+    #    硬切 + FlushSentinel（官方硬段边界，MiniMax 立即起合成）；缺省 6=
+    #    A 线耳测定档，0=回旧行为；_interp_env 透传白名单同键 ——
+    "BOK_INTERP_MT_FIRST_CHUNK_CHARS",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
@@ -965,6 +969,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # 静默到底定稿（总闸缺省开，0=旧路径逐字节；UTT_WAIT_S 调窗，B 线专用）。
         "BOK_INTERP_UTT_MERGE",
         "BOK_INTERP_UTT_WAIT_S",
+        # B 线 MT 首 chunk 早交 2026-10-08 W0：FlushSentinel 硬段边界立即合成
+        #（缺省 6=A 线耳测定档；0=回旧行为，B 线 worker 专属）。
+        "BOK_INTERP_MT_FIRST_CHUNK_CHARS",
         # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",

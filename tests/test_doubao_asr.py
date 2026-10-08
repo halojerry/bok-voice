@@ -631,14 +631,14 @@ def test_utt_merge_interpret_wiring_pins():
     assert "utt_merge=_interp_utt_merge_enabled()," in interp_src
     assert "utt_wait_s=_interp_utt_wait_s()," in interp_src
     assert "utt_merge" not in agent_src.split('stt_provider = DoubaoSTT(')[1].split(")")[0]
-    # env 纯函数：缺省 0.45/坏值回缺省/负钳 0/上限 3.0
+    # env 纯函数：缺省 0.2（W0 复核 0.45→0.2）/坏值回缺省/负钳 0/上限 3.0
     import os
 
-    assert interpret._interp_utt_wait_s() == 0.45
+    assert interpret._interp_utt_wait_s() == 0.2
     os.environ["BOK_INTERP_UTT_WAIT_S"] = "1.2"
     assert interpret._interp_utt_wait_s() == 1.2
     os.environ["BOK_INTERP_UTT_WAIT_S"] = "abc"
-    assert interpret._interp_utt_wait_s() == 0.45
+    assert interpret._interp_utt_wait_s() == 0.2
     os.environ["BOK_INTERP_UTT_WAIT_S"] = "-1"
     assert interpret._interp_utt_wait_s() == 0.0
     os.environ["BOK_INTERP_UTT_WAIT_S"] = "9"
