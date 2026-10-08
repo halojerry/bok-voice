@@ -656,6 +656,10 @@ _FORWARD_ENV = (
     # 强制出声兜底——BOK_REPEAT_ACK=1（默认）时 REPEAT 轮清风暴账+直念短承应
     # +落穿复述车道；="0" 回旧行为（静听照旧吞）。
     "BOK_REPEAT_ACK",
+    # 句级提交连发窗（W2 刀4 2026-10-08）：同客上一提交 <窗口秒且期间零
+    # assistant 出声 → 本轮不独立抢答，窗尾 generate_reply 合并应答窗内全部
+    # 轮。缺省 "3.0"；="0" 整闸关（旧行为逐字节）。
+    "BOK_BURST_MERGE_WINDOW_S",
     "BOK_REPEAT_CROSS_TURN",
     "BOK_REPEAT_CROSS_TURN_SIM",
     # 编造号码输出守卫（2026-10-01，call-231aa92a）：LLM 流出口逐句校验号码

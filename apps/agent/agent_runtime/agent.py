@@ -1714,6 +1714,18 @@ def _is_repeat_fragment_pollution(
     return False
 
 
+def _burst_merge_window_s() -> float:
+    """句级提交连发窗(W2 刀4,2026-10-08):BOK_BURST_MERGE_WINDOW_S,秒。
+
+    默认 3.0;``0`=关(回旧行为:每个句级提交轮独立抢答);坏值回缺省;负值
+    按关处理。进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。"""
+    try:
+        v = float(os.environ.get("BOK_BURST_MERGE_WINDOW_S", "3.0") or 3.0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 3.0
+    return v if v > 0 else 0.0
+
+
 def _late_answer_dedup_verdict(
     text: str,
     *,
@@ -4087,6 +4099,11 @@ async def entrypoint(ctx):
     # buffer,watcher 补账点采集,有界 4 条)——「前缀同源片」清洗的语料面,
     # item 侧重复锚/账本写入前过滤(详见 _is_repeat_fragment_pollution)。
     _interrupted_frags: list = []
+    # W2 刀4 连发窗账(2026-10-08):ts=最近一次用户轮提交时刻(monotonic);
+    # answered=最近一次提交后是否已有 assistant 出声(item 或可闻车道登记)。
+    # flush=在途合并补答任务(单飞,新轮 hook 入口先收)。
+    _burst_state: dict = {"ts": 0.0, "answered": True}
+    _burst_flush_task: dict = {"task": None}
     # B3 连环打断风暴:滚动窗打断时刻 + 静听模式截止时刻。
     _storm: dict = {"ts": [], "active_until": 0.0, "rounds": 0}
     # W1f deferred abandon(2026-10-06 demo-quality wave):打断确证才弃流——
@@ -5669,6 +5686,9 @@ async def entrypoint(ctx):
         if notify:
             _pending_lane["lane"] = str(lane or "")
             return
+        # W2 刀4(2026-10-08):可闻车道登记=连发窗链「已应答」——下一用户轮
+        # 不再并入合并补答(可闻 ack 也算接住上一轮,A3 同口径)。
+        _burst_state["answered"] = True
         if not history:
             # D6:ack 出声即接住上一用户轮(A3 语义),item_added 不再发生;
             # 不推票据(5s 新鲜度窗的误领面消灭)。
@@ -5812,6 +5832,8 @@ async def entrypoint(ctx):
             )
             return
         _assistant_out["on"] = True  # A3:assistant 轮出现=上一用户轮已被接住
+        # W2 刀4(2026-10-08):assistant item 交付=连发窗链「已应答」。
+        _burst_state["answered"] = True
         _reply_partial["text"] = ""  # B4:轮已正常落库,tee 清零(watcher 唔会再补记)
         # EX-2 chokepoint 消费点:FIFO 取本车道票据(文本配对→最旧兜底);无票据=
         # 纯 LLM 轮,gen=llm。notify 车道顺延的 provider 在此并归(同轮打铃+罐头
@@ -5866,6 +5888,58 @@ async def entrypoint(ctx):
                 print(f"REPORT_TASK_ERR {t.exception()!r}", flush=True)
 
         task.add_done_callback(_done)
+
+    def _cancel_burst_flush() -> None:
+        """W2 刀4:收在途合并补答任务(单飞)——每个用户轮 hook 入口先收:
+        本轮接管全上下文,旧 flush 不该再发。"""
+        _t = _burst_flush_task.get("task")
+        if _t is not None and not _t.done():
+            _t.cancel()
+        _burst_flush_task["task"] = None
+
+    def _arm_burst_flush(delay_s: float, *, postpone_left: int = 8) -> None:
+        """W2 刀4:排合并补答——delay_s 后客户仍安静则 generate_reply() 一次性
+        应答窗内合并的全部 user 轮(chat ctx 已含各轮消息,_try_append_user_
+        message 补写)。
+
+        - 客户中途再开口(user_state=speaking)→ 顺延 0.5s 重排(至多
+          postpone_left 次,防与在途语音对撞;到顶放行,barge-in 兜底);
+        - 暂停/收线 → 不发(降级为丢弃:恢复后由客户下一轮接管);
+        - 真正开火时置 answered(补答即 assistant 交付,后续轮不再并入)。
+        走 _spawn_report 池(挂断收线不丢任务;裸 create_task 弱引用教训)。
+        """
+        _cancel_burst_flush()
+
+        async def _flush() -> None:
+            try:
+                await asyncio.sleep(max(0.05, float(delay_s)))
+            except asyncio.CancelledError:
+                return  # 被新轮 hook 入口收掉=正常合并链
+            if closed.is_set():
+                return
+            if getattr(agent, "paused", False):
+                if postpone_left > 0:
+                    _arm_burst_flush(1.0, postpone_left=postpone_left - 1)
+                return
+            try:
+                _u_state = str(getattr(session, "user_state", "") or "")
+            except Exception:  # noqa: BLE001 - 状态拿不到=按安静放行
+                _u_state = ""
+            if _u_state == "speaking" and postpone_left > 0:
+                _arm_burst_flush(0.5, postpone_left=postpone_left - 1)
+                return
+            _burst_state["answered"] = True
+            print(
+                f"BURST_MERGE flush -> generate_reply gap_window="
+                f"{_burst_merge_window_s():.1f}s (call {room_name})",
+                flush=True,
+            )
+            try:
+                session.generate_reply()
+            except Exception as exc:  # noqa: BLE001 - 会话已关等
+                print(f"[agent] burst flush generate failed: {exc!r} (call {room_name})", flush=True)
+
+        _burst_flush_task["task"] = _spawn_report(_flush())
 
     async def _report_assistant_turn(
         text: str, latency: int, gen: str, provider: str, step: int, started_ms: int,
@@ -6787,6 +6861,15 @@ async def entrypoint(ctx):
             # 后台 judge 不准进 :1235(见 _reply_done_event 声明处)。本轮真交付
             # (assistant item 落账)或纯 StopResponse 出口各自 set 回来。
             _reply_done_event.clear()
+            # W2 刀4(2026-10-08)连发窗账轮转:先取上一轮快照(距上一提交的间隔
+            # +期间是否已有 assistant 出声),再落本轮戳。hook 入口此刻 _assistant_out
+            # 仍持上一轮的结局(本轮重置在其后)——快照必须在重置前取。
+            _burst_prev_ts = float(_burst_state["ts"])
+            _burst_prev_answered = bool(_burst_state["answered"])
+            _burst_state["ts"] = time.monotonic()
+            _burst_state["answered"] = False
+            # 旧 flush 作废:本轮已接管全上下文(合并补答不再发)。
+            _cancel_burst_flush()
             # W4 ②(2026-09-24):commit 墙钟戳——钩子入口即提交时刻,后续回复首
             # 音频(_on_reply_first_audio_timing)消费打 BOK_TURN_TIMING 行。
             # 单槽覆盖:barge-in 轮新戳顶旧戳(打断轮延迟本就含糊,近似可接受)。
@@ -8801,6 +8884,49 @@ async def entrypoint(ctx):
                         _filler.hint_category(_hint_cat)
                     except Exception:  # noqa: BLE001
                         pass
+            # ---- W2 刀4 句级提交连发窗(2026-10-08):上一轮提交 <窗口秒 且期间
+            # 零 assistant 出声(上一轮 AI 未及出答/被框架打断——打断在框架侧
+            # 先于本钩子发生,本钩子拦不住那一下)→ 本轮不再独立抢答:本轮 user
+            # 消息补进 chat ctx(_try_append_user_message 官方姿势)+StopResponse,
+            # 排合并补答(窗尾 generate_reply 一次性应答窗内合并的全部轮)。链式
+            # 连发:每个新轮 hook 入口收旧 flush,窗尾重排→补答恒落在最后一轮
+            # 提交 + 窗口处。快车道(defer-ack/say/QA 罐头/ storms)全部在上方
+            # StopResponse,不受影响;REPEAT 轮豁免(承应铁律:重复请求要快答,
+            # 刀2 同源)。BOK_BURST_MERGE_WINDOW_S=0 整闸关=旧行为逐字节。
+            _burst_window = _burst_merge_window_s()
+            _burst_gap = float(_burst_state["ts"]) - _burst_prev_ts
+            if (
+                _burst_window > 0
+                and _burst_prev_ts > 0.0
+                and not _burst_prev_answered
+                and 0 < _burst_gap <= _burst_window
+                and not closed.is_set()
+                and not getattr(self, "paused", False)
+                and str(flow_ctrl.last_verdict or "") != REPEAT
+            ):
+                _append_ok = await self._try_append_user_message(new_message)
+                try:
+                    _bm_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="burst-merge",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_bm_ms, ended_ms=_bm_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻合并
+                    pass
+                # 补答已在途=本轮「会被接住」,饿死账归零(防链中误触发 starve-ack)。
+                _starve["n"] = 0
+                _cancel_response_watchdog()
+                _arm_burst_flush(_burst_window - _burst_gap)
+                print(
+                    f"BURST_MERGE hold gap={_burst_gap:.2f}s window={_burst_window:.1f}s "
+                    f"ctx_appended={int(_append_ok)} (call {room_name})",
+                    flush=True,
+                )
+                # W-GATE:合并补答在途,本轮无即时交付 → 放行让位 judge
+                _reply_done_event.set()
+                raise StopResponse()
             _filler.arm()
 
         async def _try_append_user_message(self, new_message) -> bool:
