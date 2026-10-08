@@ -1,7 +1,7 @@
 # scripts/ 索引（G1；G1c 起顶层 .py 清零）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 134 个：`probes/` 50 + `bench/` 19 + `e2e/` 10 + `seed/` 15 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
+> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 135 个：`probes/` 51 + `bench/` 19 + `e2e/` 10 + `seed/` 15 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口；`scripts/ops/import_smoke.py` 逐件装载冒烟（CI ci.yml 常驻步）。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
@@ -85,6 +85,7 @@
 | `scripts/probes/probe_ctx_decode.py` | 上下文长度→decode 吞吐成本微基准(2026-09-24):prompt 1.7k vs 3.2k 的 decode tps。 | 无(手动) | 是 | 2026-09-26 |
 | `scripts/probes/probe_cuda_baseline.py` | CUDA 原型延迟基线探针（spec §9 门禁）：在 CUDA 节点跑与 Mac 侧同口径的 TTFT/ASR 采样出 JSON 基线（Mac 上 --dry-run 只校验参数）。 | SHAPES.md | 是 | 2026-10-04 |
 | `scripts/probes/probe_deepseek_thinking.py` | DeepSeek 官方「思考开关」实测（2026-09-21）。 | 无(手动) | 是 | 2026-09-22 |
+| `scripts/probes/probe_doubao_utterances.py` | 豆包 SAUC definite utterance 时序探针（2026-10-08 协议定案取证）：say 合成普通话五臂（0.4s/0.8s 停顿/连续/长会话>30s/尾部静音喂入），200ms 实时分包喂入不提前发末包，逐帧落 utterances（text/definite/时间戳）原样 JSONL，定案「说话中云侧是否增量下发 definite / 静音多久自发 end_window」。 | probe_cloud_asr.py import（协议同源）/ agent doubao_asr.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_fast_speech.py` | 快语速吃字/回声守卫探针（2026-09-12 Task 2 验收）。 | 3 脚本 import / test_probe_stimulus_tools.py | 是 | 2026-10-01 |
 | `scripts/probes/probe_filler_timing.py` | 垫话时序探针:用户讲完一句后,agent 出声(垫话或回复)必须 <2s。 | LATENCY_BUDGETS.md / AGENTS.md | 是 | 2026-09-23 |
 | `scripts/probes/probe_flow_20rounds.py` | A 线 20 轮粤语全流程实弹探针（FLOW20 验收电池）。 | test_settle_state_assertion.py / test_ab_slot_actor.py | 是 | 2026-09-30 |
