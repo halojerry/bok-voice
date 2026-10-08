@@ -2,10 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SWRConfig } from "swr";
 import { AlertCircle, Inbox } from "lucide-react";
 import { AccountProvider, useAccount } from "@/components/account-context";
+import { installDirtyUnloadGuard } from "@/lib/dirty-signal";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -89,6 +90,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   // 汉堡按钮 ref：抽屉（dialog）关闭后 Sidebar 把焦点还到打开者。
   const mobileTriggerRef = useRef<HTMLButtonElement | null>(null);
+  // 关标签/刷新守卫（2026-10-08 dirty 拦截刀）：全局 dirty 时才拦（仅 dirty 生效、
+  // 常驻监听零拆挂）；站内 Link 导航由 Sidebar/Topbar onClick 的 guardDirtyNavClick 拦。
+  useEffect(() => installDirtyUnloadGuard(), []);
   // 会话在最外层：AccountProvider（账号归属）与导航/守卫都读 SessionProvider。
   return (
     <SessionProvider>

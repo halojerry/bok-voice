@@ -17,6 +17,7 @@ import { useMemo, useState, type ReactNode, type Ref } from "react";
 import { Menu } from "lucide-react";
 import { useSession, useSessionActions } from "@/components/session-context";
 import { api } from "@/lib/api";
+import { guardDirtyNavClick } from "@/lib/dirty-signal";
 import { FLAT_NAV, GUARD_ONLY, matchesPath } from "@/lib/navigation";
 
 export type TopbarProps = {
@@ -187,6 +188,7 @@ export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) 
                 用户实测「看不到登录页」）——已配 BOK_JWT_SECRET 的部署点此进入账号态。 */}
             <Link
               href="/login/"
+              onClick={guardDirtyNavClick}
               className="transition text-xs text-muted-foreground hover:text-foreground"
             >
               登录
@@ -214,7 +216,9 @@ export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) 
             </button>
           </span>
         )}
-        <Link href="/calls/new" className="btn-primary">
+        {/* 壳层常驻 Link 同拦 dirty（与侧栏同款守卫，2026-10-08）：从顶栏 CTA
+            离开编辑页丢改动与侧栏是同一类泄漏。 */}
+        <Link href="/calls/new" className="btn-primary" onClick={guardDirtyNavClick}>
           进入工作台
         </Link>
       </div>
