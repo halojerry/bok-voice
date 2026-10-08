@@ -1455,6 +1455,136 @@ def _lag_turn_timing(rec: tuple[float, int, int], now: float, t0: float) -> tupl
     )
 
 
+# —— B 线碎片闸(Wave 3a,2026-10-08「B 线 A 线化」) -----------------------------
+# 豆包云档 FINAL 只按 VAD 静音切分(min_silence 0.28s):「啊。」「No.」「你。」级
+# 纯应承碎片占 finals ~30%(2026-10-08 段级审计),每片独烧一条 ASR-final→MT 往返
+# →TTS 合成→播报 全链,FIFO 串行下尾部 perceived 尖刺(「译文：No.」5.3s 实证)。
+# 闸语义=**hold-and-merge,绝不丢**(同传保真):worker 取到纯应承碎片时 hold
+# ≤BOK_INTERP_FRAG_HOLD_S(缺省 0.6s)等下一段——到=并成一句一次翻译(账本
+# drop_src 补偿保配对对齐);超时=照旧单独出译(纯语气句代价=该片 +hold 延迟,
+# INTERP_FRAG flush 行可观测)。碎片判据=剥标点后逐字纯应承(复用 A 线
+# _PURE_ACK_TAIL_CHARS+人称代词/英文应承词)——数字 run/任何实词永不闸(内容必译)。
+# kill-switch BOK_INTERP_FRAG_MERGE=0 旧路径逐字节(不 hold 不并,零额外 await);
+# 窗口 BOK_INTERP_FRAG_HOLD_S 可调(坏值回缺省 0.6,负数钳 0,上限 2.0)。
+_FRAG_MERGE_ENV = "BOK_INTERP_FRAG_MERGE"
+_FRAG_HOLD_ENV = "BOK_INTERP_FRAG_HOLD_S"
+_FRAG_HOLD_DEFAULT_S = 0.6
+_FRAG_HOLD_MAX_S = 2.0
+_FRAG_MAX_ABSORB = 3  # 单次 hold 最多并入段数(链式碎片帽)
+_FRAG_MAX_CHARS = 80  # 并后总字数帽(超长不并)
+_INTERP_FRAG_ACK_EXTRA = frozenset("你我他她它您诶")  # 人称单字(「你。」)
+_INTERP_FRAG_ACK_WORDS = frozenset(
+    {
+        "no", "yes", "yeah", "yep", "nope", "ok", "okay", "right", "sure",
+        "hmm", "hm", "um", "uh", "oh", "ah", "hey", "wow", "well",
+    }
+)
+_FRAG_BOUNDARY_TAIL = "，。！？；、,.!?;:…"
+_FRAG_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _interp_frag_merge_enabled() -> bool:
+    """碎片闸总门(默认开;0=旧路径逐字节——worker 侧短路,零额外 await)。"""
+    return os.environ.get(_FRAG_MERGE_ENV, "1") == "1"
+
+
+def _interp_frag_hold_s() -> float:
+    """hold 窗口秒(纯函数,单测直喂):坏值回缺省 0.6;负数钳 0;上限 2.0。"""
+    raw = os.environ.get(_FRAG_HOLD_ENV, "")
+    try:
+        v = float(raw) if raw else _FRAG_HOLD_DEFAULT_S
+    except ValueError:
+        return _FRAG_HOLD_DEFAULT_S
+    if v < 0:
+        return 0.0
+    return min(v, _FRAG_HOLD_MAX_S)
+
+
+def _interp_frag_is_ack(text: str) -> bool:
+    """纯应承碎片判据(纯函数):剥标点后为空(纯语气「嗯。」)或逐字纯应承
+    (A 线 _PURE_ACK_TAIL_CHARS 复用+人称代词)或整词英文应承(「No.」)。
+    数字/任何实词(「我唔知」)→ False 永不闸(内容必译)。"""
+    from .providers.livekit_plugins import _PURE_ACK_TAIL_CHARS, _strip_punct_space
+
+    core = _strip_punct_space(str(text or ""))
+    if not core:
+        return True
+    if core.lower() in _INTERP_FRAG_ACK_WORDS:
+        return True
+    return all(ch in _PURE_ACK_TAIL_CHARS or ch in _INTERP_FRAG_ACK_EXTRA for ch in core)
+
+
+def _frag_join(frag: str, text: str) -> str:
+    """碎片并入下段(纯函数):碎片已带句界标点=CJK 直连/拉丁补空格;裸碎片补
+    一枚逗号(CJK 全角)。保序:碎片恒在前(时间序=语序)。"""
+    f = str(frag or "").strip()
+    t = str(text or "").lstrip()
+    if not f:
+        return t
+    if f[-1] in _FRAG_BOUNDARY_TAIL:
+        if f[-1] in ",.?;:!" and t and not _FRAG_CJK_RE.search(t[0]):
+            return f + " " + t
+        return f + t
+    sep = "，" if (_FRAG_CJK_RE.search(f) or _FRAG_CJK_RE.search(t)) else ", "
+    return f + sep + t
+
+
+async def _frag_absorb(
+    text: str,
+    *,
+    q: asyncio.Queue,
+    backlog: "_PlaybackBacklog",
+    lag: "_LagLedger",
+    hold_s: float | None = None,
+    max_absorb: int = _FRAG_MAX_ABSORB,
+    max_chars: int = _FRAG_MAX_CHARS,
+) -> tuple[str, int, float]:
+    """hold-and-merge 执行体(worker 专用;队列/账本注入=单测免真会话)。
+
+    调用前提:text 已过 _interp_frag_is_ack 判真(worker 侧闸)。返回
+    (合并文, 并入段数, hold 毫秒)。账本补偿:note_src 每入队段一条,N 段并
+    1 译=drop_src × (N-1),配对锚=最后一段(merged 译文 t_src=末段 final,hold
+    窗不计入 perceived——hold 税单列 INTERP_FRAG 行)。摘译语义保真:hold 中
+    弹出的下段若命中背压摘译(_mt_consume_skip 真),该段照旧 drop(不并入不
+    译),碎片独立放行。task_done 随 get 逐段平衡(finally 的那枚归外层弹的)。
+    """
+    hold = _interp_frag_hold_s() if hold_s is None else max(0.0, hold_s)
+    parts: list[str] = [str(text)]
+    hold_ms = 0.0
+    while len(parts) - 1 < max_absorb and sum(len(p) for p in parts) < max_chars:
+        w0 = time.perf_counter()
+        try:
+            nxt = await asyncio.wait_for(q.get(), timeout=hold)
+        except asyncio.TimeoutError:
+            hold_ms += (time.perf_counter() - w0) * 1000
+            break
+        hold_ms += (time.perf_counter() - w0) * 1000
+        q.task_done()
+        if _mt_consume_skip(backlog, nxt):
+            lag.drop_src()
+            break
+        parts.append(nxt)
+        if not _interp_frag_is_ack(nxt):
+            break  # 内容段已并入,停
+    n = len(parts) - 1
+    if n <= 0:
+        print(
+            f"[interp] INTERP_FRAG flush chars={len(str(text))} hold_ms={int(hold_ms)}",
+            flush=True,
+        )
+        return str(text), 0, hold_ms
+    for _ in range(n):
+        lag.drop_src()
+    merged = parts[0]
+    for p in parts[1:]:
+        merged = _frag_join(merged, p)
+    print(
+        f"[interp] INTERP_FRAG merge n={n + 1} chars={len(merged)} hold_ms={int(hold_ms)}",
+        flush=True,
+    )
+    return merged, n, hold_ms
+
+
 # —— B 线 interim 投机翻译(prewarm-and-confirm,2026-10-06) -------------------
 # Ethan 指令:A/B 线都要吃 interim 流喂 LLM,B 线反应必须快过 A 线。目标:译文
 # 首声从「segment-end + MT 往返 + TTS 首包」压到「final 即声」——MT+合成在
@@ -2097,6 +2227,15 @@ async def entrypoint(ctx) -> None:
                 if _mt_consume_skip(backlog, text):
                     _lag.drop_src()  # 摘译句不产出译文:消费 src 头保后续配对对齐
                     continue
+                # Wave 3a 碎片闸(hold-and-merge,2026-10-08):纯应承碎片 hold
+                # ≤BOK_INTERP_FRAG_HOLD_S 等下段并入一次翻译(账本 drop_src 补偿
+                # 在 _frag_absorb 内);超时=照旧单独出译。kill-switch=0 短路
+                # =旧路径逐字节(零额外 await)。hold 期 _mt_busy 已置位=投机
+                # 不开火(下段改走队列被并入,防双烧)。
+                if _interp_frag_merge_enabled() and _interp_frag_is_ack(text):
+                    text, _frag_n, _frag_hold_ms = await _frag_absorb(
+                        text, q=_src_q, backlog=backlog, lag=_lag
+                    )
                 t0 = time.perf_counter()
                 # MT 入口确定性音近吸附(2026-10-08 P0,subagent 调研:今晚 69 条原文
                 # ≈19% ASR 噪声被忠实翻译):复用 A 线 asr_polish 确定性层(纯本地
