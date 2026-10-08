@@ -816,6 +816,10 @@ _FORWARD_ENV = (
     #    （豆包四语 24/24 幻听实测；MiniMax 24/24 CER≤0.08）总闸（缺省开，
     #    0=回旧装配链逐字节；B 线 worker 专属，_interp_env 透传白名单同键） ——
     "BOK_MINIMAX_ASR",
+    # —— W3b spec busy 闸放宽（2026-10-08，命中率 4/108 主刀）：spec 开火的 FIFO
+    #    深度门（qsize ≥ depth 才算忙）；缺省 2=深度门（正常说话节奏闸恒开），
+    #    1=旧「非空即封」档一键回退；坏值回 2/<1 钳 1；_interp_env 透传白名单同键 ——
+    "BOK_INTERP_SPEC_BUSY_DEPTH",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
@@ -988,6 +992,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # B 线 spec 必中体有界等待 2026-10-08 时效波 C2：缺省 0.6，0=关（旧
         # not_ready 即 miss 档；B 线 worker 专属）。
         "BOK_INTERP_SPEC_WAIT_S",
+        # W3b spec busy 闸放宽 2026-10-08：FIFO 深度门（缺省 2；1=旧非空即封档；
+        # B 线 worker 专属，_FORWARD_ENV 已登记）。
+        "BOK_INTERP_SPEC_BUSY_DEPTH",
         # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",

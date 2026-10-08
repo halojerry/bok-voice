@@ -1639,6 +1639,38 @@ def _interp_spec_wait_s() -> float:
     return min(max(v, 0.0), _SPEC_WAIT_MAX_S)
 
 
+# —— W3b·spec busy 闸放宽(2026-10-08,spec 命中率 4/108 主刀) ---------------------
+# 架构体检实证:busy 闸=FIFO 非空∨MT 在途∨摘译 pending 任一真即封——连续说话时
+# FIFO 常非空+frag hold 期 _mt_busy 恒真,整通只开出 4/108 次投机。两刀:
+# ① FIFO 条件从「非空」改「深度 ≥BOK_INTERP_SPEC_BUSY_DEPTH」(默认 2):深度 1
+#   =待译积压真忙(下一句已排队,投机让位);深度 0-1 句在队=FIFO 秒空,正常说话
+#   节奏里闸恒开(1=旧「非空即封」档,一键回退)。
+# ② frag hold 期不再无条件封——hold 是「等合并」不是「真忙」:_mt_busy 置位点
+#   从取句即置挪到 frag absorb 之后(真 MT 起跑才置位,见 _mt_say_worker)。hold
+#   期 spec 可开火:命中=下段 final 走 spec 交付(不进队,absorb 超时放行碎片,
+#   零重复——同一段内容只会走其中一条路);未命中=下段照旧入队被并入。
+#   已知小代价:hold+HIT 竞态窗内 _LagLedger FIFO 配对可能错行(spec 的
+#   note_src 插队在 hold 中碎片之前)——只影响 INTERP_LAG 观测行的归属,不影响
+#   播放/记账平衡,文档化接受。
+# ③ 观测:fired/blocked 计数挂在 _spec_stats(闭包共享 dict),开火行带双计数、
+#   封锁期首拍打 INTERP_SPEC busy 行(每封锁 episode 一行,不刷屏)。
+# kill-switch BOK_INTERP_SPEC_BUSY_DEPTH(默认 2;1=旧「非空即封」档;坏值回 2,
+# <1 钳 1)。_mt_busy 与 backlog.source_drops_pending 两条件语义不动。
+_SPEC_BUSY_DEPTH_ENV = "BOK_INTERP_SPEC_BUSY_DEPTH"
+_SPEC_BUSY_DEPTH_DEFAULT = 2
+
+
+def _spec_busy_depth() -> int:
+    """spec 开火的 FIFO 深度门(纯函数,单测直喂):qsize ≥ depth 才算忙。
+    坏值回缺省 2;<1 钳 1(1=旧「非空即封」档)。"""
+    raw = os.environ.get(_SPEC_BUSY_DEPTH_ENV, "")
+    try:
+        v = int(raw) if raw else _SPEC_BUSY_DEPTH_DEFAULT
+    except ValueError:
+        return _SPEC_BUSY_DEPTH_DEFAULT
+    return max(1, v)
+
+
 def _persona_voice_map(persona: dict) -> dict:
     """B 线人设音色 → 三语言同把声(纯函数,单测直喂;A 线同款整场同声语义)。
 
@@ -1924,6 +1956,7 @@ class _SpecMtController:
         log: Callable[[str], None] = print,
         note_src: Callable[[str], None] | None = None,
         spec_wait_s: float | None = None,
+        stats: dict | None = None,
     ) -> None:
         self._enabled = enabled
         self._detector = detector
@@ -1933,6 +1966,9 @@ class _SpecMtController:
         self._say_cached = say_cached  # (final_src, text, pcm) -> None(异常上抛)
         self._enqueue = enqueue  # (rest) -> None:余段入 FIFO+记账
         self._log = log
+        # W3b busy 闸放宽:fired/blocked 计数(与 busy 闸闭包共享同一 dict;
+        # None=不计数,开火行逐字节同旧)。
+        self._stats = stats
         # C2(2026-10-08 时效波):not_ready 有界延迟交付——confirm 时 slot 在途但
         # sim 已过门=必中,等合成落地再 HIT(有界);兜底=正常入队(note_src 先记账
         # 保配对)。note_src 缺省 None=旧行为(不延迟,立刻 miss)。
@@ -1959,7 +1995,14 @@ class _SpecMtController:
         if old is not None and not old.done():
             old.cancel()  # 单飞:新 span 顶掉旧投机(cancel→本地车道 abort/云端纯弃)
         hold.task = asyncio.create_task(self._fire(span))
-        self._log(f"[interp] INTERP_SPEC fire chars={len(span)}")
+        if self._stats is not None:
+            self._stats["fired"] = self._stats.get("fired", 0) + 1
+            self._log(
+                f"[interp] INTERP_SPEC fire chars={len(span)} "
+                f"fired={self._stats['fired']} blocked={self._stats.get('blocked', 0)}"
+            )
+        else:
+            self._log(f"[interp] INTERP_SPEC fire chars={len(span)}")
 
     async def _fire(self, span: str) -> None:
         try:
@@ -2510,9 +2553,6 @@ async def entrypoint(ctx) -> None:
         while True:
             text = await _src_q.get()
             _round += 1
-            # 真 MT 在途旗(2026-10-06 投机翻译 busy 闸消费;置位/清位零行为变化,
-            # BOK_INTERP_SPEC_MT=0 时无读者)。
-            _mt_busy["flag"] = True
             try:
                 # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
                 # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
@@ -2522,12 +2562,17 @@ async def entrypoint(ctx) -> None:
                 # Wave 3a 碎片闸(hold-and-merge,2026-10-08):纯应承碎片 hold
                 # ≤BOK_INTERP_FRAG_HOLD_S 等下段并入一次翻译(账本 drop_src 补偿
                 # 在 _frag_absorb 内);超时=照旧单独出译。kill-switch=0 短路
-                # =旧路径逐字节(零额外 await)。hold 期 _mt_busy 已置位=投机
-                # 不开火(下段改走队列被并入,防双烧)。
+                # =旧路径逐字节(零额外 await)。W3b busy 闸放宽(2026-10-08):
+                # hold 期不再置位 _mt_busy(hold 是等合并不是真忙,spec 可开火
+                # ——命中=下段 final 走 spec 交付不进队,零重复;未命中=下段
+                # 照旧入队被并入),置位点挪到真 MT 起跑前。
                 if _interp_frag_merge_enabled() and _interp_frag_is_ack(text):
                     text, _frag_n, _frag_hold_ms = await _frag_absorb(
                         text, q=_src_q, backlog=backlog, lag=_lag
                     )
+                # 真 MT 在途旗(2026-10-06 投机翻译 busy 闸消费;W3b 起仅覆盖真
+                # 译段,BOK_INTERP_SPEC_MT=0 时无读者)。
+                _mt_busy["flag"] = True
                 t0 = time.perf_counter()
                 # MT 入口确定性音近吸附(2026-10-08 P0,subagent 调研:今晚 69 条原文
                 # ≈19% ASR 噪声被忠实翻译):复用 A 线 asr_polish 确定性层(纯本地
@@ -2616,6 +2661,8 @@ async def entrypoint(ctx) -> None:
     from .tts_cache import frames_aiter, pcm_to_frames
 
     _mt_busy = {"flag": False}  # 真 MT 在途旗(投机 busy 闸消费,见 _mt_say_worker)
+    # W3b busy 闸观测:fired/blocked 计数+封锁 episode 首拍旗(busy 闸与控制器共享)。
+    _spec_stats = {"fired": 0, "blocked": 0, "was": False}
     _spec_on = _spec_mt_enabled() and tts_provider is not None
     if _spec_on:
         print(
@@ -2662,8 +2709,28 @@ async def entrypoint(ctx) -> None:
 
     def _spec_busy_gate() -> bool:
         """真车道忙闸(闭包后绑 backlog——事件只在 session.start 后流动,装配序安全):
-        FIFO 非空/真 MT 在途/背压摘译 pending 任一真=投机让路。"""
-        return bool(not _src_q.empty() or _mt_busy["flag"] or backlog.source_drops_pending)
+        FIFO 深度 ≥ BOK_INTERP_SPEC_BUSY_DEPTH(默认 2;1=旧「非空即封」档)/真 MT
+        在途/背压摘译 pending 任一真=投机让路。封锁 episode 首拍打 INTERP_SPEC
+        busy 行(fired/blocked 累计计数,每 episode 一行不刷屏)。"""
+        depth = _spec_busy_depth()
+        busy = bool(
+            _src_q.qsize() >= depth or _mt_busy["flag"] or backlog.source_drops_pending
+        )
+        st = _spec_stats
+        if busy:
+            st["blocked"] += 1
+            if not st["was"]:
+                st["was"] = True
+                print(
+                    f"[interp] INTERP_SPEC busy depth={depth} fifo={_src_q.qsize()} "
+                    f"mt={int(bool(_mt_busy['flag']))} "
+                    f"skip={int(bool(backlog.source_drops_pending))} "
+                    f"fired={st['fired']} blocked={st['blocked']}",
+                    flush=True,
+                )
+        else:
+            st["was"] = False
+        return busy
 
     def _spec_say_cached(final_src: str, text: str, pcm: bytes) -> None:
         """HIT 直播:held PCM 走 say(audio=frames) 零合成(qa_gate 罐头车同构)。
@@ -2693,6 +2760,7 @@ async def entrypoint(ctx) -> None:
         busy_gate=_spec_busy_gate,
         say_cached=_spec_say_cached,
         enqueue=_spec_enqueue,
+        stats=_spec_stats,
     )
     # W1×spec 饥饿修复(2026-10-08,call-21739d55 整通零开火定案):豆包档
     # clause-commit 在 interim 更新点先跑、会话级 interim 只带剥前缀尾巴,
