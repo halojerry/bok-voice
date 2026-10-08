@@ -555,3 +555,68 @@ def test_mt_worker_exception_path_says_fallback_source_pinned():
     assert "mt fail fallback say failed" in generic
 
 
+# ---- B 线人设音色复用（2026-10-08：音色链插人设层） ----
+
+
+def test_build_tts_provider_persona_layer(monkeypatch):
+    """人设层链位=会话级 voices > 人设 > 设置三键 > 默认；本地 qwen3 音色 ID
+    同样过滤；人设 map 只有三语键，四语目标天然缺席回落下层。"""
+    from agent_runtime.providers.livekit_plugins import MiniMaxTTS
+
+    for key in ("MINIMAX_MODEL", "MINIMAX_LANGUAGE_BOOST"):
+        monkeypatch.delenv(key, raising=False)
+    cfg = {"provider": "minimax", "speaker_zh": "settings-zh", "speaker_en": "settings-en"}
+
+    # ① 人设覆盖设置；未涉及的键（en）走设置。
+    p = interpret._build_tts_provider(
+        cfg, "zh", persona_voices={"zh": "persona-zh", "cantonese": "persona-canto"}
+    )
+    assert isinstance(_primary(p), MiniMaxTTS)
+    p_ls = _primary(p)._language_state
+    p_ls.lang = "zh"
+    assert _primary(p)._resolve_voice() == "persona-zh"
+    en = interpret._build_tts_provider(cfg, "en", persona_voices={"zh": "persona-zh"})
+    _primary(en)._language_state.lang = "en"
+    assert _primary(en)._resolve_voice() == "settings-en"
+
+    # ② 会话级仍最优先（覆盖人设）。
+    both = interpret._build_tts_provider(
+        cfg, "zh", {"zh": "session-zh"}, persona_voices={"zh": "persona-zh"}
+    )
+    _primary(both)._language_state.lang = "zh"
+    assert _primary(both)._resolve_voice() == "session-zh"
+
+    # ③ 人设里的本地 Qwen3 音色 ID 过滤（误配防 2054）→ 回落设置。
+    local_id = interpret._build_tts_provider(
+        cfg, "zh", persona_voices={"zh": "vivian"}
+    )
+    _primary(local_id)._language_state.lang = "zh"
+    assert _primary(local_id)._resolve_voice() == "settings-zh"
+
+    # ④ persona_voices 收 JSON 字符串（parse_voice_map 同源解析）。
+    as_json = interpret._build_tts_provider(cfg, "zh", persona_voices='{"zh": "persona-json"}')
+    _primary(as_json)._language_state.lang = "zh"
+    assert _primary(as_json)._resolve_voice() == "persona-json"
+
+    # ⑤ 不传人设=链路逐字节旧档（设置生效）。
+    legacy = interpret._build_tts_provider(cfg, "zh")
+    _primary(legacy)._language_state.lang = "zh"
+    assert _primary(legacy)._resolve_voice() == "settings-zh"
+
+
+def test_persona_voice_assembly_wiring_pins():
+    """接线 pin：装配点拉 persona（meta.persona_id → cp.get_persona →
+    parse_voice_map）并传入 _build_tts_provider；agent 侧 A 线 _parse_voice_map
+    别名=core 单源（防第二份拷贝回潮）。"""
+    src = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(encoding="utf-8")
+    assert '_persona_id = str(meta.get("persona_id") or "").strip()' in src
+    assert "await cp.get_persona(_persona_id)" in src
+    assert "persona_voices = parse_voice_map(_persona.get(\"reference_audio\"))" in src
+    assert "persona_voices=_persona_voices" in src
+
+    from agent_runtime.agent import _parse_voice_map
+    from bok_voice_core.voice_map import parse_voice_map
+
+    assert _parse_voice_map is parse_voice_map  # A 线别名=core 单源对象
+
+

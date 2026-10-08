@@ -54,6 +54,15 @@ export default function InterpretPage() {
       .then((rows) => setCloneVoices(rows.map((r) => ({ voice_id: String(r.voice_id ?? ""), label: r.label ? String(r.label) : undefined }))))
       .catch(() => setCloneVoices([]));
   }, []);
+  // 人设音色复用（2026-10-08）：建单可绑人设——未手动选音色的语言槽用人设的
+  // reference_audio 音色（A 线同一份解析，链位=手动音色 > 人设 > 设置 > 默认）。
+  const [personas, setPersonas] = useState<Array<{ id: string; name?: string }>>([]);
+  const [personaId, setPersonaId] = useState("");
+  useEffect(() => {
+    api.listPersonas()
+      .then((rows) => setPersonas(rows.map((r) => ({ id: String(r.id ?? ""), name: r.name ? String(r.name) : undefined }))))
+      .catch(() => setPersonas([]));
+  }, []);
   const [glossary, setGlossary] = useState("");
   const [callId, setCallId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -87,6 +96,7 @@ export default function InterpretPage() {
         target_lang: otherLang,
         glossary,
         voices_json: Object.keys(voices).length ? JSON.stringify(voices) : "",
+        persona_id: personaId,
       });
       const id = String((created as { id?: string }).id ?? "");
       if (!id) {
@@ -180,6 +190,17 @@ export default function InterpretPage() {
           </label>
         </div>
         <label className="flex flex-col gap-1 text-xs">
+          <span className="muted">人设音色（可选，未手动选音色的语言槽用人设的音色）</span>
+          <select className="select" value={personaId} onChange={(e) => setPersonaId(e.target.value)}>
+            <option value="">（不绑定）</option>
+            {personas.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name || p.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-xs">
           <span className="muted">术语表（可选，治专名误听与译名漂移）</span>
           <textarea
             className="textarea min-h-20"
@@ -190,11 +211,10 @@ export default function InterpretPage() {
         </label>
         <p className="text-xs leading-relaxed muted">
           两人各一支麦：一个页面同时接入本会话两端，同页看双向原文+译文字幕。听感拓扑——
-          <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声</strong>（像直接通话），
-          对方→我方的译文只显示文字不出声；我方译文播报时自动暂让对方麦克风防串译。
+          <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声 + 对方译文的译员耳语</strong>
+          （译员耳语默认开，进房后控制台「译员耳语」开关可关）；我方译文播报时自动暂让对方麦克风防串译。
           说话中按句出译文（不必等停嘴）。语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
-          音色可按语言另选（MiniMax 云端音色）；不选则用设置页「分语言音色」。我方音色仅在 rev
-          双向出声开启时用于我方译文（默认我方纯字幕）。
+          音色优先级=手动选的音色 &gt; 人设音色 &gt; 设置页「分语言音色」&gt; 默认。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话

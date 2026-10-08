@@ -186,6 +186,8 @@ class DoubaoSTT(stt.STT):
         speaker_lock=None,
         connect_timeout: float = _CONNECT_TIMEOUT_S,
         final_timeout: float = _FINAL_TIMEOUT_S,
+        utt_merge: bool = False,
+        utt_wait_s: float = 0.45,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -214,6 +216,13 @@ class DoubaoSTT(stt.STT):
         self._speaker_lock = speaker_lock
         self._connect_timeout = float(connect_timeout)
         self._final_timeout = float(final_timeout)
+        # 尾部续说观察窗（B 线 3b，2026-10-08）：END 不立刻负 seq 定稿，先等
+        # utt_wait_s——窗口内续讲=同一 WS 会话续喂（服务端 result.text 单调
+        # 累积=微停顿并段），静默到底才负 seq 定稿。**B 线专用**（interpret
+        # 装配点传 True；A 线不传=逐字节旧路）。观察值=说话末音后总静默
+        # (VAD min_silence + utt_wait_s) 才切句：0.45+0.45=0.9s 档。
+        self._utt_merge = bool(utt_merge)
+        self._utt_wait_s = min(max(float(utt_wait_s or 0.0), 0.0), 3.0)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
         # 回复在途旗、收线窗旗、本轮 partial 末稿。云档语义见各方法 docstring。
         self._partial_ms_override: int | None = None
@@ -370,6 +379,13 @@ class _DoubaoLiveStream(stt.RecognizeStream):
     生命周期：START_OF_SPEECH 开 WS（配置帧 seq=1）→ 说话中 200ms 分包喂音频
     → END_OF_SPEECH 发末包（负 seq）→ 等 is_last 收全文 → FINAL_TRANSCRIPT。
     收线窗（_closing_say）整段丢弃；live 路失败且无文本时整段单发重试一次。
+
+    **尾部续说观察窗（utt 档，B 线 3b 2026-10-08，stt_._utt_merge=False=零行为）**：
+    END_OF_SPEECH 不立刻负 seq 定稿——先观察 utt_wait_s：窗口内 START（续讲）
+    =微停顿并段（同会话续喂，服务端 result.text 单调累积=天然并稿，不重开 WS）；
+    静默到底=负 seq 定稿整段出 FINAL。有效切句边界=说话末音后
+    (VAD min_silence + utt_wait_s) 总静默（B 线 0.45+0.45=0.9s 档），微停顿不再
+    一停一句。等待期不喂帧（服务端不计静音、不提前 end_window，窗口主权在本地）。
     """
 
     def __init__(self, stt_: DoubaoSTT, *, conn_options):
@@ -392,6 +408,13 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._receiver_task: asyncio.Task | None = None
         self._final_evt: asyncio.Event | None = None
         self._session_alive = False
+        # 尾部续说观察窗（B 线 3b；stt_._utt_merge=False=零行为逐字节旧路）
+        self._utt = bool(getattr(stt_, "_utt_merge", False))
+        self._utt_wait = float(getattr(stt_, "_utt_wait_s", 0.0) or 0.0)
+        self._tailing = False            # END 已发、尾窗观察中（INFERENCE 喂入停）
+        self._tail_task: asyncio.Task | None = None
+        self._tail_finalizing = False    # 尾窗已到期、负 seq 定稿在途（START 让路）
+        self._utt_merges = 0             # 本 utterance 内并掉的微停顿数（观测）
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
@@ -581,6 +604,64 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 暴露位随段清零；FINAL 发出点按 pre-reset 快照重贴（与 Qwen3 版契约一致）。
         self._stt_._turn_partial_text = ""
 
+    async def _finalize_utterance(self) -> None:
+        """负 seq 定稿 → FINAL → 声纹登记 → 段复位（legacy 内联路=utt 尾窗到期路共用）。
+
+        与旧 END 内联路径逐字节同序：快照 partial → `_finish_segment`（末包→等
+        is_last→失败整段单发重试）→ FINAL 事件 → DOUBAO_ASR_TEXT 行（utt 档追加
+        utt_merges 列）→ gate.segment_end 灰区复核 → 复位 → pre-reset 快照重贴。
+        """
+        t0 = time.monotonic()
+        partial_snapshot = self._last_server_text
+        text = await self._finish_segment()
+        if text:
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[
+                        stt.SpeechData(language=self._stt_._lang(), text=text)
+                    ],
+                )
+            )
+        suffix = f" utt_merges={self._utt_merges}" if self._utt else ""
+        print(
+            f"DOUBAO_ASR_TEXT {text[:120]!r} {self._stt_._lang()} "
+            f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(cloud){suffix}",
+            flush=True,
+        )
+        # 段末收口：灰区整段复核判丢→吞 FINAL（幻听轮不成）；登记钩照走。
+        if not self._gate.segment_end(text):
+            text = ""
+        self._finishing = False
+        self._utt_merges = 0
+        self._reset_segment()
+        if text and partial_snapshot:
+            self._stt_._turn_partial_text = partial_snapshot
+
+    async def _tail_watch(self) -> None:
+        """尾部续说观察窗（B 线 3b）：睡满 utt_wait_s=真停顿→负 seq 定稿整段。
+
+        被取消=窗口内续讲（START 分支 cancel）→ 同会话续喂，微停顿并段；
+        服务端 ``result.text`` 单调累积（实弹定案），续段文本天然并进同一稿。
+        """
+        try:
+            await asyncio.sleep(self._utt_wait)
+        except asyncio.CancelledError:
+            return
+        # 尾窗到期：此后不再可并段——START 若撞上，让它等定稿走完再开新会话。
+        self._tail_finalizing = True
+        self._tail_task = None
+        self._tailing = False
+        self._finishing = True
+        try:
+            await self._finalize_utterance()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 尾窗定稿失败不阻后续段
+            print(f"DOUBAO_UTT_TAIL_ERROR {exc!r}", flush=True)
+            self._finishing = False
+            self._reset_segment()
+
     # ---- 主循环（VAD 双任务骨架，与 _Qwen3ASRLiveStream 同构）----
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -597,12 +678,42 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             started = False
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
+                    # 尾部续说观察窗内续讲=微停顿并段（B 线 3b）：取消尾窗、
+                    # 同会话续喂（不重开 WS——服务端 text 单调累积天然并稿）。
+                    # 尾窗已到期、定稿在途=不可并段：等定稿走完（会话已关），
+                    # 本次 START 走新会话路（停顿≥窗口=真 utterance 边界）。
+                    if self._tail_task is not None or self._tail_finalizing:
+                        t, self._tail_task = self._tail_task, None
+                        if self._tail_finalizing:
+                            if t is not None:
+                                try:
+                                    await t
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception:  # noqa: BLE001 - 定稿异常已由尾窗记录
+                                    pass
+                            self._tail_finalizing = False
+                            self._tailing = False
+                        else:
+                            t.cancel()
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:  # noqa: BLE001
+                                pass
+                            self._tailing = False
+                            self._utt_merges += 1
+                            print("DOUBAO_UTT_MERGE resume", flush=True)
                     started = True
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH)
                     )
                     self._gate.segment_start()
-                    await self._open_session()
+                    # legacy=每段必开新会话（段末已关）；utt=会话跨停顿存活，
+                    # 仅在确无活会话时开（续说复用=并段的关键）。
+                    if not self._session_alive:
+                        await self._open_session()
                     if event.frames:
                         # 前导喂会话（silero prefix padding + min_speech 确认窗帧）
                         try:
@@ -610,7 +721,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         except Exception:  # noqa: BLE001 - 合帧失败不致命
                             pass
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
-                    if not started or self._finishing:
+                    if not started or self._finishing or self._tailing:
                         continue
                     try:
                         self._feed(bytes(utils.merge_frames(event.frames).data))
@@ -623,6 +734,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     if bool(getattr(self._stt_, "_closing_say", False)):
                         started = False
                         self._finishing = False
+                        self._cancel_tail()
                         self._reset_segment()
                         print("DOUBAO_ASR_CLOSING_SAY_SUPPRESS src=segment_eos", flush=True)
                         continue
@@ -631,6 +743,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     if self._gate.dropped:
                         started = False
                         self._finishing = False
+                        self._cancel_tail()
                         await self._close_session()
                         self._gate.segment_end("")
                         self._reset_segment()
@@ -645,33 +758,27 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                             speech_end_time=speech_end_time,
                         )
                     )
-                    t0 = time.monotonic()
-                    partial_snapshot = self._last_server_text
-                    text = await self._finish_segment()
-                    if text:
-                        self._event_ch.send_nowait(
-                            stt.SpeechEvent(
-                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                alternatives=[
-                                    stt.SpeechData(language=self._stt_._lang(), text=text)
-                                ],
-                            )
-                        )
-                    print(
-                        f"DOUBAO_ASR_TEXT {text[:120]!r} {self._stt_._lang()} "
-                        f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(cloud)",
-                        flush=True,
-                    )
-                    # 段末收口：灰区整段复核判丢→吞 FINAL（幻听轮不成）；登记钩照走。
-                    if not self._gate.segment_end(text):
-                        text = ""
+                    # ---- 尾部续说观察窗（B 线 3b）：END 不立刻定稿——窗口内续讲
+                    # 并段（服务端单调累积），静默到底负 seq 定稿。等待期不喂帧
+                    # （服务端不计静音、不提前 end_window，窗口主权在我们）。----
+                    if self._utt and self._utt_wait > 0:
+                        self._finishing = False
+                        self._tailing = True
+                        started = False
+                        self._tail_task = asyncio.create_task(self._tail_watch())
+                        continue
+                    await self._finalize_utterance()
                     started = False
-                    self._finishing = False
-                    self._reset_segment()
-                    if text and partial_snapshot:
-                        self._stt_._turn_partial_text = partial_snapshot
 
         try:
             await asyncio.gather(_forward_input(), _recognize())
         finally:
+            self._cancel_tail()
             await self._close_session()
+
+    def _cancel_tail(self) -> None:
+        """取消尾窗任务（续讲/收线/声纹丢段/流关闭共用；已到期=无害 noop）。"""
+        t, self._tail_task = self._tail_task, None
+        if t is not None and not t.done():
+            t.cancel()
+        self._tailing = False

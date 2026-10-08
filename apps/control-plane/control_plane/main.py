@@ -2269,6 +2269,10 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         # 会话级音色(2026-09-17)同管道透传:双向同带 JSON map,fwd/rev 各按自己
         # target_lang 取键(_build_tts_provider 最优先档);空=跟随设置。
         voices_json = str(_call.get("voices_json") or "")
+        # B 线人设音色复用(2026-10-08):建单绑定的人设随 dispatch 双向下发——
+        # interpret 侧 cp.get_persona 拉 reference_audio,A 线 parse_voice_map
+        # 同源解析折进音色链(会话级 voices 仍最优先)。空=该层缺席。
+        persona_id_dispatch = str(_call.get("persona_id") or "")
         from livekit.api import RoomAgentDispatch, RoomConfiguration
 
         at = at.with_room_config(
@@ -2283,6 +2287,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "target_lang": tgt,
                             "glossary": glossary,
                             "voices": voices_json,
+                            "persona_id": persona_id_dispatch,
                         }),
                     ),
                     RoomAgentDispatch(
@@ -2294,6 +2299,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "target_lang": src,
                             "glossary": glossary,
                             "voices": voices_json,
+                            "persona_id": persona_id_dispatch,
                         }),
                     ),
                 ]

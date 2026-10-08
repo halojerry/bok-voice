@@ -192,6 +192,9 @@ def test_interpret_session_token_roles_and_dispatch():
                 "direction": "interpret",
                 "language": "zh",
                 "target_lang": "en",
+                # B 线人设音色复用（2026-10-08）：persona_id 随 dispatch 双向下发
+                #（interpret 侧 cp.get_persona 拉 reference_audio 折音色链）。
+                "persona_id": "persona-voice-test",
             },
         ).json()
         assert created["kind"] == "interpret" and created["target_lang"] == "en"
@@ -213,6 +216,9 @@ def test_interpret_session_token_roles_and_dispatch():
         fwd = next(m for m in metas if m.get("listen_identity") == f"me-{room}")
         assert fwd["deliver_identity"] == f"other-{room}"
         assert fwd["source_lang"] == "zh" and fwd["target_lang"] == "en"
+        assert fwd["persona_id"] == "persona-voice-test"  # 人设随 dispatch 下发（双向同带）
+        rev = next(m for m in metas if m.get("listen_identity") == f"other-{room}")
+        assert rev["persona_id"] == "persona-voice-test"
 
         # 对方端 token 不挂 agent 分发(只有首个建房者生效)。
         assert not (other_claims.get("roomConfig") or other_claims.get("room_config"))
