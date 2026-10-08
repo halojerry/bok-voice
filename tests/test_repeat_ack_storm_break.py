@@ -14,9 +14,8 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "apps" / "agent"))
 
-from agent_runtime.agent import _ack_anchor_texts, _is_ack_anchor_text, _repeat_ack_line
-from agent_runtime.flow import REPEAT, decide_advance, is_repeat_request_text
-
+from agent_runtime.agent import _ack_anchor_texts, _is_ack_anchor_text, _repeat_ack_line  # noqa: E402
+from agent_runtime.flow import REPEAT, decide_advance, is_repeat_request_text  # noqa: E402
 
 # ---- 判据单源(flow.is_repeat_request_text)== decide_advance REPEAT 分支 ----
 

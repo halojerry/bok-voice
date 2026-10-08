@@ -18,8 +18,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "apps" / "agent"))
 
-from agent_runtime.agent import _is_repeat_fragment_pollution, _ticket_norm
-
+from agent_runtime.agent import _is_repeat_fragment_pollution  # noqa: E402
 
 _FRAG = "好的我哋而家就幫你查下張單"  # 假想被打断半截回复(13 字)
 

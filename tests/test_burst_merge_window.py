@@ -21,8 +21,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "apps" / "agent"))
 
-from agent_runtime.agent import _burst_merge_window_s
-
+from agent_runtime.agent import _burst_merge_window_s  # noqa: E402
 
 # ---- env 解析 ----
 
