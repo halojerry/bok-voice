@@ -1,7 +1,8 @@
 """ASR 热词沉淀（EX-H1，2026-09-28）单测。
 
-面：hotword_mining 纯函数（三源抽取 / 数字与回声铁律 / near-miss 规范用语 /
-gap n-gram 覆盖排除 / freq 排序与每语言上限 / LLM 判定解析）+ flow.py
+面：hotword_mining 纯函数（三源抽取 / 数字与回声铁律 / near-miss 规范用语与
+证据样近形 / gap n-gram 覆盖排除 / 子串吞噬丢短留长 / freq 排序与每语言上限 /
+LLM 判定解析）+ flow.py
 `_REPEAT_EXPLICIT_RE` 短语族镜像（pathlib 读源钉住）+ 表 DDL/仓储（镜像
 test_intent_rules 的 tmp sqlite + build_engine 幂等）+ CP 端点（GET
 /api/asr/hotwords 两级合并/过滤/400；POST /api/qa/cluster hotwords 段/采纳/审计/
@@ -107,12 +108,132 @@ def test_gap_ngram_needs_three_and_qa_coverage_excludes():
 
     three = [_conv("我要退货退款", "zh", f"c{i}") for i in range(3)]
     out = hm.extract_hotword_candidates(three, [])
-    assert any(r["word"] == "退货" and r["kind"] == "gap_ngram" and r["freq"] == 3 for r in out)
+    # 子串吞噬（IRON FILTER iv）后保留极大形：退货退款 在；其真子串 退货/货退款
+    # 等被吞（EX-H1 遗留①——同批候选互为子串时丢短留长，防短碎片稀释热词预算）。
+    assert any(r["word"] == "退货退款" and r["kind"] == "gap_ngram" and r["freq"] == 3 for r in out)
+    assert not any(r["word"] == "退货" for r in out)
 
     covered = hm.extract_hotword_candidates(
         three, [], existing_q_norms={normalize_question("我要退货退款")}
     )
     assert not any("退货" in r["word"] for r in covered)
+
+
+# ---- 子串吞噬过滤（EX-H1 遗留①，2026-10-08）----
+
+
+def test_substring_swallow_drops_shorter_same_batch():
+    """「拼多多」+「拼多」同采 → 「拼多」「多多」被滤、极大形「拼多多」保留。"""
+    convs = [_conv("拼多多，帮我查下订单", "zh", f"c{i}") for i in range(4)]
+    out = hm.extract_hotword_candidates(convs, [])
+    words = {r["word"] for r in out}
+    assert "拼多多" in words
+    assert "拼多" not in words and "多多" not in words
+
+
+def test_substring_filter_pure_function_drop_and_order():
+    """纯函数面：真子串丢短留长、保序、被吞词列表回传观测。"""
+    rows = [
+        {"word": "顺丰", "lang": "zh"},
+        {"word": "拼多多", "lang": "zh"},
+        {"word": "拼多", "lang": "zh"},
+    ]
+    kept, dropped = hm.filter_substring_swallowed(rows)
+    assert [r["word"] for r in kept] == ["顺丰", "拼多多"]
+    assert dropped == ["拼多"]
+
+
+def test_substring_filter_keeps_unrelated_and_cross_lang():
+    """互不为子串 → 都保留；跨语言不比较（热词表按 lang 分表下发互不稀释）。"""
+    rows = [
+        {"word": "退货", "lang": "zh"},
+        {"word": "退款", "lang": "zh"},
+        {"word": "refund", "lang": "en"},
+        {"word": "拼多多", "lang": "cantonese"},
+        {"word": "拼多", "lang": "zh"},  # 与 cantonese 的「拼多多」不同语言，不判
+    ]
+    kept, dropped = hm.filter_substring_swallowed(rows)
+    assert [r["word"] for r in kept] == ["退货", "退款", "refund", "拼多多", "拼多"]
+    assert dropped == []
+
+
+def test_substring_filter_case_and_width_normalized():
+    """全半角/大小写归一后判子串（NFKC+casefold）；展示形字段不被改写。"""
+    rows = [{"word": "PARDON", "lang": "en"}, {"word": "ｐａｒ", "lang": "en"}]
+    kept, dropped = hm.filter_substring_swallowed(rows)
+    assert [r["word"] for r in kept] == ["PARDON"]
+    assert dropped == ["ｐａｒ"]
+    assert kept[0]["word"] == "PARDON"  # 展示形原值不动
+
+
+def test_substring_filter_chain_keeps_maximal_only():
+    """链式包含（多⊂多多⊂拼多多）单趟收敛，只留极大形。"""
+    kept, dropped = hm.filter_substring_swallowed(
+        [{"word": w, "lang": "zh"} for w in ("多", "多多", "拼多多")]
+    )
+    assert [r["word"] for r in kept] == ["拼多多"]
+    assert dropped == ["多", "多多"]
+
+
+def test_substring_filter_empty_zero_drift():
+    """空输入=零输出零漂移（None/[]/缺 word 行防御不炸）。"""
+    assert hm.filter_substring_swallowed([]) == ([], [])
+    assert hm.filter_substring_swallowed(None) == ([], [])
+    kept, dropped = hm.filter_substring_swallowed([{"lang": "zh"}])  # 缺 word=空词不判
+    assert kept == [{"lang": "zh"}] and dropped == []
+
+
+# ---- near_miss 证据样（EX-H1 遗留②，2026-10-08）----
+
+
+def _raw_has_candidate_near_form(raw: str, word: str) -> bool:
+    """证据样必含候选词（或其归一形=casefold 字面/编辑预算内同长窗口）。"""
+    cf_raw, cf_w = raw.casefold(), word.casefold()
+    if cf_w in cf_raw:
+        return True
+    budget = min(hm.near_miss_edit_budget(len(cf_w)), len(cf_w) - 1)
+    for i in range(len(cf_raw) - len(cf_w) + 1):
+        if hm._edit_distance(cf_raw[i : i + len(cf_w)], cf_w) <= budget:
+            return True
+    return False
+
+
+def test_near_miss_short_budget_no_family_explosion():
+    """≤4 字短语只容 1 字差：一句话不再把整族规范语炸成候选（证据样失配根因）。
+
+    修复前 d=2 窗把「你说什幺」同时炸出 你說什麼/你讲乜/乜嘢话 等——证据样
+    （客户原话）与这些候选词根本对不上；修后只剩 d=1 的诚实近似「你说什么」。
+    """
+    out = hm.extract_hotword_candidates([_conv("你说什幺")], [])
+    near_words = {r["word"] for r in out if r["kind"] == "near_miss"}
+    assert near_words == {"你说什么"}
+
+
+def test_near_miss_evidence_sample_contains_candidate_near_form():
+    """任意 near_miss 行：evidence.raw 必含候选词（或其归一形/预算内近形）。"""
+    convs = [
+        _conv("你说什幺"),
+        _conv("我听唔清啊"),
+        _conv("再讲一次好吗"),
+        _conv("say agian please", "en"),
+        _conv("padon?", "en"),
+    ]
+    out = hm.extract_hotword_candidates(convs, [])
+    near = [r for r in out if r["kind"] == "near_miss"]
+    assert near  # 语料必须真的产出 near_miss 行，否则断言空转
+    for r in near:
+        raws = [str(e.get("raw") or "") for e in r["evidence"]]
+        assert raws, r["word"]
+        assert any(_raw_has_candidate_near_form(raw, r["word"]) for raw in raws), (
+            r["word"],
+            raws,
+        )
+
+
+def test_near_miss_latin_keeps_two_edit_budget():
+    """≥5 字拉丁族保持 2 字预算（拼错两个字母仍算近似）——分档只收紧 CJK 短语。"""
+    out = hm.extract_hotword_candidates([_conv("say agian please", "en")], [])
+    assert any(r["word"] == "say again" and r["kind"] == "near_miss" for r in out)
 
 
 def test_freq_ordering_and_per_lang_cap():
