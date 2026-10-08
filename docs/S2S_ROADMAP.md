@@ -66,3 +66,22 @@ W0 KV-cache 命中率工程 + W1 打断自噬修复）；普通话/英语可在�
    集防过拟。**用法=下一代本地 ASR 候选短名单源**，不直接当结论：批式离线榜 ≠ 我们
    流式 sidecar（句级提交/热词偏置/数字纪律/MLX 皆不在榜内），终裁走我们自己的
    碎裂语料 A/B 探针纪律。
+
+## 增补二（2026-10-08，B 线同传延迟三 subagent 实测；执行计划见 docs/superpowers/plans/2026-10-08-bline-parity.md）
+
+1. **HF speech-to-speech 二次评估（重叠形状专查）**：仍无同传重叠形状——其漏斗
+   是「转写 final 才触发 LLM」的串行三段，与「边说边译」零重叠。判定维持
+   「偷形状不用整包」，可偷五件工程件：revision turn 协议（同轮转写修订的
+   上下文改写）、CancelScope generation 计数打断、句批 stream_batch_sentences=3、
+   延迟分段 schema、progressive stale-filter——排后续 W 线。
+2. **豆包 definite utterance 实弹定案**：definite utterance 虽在说话中下发，但
+   滞后子句末 5-6s——**不能当提交边界**（死路）；interim `result.text`
+   ~400ms 更新才是快车道（W1 说话中成句的输入源）。探针
+   `scripts/probes/probe_doubao_utterances.py` 已入库（协议定案取证）；
+   utterance 自带 words[] 词级时间戳（未来字幕料）。
+3. **A/B 云档基线与路线定案**：A 线首声 p50=1763ms（eou600+llm666+tts546）；
+   B 线观察窗关档 1666ms **已反超 A**；窗开档 2332（观察窗税 +450）；结构性
+   缺口=MT 短句等整句（+224，first_ms≈mt_ms 实锤）+TTS 首音频 B 已占优
+   （468<546）。路线定案=全云三件套（DeepSeek 磁盘前缀缓存+MiniMax bidi
+   攒句规则+LiveKit FlushSentinel）+说话中成句（W1 主刀），见
+   2026-10-08-bline-parity.md。

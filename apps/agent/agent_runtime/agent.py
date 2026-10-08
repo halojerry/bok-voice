@@ -35,8 +35,8 @@ from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 # a-line-speed-asr-decision-verification.md §26.2-E1/E2);装配编译/每轮消费/
 # kill-switch 的接线在 agent 侧(见 _asr_postprocess)。
 from bok_voice_core.hotword_leak import sanitize as _hotword_leak_sanitize
-# 人设音色 map 解析（单源 core，2026-10-08 上收；A/B 线共用防拷贝漂移）。
-from bok_voice_core.voice_map import parse_voice_map
+# 人设音色 map 解析+整场同声收敛（单源 core，2026-10-08 上收；A/B 线共用防拷贝漂移）。
+from bok_voice_core.voice_map import collapse_voice_map, parse_voice_map
 from bok_voice_core.snippets import apply_snippets as _apply_snippet_rules
 from bok_voice_core.snippets import compile_rules_with_skipped as _compile_snippet_rules
 from bok_voice_core.snippets import merge_rules as _merge_snippet_rules
@@ -649,33 +649,11 @@ def _intent_judge_candidates(
     return eligible_judge_intents(graph, step_1based=step_1based, fired=fired)
 
 
-# 人设音色 map 解析单源（2026-10-08 B 线人设音色复用波上收 core：
-# bok_voice_core.voice_map.parse_voice_map）；本名保留=A 线既有调用面零变化。
+# 人设音色 map 解析+整场同声收敛单源（2026-10-08 B 线人设音色复用波上收 core：
+# bok_voice_core.voice_map.parse_voice_map / collapse_voice_map）；本名保留=
+# A 线既有调用面零变化。
 _parse_voice_map = parse_voice_map
-
-
-def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
-    """整场同声：把 persona 的 {zh,cantonese,en} 分语言 map 收敛成单一主音色。
-
-    主音色取人设主语言（persona.language）对应键，缺则按 zh→cantonese→en→首个非空
-    取；最终统一放进 zh 键（MiniMax/Qwen3 的 _resolve_voice 语言缺省都回落 zh），
-    使整场无论客户讲粤/普/英都用同一把声。回退点：若想恢复「按语言分音色」，
-    删掉本函数调用、直接传 raw_map 即可。语言值全时空统一 cantonese（旧值
-    已由 CP 启动迁移清零，这里不再兜别名）。
-    """
-    if not raw_map:
-        return {}
-    lang = (persona_lang or "").strip().lower()
-    if lang not in {"zh", "cantonese", "en"}:
-        lang = ""
-    picked = ""
-    for key in ([lang] if lang else []) + ["zh", "cantonese", "en"]:
-        if raw_map.get(key):
-            picked = str(raw_map[key])
-            break
-    if not picked:
-        picked = str(next((v for v in raw_map.values() if v), ""))
-    return {"zh": picked} if picked else {}
+_collapse_voice_map = collapse_voice_map
 
 
 _LANG_LABELS = {"zh": "普通话/中文", "cantonese": "粤语", "en": "英语"}

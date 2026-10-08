@@ -522,6 +522,37 @@ Dante 族）进 `device-roles` 单源；console realMic/realOut 双过滤硬排�
   短窗归并，段数砍半摊薄 MT 延迟，spec 命中率连带受益）→ 测试姿势戴耳机/
   分房 + 声纹锁 enrollment。内容碎片 blind-hold 收益小（continuation 间隔
   实测 1.7s+ 居多）不做。
+  *（2026-10-08 晚修订：mt A/B 回本地违反用户「AB 线全云腿」立法，撤回；
+  3b 已按「尾部续说观察窗」形状落地，见下节。）*
+
+## 执行纪要·3b 尾部续说观察窗 + B 线人设音色复用（2026-10-08，#223）
+
+- **3b 落地形状=尾部续说观察窗**（非 utterance 归并——服务端 utterance
+  边界在段内、跨 VAD 段无坐标，真杠杆是停顿观察）：DoubaoSTT 新增
+  `utt_merge/utt_wait_s`（**B 线专用旗，A 线不传=逐字节旧路**）——END 不
+  立刻负 seq 定稿，先观察 0.45s：窗口内 START=同 WS 会话续喂并段（服务端
+  `result.text` 单调累积=天然并稿，零拼接账本）；静默到底才定稿。有效切句
+  边界=说话末音后 0.45+0.45=0.9s 总静默。竞态护栏=`_tail_finalizing`（尾窗
+  到期定稿在途时 START=等定稿走完开新会话）；等待期不喂帧（窗口主权在
+  本地）。kill-switch `BOK_INTERP_UTT_MERGE`；调窗 `BOK_INTERP_UTT_WAIT_S`；
+  `_FORWARD_ENV` 272→274。观测=`DOUBAO_UTT_MERGE resume`/`utt_merges=N`。
+- **B 线人设音色复用**（用户拍板「复用人设里的音色」）：`_parse_voice_map`
+  上收 core 单源（A 线别名同对象）；CP dispatch 双向带 `persona_id`（建单
+  API 早收）→ interpret 经 CP 客户端拉 `reference_audio` 折音色链：会话级
+  voices > 人设 > 设置三键 > 默认（qwen3 音色 ID 同层过滤；四语目标天然
+  回落）；web 同传台建单加「人设音色」下拉。
+- **验收**：全量 5015 passed/2 skipped；web tsc+build 绿；e2e_interpret
+  **8/8**（READBACK=0 云档）。延迟探针（DeepSeek mt + utt 窗）单跑
+  [4028,3198]ms avg 3613 vs 预算 3500——贴线（构成=0.9s 边界税 + DeepSeek
+  0.7-1.0s 腿 + TTS 0.4s；旧 2223 基线是本地 MT2 时代）。**第二轮起
+  DeepSeek 402 Insufficient Balance**——A/B 线 LLM 全瘫（a_reply/judge/
+  settle/mt 同 key），探针 35s 数字=402 叠双 15s 超时，非代码回归；待充值
+  复测。spec 观测：39 fire/4 hit/24 miss，miss 主因 `not_ready`（短句
+  span fire 离句尾近，held PCM 全量排干赶不上 final——下一刀=首帧流式
+  持有/confirm 有界等待）。
+- **全云腿立法（用户二次强调）**：默认启动=纯全云（BOK_SPEAKER_LOCK/
+  BOK_AMBIENT_SCENE 可选）；`BOK_LOCAL_TTS/BOK_LOCAL_ASR=1` 仅为探针仪器位，
+  验收完即回纯云，不留本地模型。
 
 ## 风险与不做的事
 
