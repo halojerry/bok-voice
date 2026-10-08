@@ -128,6 +128,7 @@
 | `scripts/runtime/mock_callee.py` | mock SIP 客户(模拟联调档):CP 派生的真语音被叫。 | ★ CP main.py exec / bok.py（进程识别 marker） | 是 | 2026-09-21 |
 | `scripts/runtime/pregen_tts.py` | 离线批量预合成 TTS 本地缓存(bok.py tts-pregen 的执行体,2026-09-08;task-14b 按人设物化)。 | ★ CP pregen.py exec / bok.py tts-pregen | 是 | 2026-10-02 |
 | `scripts/seed/build_asr_variants.py` | 离线构建 ASR 音近变体词表资产(2026-09-27)。 | asr_polish.py | 否 | 2026-10-04 |
+| `scripts/seed/merge_asr_variants_extra.py` | curated 变体幂等并进吸附资产(2026-10-08 B 线 P0;builder 重建后须重跑回填,extra=asr_variants_extra_bline.json)。 | asr_polish.py / asr_variants.json | 否 | 2026-10-08 |
 | `scripts/seed/export_ecapa_onnx.py` | v2 认人票：官方 speechbrain ECAPA ckpt 自导出单文件 ONNX（临时 venv 跑，torch 懒导入非生产依赖；parity 断言+sha256 存档）。 | speaker_lock.py ECAPA 档 | 否 | 2026-10-07 |
 | `scripts/seed/cache_minimax_auditions.py` | MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。 | minimax-voices.ts | 是 | 2026-10-03 |
 | `scripts/seed/gen_filler_assets.py` | 垫话音频资产生成器(2026-09-10 拍板,spec 讨论见会话)。 | agent fillers.py / test_speed_unification.py | 是 | 2026-10-04 |

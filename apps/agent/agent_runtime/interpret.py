@@ -270,6 +270,23 @@ _CAPTION_TAG_EN = {
 }
 
 
+def _polish_for_mt(text: str, lang: str) -> str:
+    """B 线 MT 入口确定性音近吸附(纯函数,单测直喂;2026-10-08 P0)。
+
+    今晚实测(69 条原文 ≈19% 噪声被忠实翻译,如「我成鸟解下」→「我成鳥解下你
+    哋嘅產品」):ASR 错字原文直灌 MT=错得整整齐齐。复用 A 线 asr_polish 的
+    确定性层(纯本地 ~1ms、数字/拉丁冻结、>max_edits 整层放弃、粤特征字守卫),
+    kill-switch 同 ``BOK_ASR_POLISH``。**原文单轨铁律**——本函数只喂 MT 上下文
+    与 ``_mt_pairs`` 滚动对;账本/字幕/spec 判定/QA 快路全吃 raw(调用点纪律,
+    source-pin 测试钉死)。四语源(de/fr/ja/pt)表空且 detect_lane 会把日文嗅成
+    zh,直通原样。"""
+    if lang not in ("zh", "cantonese", "en") or not text:
+        return text
+    from .asr_polish_runtime import sync_polish
+
+    return sync_polish(text, lang)
+
+
 # 纯标点/空白残渣判据:剥标记后只剩「.」「，」等不算有内容(云端 MT 直接吐
 # "(laughs)." 的形状),按纯语气句走占位。
 _PUNCT_ONLY_RE = re.compile(r"^[\s.,;:!?，。！？；：、…]+$")
@@ -1905,11 +1922,18 @@ async def entrypoint(ctx) -> None:
                     _lag.drop_src()  # 摘译句不产出译文:消费 src 头保后续配对对齐
                     continue
                 t0 = time.perf_counter()
-                ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
+                # MT 入口确定性音近吸附(2026-10-08 P0,subagent 调研:今晚 69 条原文
+                # ≈19% ASR 噪声被忠实翻译):复用 A 线 asr_polish 确定性层(纯本地
+                # ~1ms,kill-switch 同 BOK_ASR_POLISH)。**原文单轨铁律**:账本/字幕/
+                # spec 判定/QA 全吃 raw,只有 MT 输入与滚动对 `_mt_pairs` 吃吸附副本
+                # ——与 A 线 ContextAwareLLM 冻结点同构。四语源(de/fr/ja/pt)表空
+                # 且 detect 有误判风险,直通。
+                text_mt = _polish_for_mt(text, source_lang)
+                ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text_mt)
                 translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
                 _mt_latency["ms"] = int((time.perf_counter() - t0) * 1000)
                 if translated:
-                    _mt_pairs.append((text, translated))
+                    _mt_pairs.append((text_mt, translated))
                     # 先 say 后记账:say 失败(会话关闭)不留 pending 孤儿——待配对
                     # 队列只装「交付已发起」的句,与 item 到达序仍一一对应(RC-8)。
                     session.say(_speech_text(translated, voice_tags))
