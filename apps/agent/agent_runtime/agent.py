@@ -1675,6 +1675,45 @@ def _reply_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(a=na, b=nb).ratio()
 
 
+def _is_repeat_fragment_pollution(
+    text: str,
+    frags,
+    *,
+    sim_threshold: float = 0.85,
+    min_norm_chars: int = 6,
+) -> bool:
+    """interrupted 轮「前缀同源片」判定(W2 刀3,2026-10-08;纯函数,单测用)。
+
+    病理(架构体检 2026-10-08):10-07 的 interrupted-item corpus skip 走
+    ``item.interrupted`` 旗——旗没送到(事件形态差异/late item)时,被打断的
+    前缀残片仍进重复锚/账本,风暴后重生成同答案的首句被误判复读
+    (REPEAT_GUARD_CANCEL_DROP first_sent=1 家族,10-05 以来 38 次)。
+
+    判据:text 与任一在案打断残片 归一后 相等 / 前缀同源(任一方向
+    startswith 且较短侧 ≥min_norm_chars)/ 相似 ≥sim_threshold——即「同源
+    内容的截断形态」。False 的情况:残片账空、双方过短、kill-switch
+    ``BOK_REPEAT_CROSS_TURN=0``(残片清洗随跨轮复读防线同闸,=0 全关回旧)。
+    只影响语料写入(item 侧豁免出口复用),不阻出声。
+    """
+    if os.environ.get("BOK_REPEAT_CROSS_TURN", "1") != "1":
+        return False
+    t = _ticket_norm(text)
+    if len(t) < min_norm_chars:
+        return False
+    for frag in frags or []:
+        f = _ticket_norm(str(frag or ""))
+        if not f:
+            continue
+        if t == f:
+            return True
+        shorter = min(len(t), len(f))
+        if shorter >= min_norm_chars and (t.startswith(f) or f.startswith(t)):
+            return True
+        if _reply_similarity(t, f) >= sim_threshold:
+            return True
+    return False
+
+
 def _late_answer_dedup_verdict(
     text: str,
     *,
@@ -4044,6 +4083,10 @@ async def entrypoint(ctx):
     # B4 打断轮部分文本 tee(ContextAwareLLM 注入)——回复被框架打断时 item 永不
     # added,这里留着已生成的文本给 speech watcher 补记 gen=interrupted 行。
     _reply_partial: dict = {"text": ""}
+    # W2 刀3 打断残片账(2026-10-08):被打断回复的已生成文本(partial+guard
+    # buffer,watcher 补账点采集,有界 4 条)——「前缀同源片」清洗的语料面,
+    # item 侧重复锚/账本写入前过滤(详见 _is_repeat_fragment_pollution)。
+    _interrupted_frags: list = []
     # B3 连环打断风暴:滚动窗打断时刻 + 静听模式截止时刻。
     _storm: dict = {"ts": [], "active_until": 0.0, "rounds": 0}
     # W1f deferred abandon(2026-10-06 demo-quality wave):打断确证才弃流——
@@ -5919,6 +5962,15 @@ async def entrypoint(ctx):
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
+    def _is_interrupted_fragment_text(t: str) -> bool:
+        """W2 刀3(2026-10-08):文本是否与在案打断残片「前缀同源」——item.interrupted
+        旗没送到的事件形态下,被打断半截 item 的语料面兜底过滤(语料账=
+        _interrupted_frags,watcher 补账点采集;kill-switch 复用 BOK_REPEAT_CROSS_TURN)。"""
+        try:
+            return _is_repeat_fragment_pollution(t, _interrupted_frags)
+        except Exception:  # noqa: BLE001 - 清洗异常=不过滤(旧行为)
+            return False
+
     def _on_item_for_context(ev):
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -5951,11 +6003,17 @@ async def entrypoint(ctx):
                 # 有意识修复,碎片不配当比对语料。上句锚保留风暴前最后一条完整
                 # 回复(ack 豁免同机制)。prefill 历史喂入不受影响(KV 前缀字节
                 # 对齐:历史怎么落就怎么喂)。
+                # W2 刀3(2026-10-08)补「前缀同源片」面:interrupted 旗没送到的
+                # 形态(item 文本与在案打断残片相等/前缀同源/高相似)同走豁免——
+                # 残片账由 watcher 补账点采集(_interrupted_frags,有界 4 条)。
                 _item_interrupted = bool(getattr(item, "interrupted", False))
-                if _item_interrupted and not _assistant_ack:
+                _item_frag_hit = (not _item_interrupted) and _is_interrupted_fragment_text(text)
+                if (_item_interrupted or _item_frag_hit) and not _assistant_ack:
                     _assistant_ack = True  # 复用豁免通道:锚/账本/摘要全让开
                     print(
-                        f"[agent] interrupted-item corpus skip {str(text)[:24]!r} 不进重复锚/账本",
+                        f"[agent] interrupted-item corpus skip "
+                        f"reason={'flag' if _item_interrupted else 'fragment'} "
+                        f"{str(text)[:24]!r} 不进重复锚/账本",
                         flush=True,
                     )
                 if _assistant_ack:
@@ -9050,6 +9108,15 @@ async def entrypoint(ctx):
                 print(f"[agent] interrupted reply guard-buffer appended chars={len(_gb)} (call {room_name})", flush=True)
             if closed.is_set() or not bool(getattr(handle, "interrupted", False)):
                 return
+            # W2 刀3(2026-10-08)打断残片入账:本轮已生成文本(tee+guard buffer,
+            # 上方 partial)是「前缀同源片」清洗的语料——item 侧重复锚/账本写入前
+            # 按 _is_repeat_fragment_pollution 过滤(interrupted 旗没送到的形态
+            # 兜底)。有界 4 条,零产出轮(空 partial)不记。BOK_REPEAT_CROSS_TURN=0
+            # 时过滤判定恒 False=账留着也零行为(与跨轮防线同闸)。
+            if partial.strip():
+                _interrupted_frags.append(partial)
+                if len(_interrupted_frags) > 4:
+                    del _interrupted_frags[:-4]
             # W-GATE 打断面补洞（2026-10-01 call-231aa92a 实弹）：打断轮的回复
             # 车道就此终结（无 item 交付、_report_assistant_turn 不会来）——20 站点
             # 审计漏了这条路，事件不置位 → 等待中的 judge 挂到 15s 硬帽过期才放行，
