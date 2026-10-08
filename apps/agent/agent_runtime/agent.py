@@ -1427,6 +1427,18 @@ def _starve_ack_line(lang: str) -> str:
     return "在的，您讲，我马上答复您。"
 
 
+def _repeat_ack_line(lang: str) -> str:
+    """REPEAT 轮承应句(W2 刀2,2026-10-08):客户显式要求重复时先出声应一下,
+    再由复述指引车道补真内容——静默消费路径(风暴静听吞轮)的强制出声兜底。
+    零内容承诺、≤14 字,落 _ack_anchor_texts(唔进【你上一句】锚/摘要)。
+    BOK_REPEAT_ACK=0 关。"""
+    if lang == "cantonese":
+        return "好，我再講一次。"
+    if lang == "en":
+        return "Sure — let me say that again."
+    return "好的，我再讲一遍。"
+
+
 def _reap_generation_idle(stream) -> bool:
     """D1 收尸孤儿门控(2026-09-30 终修):仅当包装流链**最内层**的生成任务
     已结束(或拿不到任务引用)才允许收尸。
@@ -1584,7 +1596,9 @@ def _ack_anchor_texts() -> frozenset[str]:
     EX-2(2026-09-28)补 followup-ack:跟进建单确认语同为「零内容承诺应承」,
     落进【你上一句】锚/摘要会污染(context 只留真回复)。
     EX-2(2026-09-28)再补 garbled-reask:碎片重问行同为无内容承诺语,且含道歉词,
-    进锚/摘要会教 4B 道歉敷衍口气(同 _is_ack_anchor_text docstring)。"""
+    进锚/摘要会教 4B 道歉敷衍口气(同 _is_ack_anchor_text docstring)。
+    W2 刀2(2026-10-08)补 repeat-ack:复述请求承应句同为零内容承诺行。
+    """
     lines: set[str] = set()
     for fn in (
         _llm_fallback_line,
@@ -1593,6 +1607,7 @@ def _ack_anchor_texts() -> frozenset[str]:
         _defer_ack_line,
         _followup_ack_line,
         _garbled_reask_line,
+        _repeat_ack_line,
     ):
         for lang in ("zh", "cantonese", "en"):
             lines.add(_clean_transcript(strip_voice_style(fn(lang))))
@@ -1632,7 +1647,7 @@ _REPLY_LANES: tuple[str, ...] = (
     "qa-fastpath", "graph-play", "graph-jump", "graph-notify", "graph-catchall",
     "branch-canned",
     "farewell", "nudge", "followup-ack", "pause-ack", "fallback-ack",
-    "garbled-reask", "wa-confirm",
+    "garbled-reask", "wa-confirm", "repeat-ack",
 )
 
 
@@ -6969,10 +6984,66 @@ async def entrypoint(ctx):
             # (A3 交接,独白不哑);过期/cap resume 时清 ts+starve(防旧计数复燃、
             # 防恢复首轮被 starve 吃掉)。Storm 轮照落库(provider=storm-listen,
             # ack 轮=starve-ack)。BOK_INTERRUPT_STORM_BACKOFF=0 整闸关。
+            # ---- W2 刀2 REPEAT 承应豁免(2026-10-08,call-123d4a21 静默票):风暴
+            # 静听把「再说一次/听唔清」类显式重复请求轮整段吞掉(rounds 1/2/4 静默、
+            # 3/5 让路语——都不是复述)——静听前提「客户在独白」被显式复述请求证伪。
+            # 豁免=清风暴账(ts/rounds/active_until 归零+到期钟收)+直念三语短承应
+            # (零 TTFT 罐头线),**唔 raise**——落穿回正常轮路径,复述指引车道
+            # (verdict==REPEAT→allow_repeat)接手把上一句关键内容真讲一遍。
+            # 判据单源=flow.is_repeat_request_text(与 decide_advance REPEAT 分支
+            # 同一对象)。BOK_REPEAT_ACK=0 回旧行为(风暴静听照旧吞 REPEAT 轮)。
+            _storm_repeat_bypass = False
+            if (
+                os.environ.get("BOK_INTERRUPT_STORM_BACKOFF", "1") == "1"
+                and os.environ.get("BOK_REPEAT_ACK", "1") == "1"
+                and _storm.get("active_until", 0.0) > 0.0
+                and not closed.is_set()
+            ):
+                try:
+                    from .flow import is_repeat_request_text as _is_repeat_req
+
+                    _storm_repeat_bypass = _is_repeat_req(user_text)
+                except Exception:  # noqa: BLE001 - 判据异常=不豁免(旧行为)
+                    _storm_repeat_bypass = False
+            if _storm_repeat_bypass:
+                _storm["ts"] = []
+                _storm["rounds"] = 0
+                _storm["active_until"] = 0.0
+                _cancel_storm_expiry()
+                _starve["n"] = 0
+                _rack = _repeat_ack_line(language_state.lang)
+                # history=False(ack 出声 item 永不发生)+cancel_watchdog=False
+                # (落穿后的 LLM 复述回复还需要响应看门狗兜底)。
+                _register_reply_lane(
+                    lane="repeat-ack", text=_rack, history=False, cancel_watchdog=False
+                )
+                try:
+                    _ra_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="repeat-ack",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_ra_ms, ended_ms=_ra_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻承应
+                    pass
+                print(
+                    f"REPEAT_ACK storm-break rounds_cleared (call {room_name})",
+                    flush=True,
+                )
+                try:
+                    await _say_script(
+                        session, tts_provider, _tts_cache, _rack, add_to_chat_ctx=False
+                    )
+                    await _ledger_ack_line("repeat-ack", _rack)
+                except Exception as exc:  # noqa: BLE001 - 承应失败唔阻复述车道
+                    print(f"[agent] repeat-ack say failed: {exc!r} (call {room_name})", flush=True)
+                # 唔 raise——落穿回正常轮路径(复述指引→LLM 讲真内容)
             if (
                 os.environ.get("BOK_INTERRUPT_STORM_BACKOFF", "1") == "1"
                 and _storm.get("active_until", 0.0) > 0.0
                 and not closed.is_set()
+                and not _storm_repeat_bypass
             ):
                 _now = time.monotonic()
                 _verdict = _storm_on_turn(

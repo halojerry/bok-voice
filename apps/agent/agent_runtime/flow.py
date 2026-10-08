@@ -548,6 +548,19 @@ _REPEAT_RE = re.compile(
     r"^what\s*\?*$|^乜嘢\s*\?*$|^咩\s*\?*$)",
     re.IGNORECASE,
 )
+
+
+def is_repeat_request_text(text: str) -> bool:
+    """重复请求判定(纯函数;decide_advance REPEAT 分支的同判据单源,W2 刀2)。
+
+    显式族(_REPEAT_EXPLICIT_RE)出现即命中、不看句长;模糊族(_REPEAT_RE)只认
+    ≤12 字短句——16 字「乜嘢意思?」係内容提问,唔算要求重复。除 decide_advance
+    外,风暴静听轮的 REPEAT 承应豁免(agent 侧 BOK_REPEAT_ACK)同食此判据。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return False
+    return bool(_REPEAT_EXPLICIT_RE.search(t) or (len(t) <= 12 and _REPEAT_RE.search(t)))
 # 多字「强确认」:疑问句里出现都算确认(「係我,然後呢?」);单字「係/好/嗯/对/可以」
 # 喺疑问句(「係咩?」「可以點做?」)唔当确认,靠 _CONFIRM_RE 只喺非疑问句时兜底。
 _STRONG_AFFIRM_RE = re.compile(
@@ -1249,7 +1262,8 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
     # 两族分治(2026-09-28 EX-2):显式族(_REPEAT_EXPLICIT_RE)出现即命中、不看句长
     # ——16 字「唔好意思頭先冇聽清,你講多次」实测被 ≤12 闸误杀;模糊族(乜嘢/咩/what)
     # 保留 ≤12 闸,长句里嘅「乜嘢意思」照走 QUESTION(内容提问)。
-    if _REPEAT_EXPLICIT_RE.search(t) or (len(t) <= 12 and _REPEAT_RE.search(t)):
+    # W2 刀2(2026-10-08)收 is_repeat_request_text 单源(判据逐字节同)。
+    if is_repeat_request_text(t):
         return REPEAT
     is_question = bool(_QUESTION_RE.search(t))
     strong_affirm = bool(_STRONG_AFFIRM_RE.search(t))
