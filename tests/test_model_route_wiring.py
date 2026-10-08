@@ -298,8 +298,12 @@ def test_build_llm_provider_mt_unset_falls_back_env_lane(clean_lane_env):
 
 
 def test_build_llm_provider_mt_openai_route(monkeypatch, clean_lane_env, tmp_path):
-    """mt 车道 openai 档＝云端整体接管（本地路径门禁不适用），思考旗进请求体。"""
+    """mt 车道 openai 档＝云端整体接管（本地路径门禁不适用），思考旗进请求体。
+    Wave 1(2026-10-08「MT 全量切 DeepSeek 试」):缺省**指令化**——不再包
+    StatelessMTLLM(模板会丢 system 指令=ASR 纠错锁死),直接 MlxLlmLLM 吃完整
+    ctx;kill-switch BOK_INTERP_MT_CLOUD_INSTRUCT=0 回旧模板包裹形状。"""
     monkeypatch.setenv("MT_LLM_MODEL", str(tmp_path / "ghost"))  # 非法本地路径也拦不住 openai 档
+    monkeypatch.delenv("BOK_INTERP_MT_CLOUD_INSTRUCT", raising=False)
     routing = _routing(
         {
             "mt": {
@@ -312,11 +316,16 @@ def test_build_llm_provider_mt_openai_route(monkeypatch, clean_lane_env, tmp_pat
         }
     )
     provider = interpret_mod._build_llm_provider({}, "cantonese", routing_raw=routing)
-    assert isinstance(provider, StatelessMTLLM)
-    assert _base_url(provider._inner) == CLOUD_BASE_FIXTURE
-    assert provider._inner._opts.model == "fixture-mt-model"
-    assert provider._inner._opts.extra_body["enable_thinking"] is False
-    assert provider._inner._client.api_key == CLOUD_KEY_FIXTURE
+    assert isinstance(provider, MlxLlmLLM) and not isinstance(provider, StatelessMTLLM)
+    assert _base_url(provider) == CLOUD_BASE_FIXTURE
+    assert provider._opts.model == "fixture-mt-model"
+    assert provider._opts.extra_body["enable_thinking"] is False
+    assert provider._client.api_key == CLOUD_KEY_FIXTURE
+    # kill-switch=回旧模板包裹（试验逃生口）
+    monkeypatch.setenv("BOK_INTERP_MT_CLOUD_INSTRUCT", "0")
+    legacy = interpret_mod._build_llm_provider({}, "cantonese", routing_raw=routing)
+    assert isinstance(legacy, StatelessMTLLM)
+    assert _base_url(legacy._inner) == CLOUD_BASE_FIXTURE
 
 
 def test_build_llm_provider_mt_local_routing_overrides_endpoint(monkeypatch, clean_lane_env, tmp_path):
@@ -356,16 +365,17 @@ def test_build_llm_provider_reply_fallback_openai_route(clean_lane_env):
 
 def test_build_llm_provider_two_calls_different_routing_no_cross_talk(monkeypatch, clean_lane_env):
     """两通不同 routing 不串线：纯函数只吃参数，两次调用各按各的 routing 解析。"""
+    monkeypatch.delenv("BOK_INTERP_MT_CLOUD_INSTRUCT", raising=False)
     routing_a = _routing({"mt": {"provider": "openai", "base_url": "https://a-fixture.example/v1",
                                  "model": "mt-a", "api_key": CLOUD_KEY_FIXTURE}})
     routing_b = _routing({"mt": {"provider": "openai", "base_url": "https://b-fixture.example/v1",
                                  "model": "mt-b", "api_key": CLOUD_KEY_FIXTURE}})
     pa = interpret_mod._build_llm_provider({}, "cantonese", routing_raw=routing_a)
     pb = interpret_mod._build_llm_provider({}, "cantonese", routing_raw=routing_b)
-    assert _base_url(pa._inner) == "https://a-fixture.example/v1"
-    assert pa._inner._opts.model == "mt-a"
-    assert _base_url(pb._inner) == "https://b-fixture.example/v1"
-    assert pb._inner._opts.model == "mt-b"
+    assert _base_url(pa) == "https://a-fixture.example/v1"
+    assert pa._opts.model == "mt-a"
+    assert _base_url(pb) == "https://b-fixture.example/v1"
+    assert pb._opts.model == "mt-b"
 
 
 def test_build_llm_provider_kill_switch_ignores_table(monkeypatch, clean_lane_env):
