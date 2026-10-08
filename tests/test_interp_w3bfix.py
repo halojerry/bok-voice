@@ -85,10 +85,13 @@ def _done_pair(pair):
 
 def test_busy_gate_wiring_source_pinned():
     """闸体三条铁律源级 pin:①FIFO 条件=深度门(qsize>=depth)非「非空」;
-    ②mt_busy/source_drops_pending 两条件原样保留;③封锁 episode 首拍 busy 行;
-    ④hold 不封=_mt_busy 置位点在 frag absorb 之后;⑤立法双面登记。"""
+    ②mt_busy/source_drops_pending/死道三条件原样保留(402 波并门后多行形状);
+    ③封锁 episode 首拍 busy 行;④hold 不封=_mt_busy 置位点在 frag absorb 之后;
+    ⑤立法双面登记。"""
     assert "_src_q.qsize() >= depth" in INTERP_SRC
-    assert '_mt_busy["flag"] or backlog.source_drops_pending' in INTERP_SRC
+    assert '_mt_busy["flag"]' in INTERP_SRC
+    assert "backlog.source_drops_pending" in INTERP_SRC
+    assert 'or _mt_lane_dead["reason"]' in INTERP_SRC  # W1-② 死道并门(合并后)
     assert "INTERP_SPEC busy depth=" in INTERP_SRC
     # hold 不封:置位点必须在 _frag_absorb 调用之后(真 MT 起跑才置位)。
     absorb_at = INTERP_SRC.index("await _frag_absorb(")
