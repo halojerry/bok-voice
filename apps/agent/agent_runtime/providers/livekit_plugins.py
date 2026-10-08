@@ -1345,8 +1345,10 @@ def _mt_prompt(text: str, target_lang: str, glossary: str = "", retry: bool = Fa
 # ②反引号「`…`」(模型镜像模板的 ` 包裹,:1236 直打 100% 复现)——比弯引号更高频。
 # TTS 读引号=怪停顿、字幕带杂质。首尾独立剥——整段包裹场景全覆盖;译文内容
 # 本身以引号开头的罕见场景会被误剥(spoken-style MT 输出几乎不含,可接受)。
-_MT_QUOTES_OPEN = "\"“「『'`"
-_MT_QUOTES_CLOSE = "\"”」』'`"
+# 2026-10-08 补弯**单**引号「‘…’」(call-3a193d53 落库/TTS 实证多条译文裹着
+# ‘…’——旧表只有直单引号)。
+_MT_QUOTES_OPEN = "\"“「『'‘`"
+_MT_QUOTES_CLOSE = "\"”」』'’`"
 
 
 class _CascadeCloseStreamMixin:

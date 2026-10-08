@@ -310,6 +310,15 @@ def test_mt_quote_strip_backticks_systematic():
     assert stream._held == "`" and stream._held in lp._MT_QUOTES_CLOSE
 
 
+def test_mt_quote_strip_curly_single_quotes():
+    """弯**单**引号包裹(call-3a193d53 落库/TTS 实证多条译文裹着 ‘…’——旧表只有
+    直单引号,2026-10-08 补)。"""
+    stream = _quote_stream()
+    assert stream._transform("‘Hello,") == "Hello"
+    assert stream._transform(" world’") == ", world" or stream._held in lp._MT_QUOTES_CLOSE
+    assert "‘" in lp._MT_QUOTES_OPEN and "’" in lp._MT_QUOTES_CLOSE
+
+
 def test_mt_quote_strip_plain_text_intact():
     stream = _quote_stream()
     parts = ["My parcel", " hasn't arrived", "."]
@@ -430,6 +439,38 @@ def test_caption_text_pure_tone_placeholder():
     assert interpret._caption_text("(sighs)", "zh") == "（叹气）"
     assert interpret._caption_text("morning (laughs), right?", "en") == "morning, right?"
     assert interpret._caption_text("no tags", "zh") == "no tags"
+
+
+# ---- 6. B 线 MT 入口确定性音近吸附(2026-10-08 P0)----
+
+_INTERP_PATH = Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "interpret.py"
+INTERP_SRC = _INTERP_PATH.read_text(encoding="utf-8")
+
+
+def test_polish_for_mt_observed_noise(monkeypatch):
+    """今晚实测噪声实例(变体表 curated 回填后):ASR 错字在 MT 前被吸附。"""
+    monkeypatch.delenv("BOK_ASR_POLISH", raising=False)
+    assert interpret._polish_for_mt("你好，我成鸟解下你们的产品", "zh") == "你好，我了解下你们的产品"
+    assert interpret._polish_for_mt("极度买的快递什么时候到", "zh") == "寄出来的快递什么时候到"
+    # 干净句逐字节原样(零命中零漂移)
+    assert interpret._polish_for_mt("今天天气很好", "zh") == "今天天气很好"
+
+
+def test_polish_for_mt_guards(monkeypatch):
+    """护栏:四语源(de/fr/ja/pt)直通(表空+detect 误判风险);kill-switch 全关。"""
+    monkeypatch.delenv("BOK_ASR_POLISH", raising=False)
+    assert interpret._polish_for_mt("こんにちは明日", "ja") == "こんにちは明日"
+    assert interpret._polish_for_mt("", "zh") == ""
+    monkeypatch.setenv("BOK_ASR_POLISH", "0")
+    assert interpret._polish_for_mt("你好，我成鸟解下你们的产品", "zh") == "你好，我成鸟解下你们的产品"
+
+
+def test_polish_for_mt_source_pins():
+    """原文单轨铁律接线 pin:吸附副本只喂 MT 上下文与滚动对;账本/字幕/spec 吃 raw。
+    (2026-10-08 P0,subagent 调研:今晚 69 条原文 ≈19% 噪声被忠实翻译。)"""
+    assert "text_mt = _polish_for_mt(text, source_lang)" in INTERP_SRC
+    assert "_mt_pairs.append((text_mt, translated))" in INTERP_SRC
+    assert "_add_turn(f\"原文：{text}\"" in INTERP_SRC  # 账本原文恒 raw
 
 
 def test_strip_voice_tags():
