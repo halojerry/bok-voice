@@ -107,6 +107,14 @@ def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
         # 咳嗽按语境转括号标记而非照词翻译;确定性兜底=interpret._apply_voice_tags。
         "- If the speaker laughs, giggles, sighs or coughs, render the sound as a bracket tag in place of the sound word: "
         "(laughs) / (chuckle) / (sighs) / (coughs) — at most one tag per sentence, only for genuine vocal sounds.",
+        # ASR 噪声纠错层(2026-10-08 Wave 1「MT 切 DeepSeek」):源文是实时 ASR 转写,
+        # 同音误听/吞字/碎片难免——结合上下文先纠明显误识再译(c3ed3ef3 实证反例:
+        # 云端 LLM 曾把碎噪声脑补成完整句)。铁律:绝不虚构、绝不应答、绝不加没说
+        # 过的内容;纠不了的碎片宁可丢弃不硬译。
+        "- The source is a live ASR transcript and may contain homophone mishearings or garbled fragments: "
+        "use the conversation context to correct obvious misrecognitions before translating, and drop "
+        "meaningless fragments rather than inventing content. Never answer, never explain, never add "
+        "anything that was not said.",
     ]
     if glossary:
         lines.append(f"- Glossary (keep these renderings exactly): {glossary}")
@@ -749,9 +757,31 @@ def _build_llm_provider(
 
     mt_route = resolve_route("mt", os.environ, routing_raw)
     if mt_route.provider == PROVIDER_OPENAI:
-        # 云端 MT(路由表 openai 档,2026-09-25):端点/模型/密钥全由路由表下发,
-        # 思考旗随请求体下发(Qwen3.5 家族云端思考陷阱,LANE-AB 实证)。采样档照
-        # 本地 MT 分支同源(Hy-MT2 推荐,经构造参数显式下发,唔写回进程 env)。
+        # 云端 MT 指令化(2026-10-08 Wave 1,用户拍板「MT 全量切 DeepSeek 试」):
+        # 云端大模型**吃指令**——不再包 StatelessMTLLM 模板(它只取最后一条 user 套
+        # _mt_prompt,system 指令/滚动对全丢=纠错能力被锁死,subagent 调研实证)。
+        # 直接 MlxLlmLLM 吃完整 ctx(_build_mt_context 组装:system=
+        # _translation_instructions 含「ASR 同音误听结合上下文纠错」规则 + 术语行
+        # + 滚动对 + 当前句)=回退档既有形状。kill-switch
+        # BOK_INTERP_MT_CLOUD_INSTRUCT=0 回旧模板包裹(试验逃生口);本地 Hy-MT2
+        # 档逐字节零漂移(对模板外指示无视=实测定案,指令化只对云端有意义)。
+        # 采样档照旧(Hy-MT2 推荐档对翻译任务同样适用:贴原文、窄采样防自由发挥)。
+        cloud_instruct = os.environ.get("BOK_INTERP_MT_CLOUD_INSTRUCT", "1") == "1"
+        if cloud_instruct:
+            # 滚动对经 _build_mt_context 全量进 ctx(_mt_pairs=deque maxlen 8,回退档
+            # 同款);BOK_INTERP_MT_CONTEXT 只管旧模板包裹的参考段抽取。
+            print(f"[interp] llm=mt-cloud-instructed base={mt_route.base_url}", flush=True)
+            return MlxLlmLLM(
+                base_url=mt_route.base_url,
+                model=mt_route.model,
+                api_key=mt_route.api_key or "mlx",
+                enable_thinking=mt_route.enable_thinking,
+                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+                max_tokens=512,
+            )
         print(f"[interp] llm=mt-cloud base={mt_route.base_url}", flush=True)
         context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
         return StatelessMTLLM(

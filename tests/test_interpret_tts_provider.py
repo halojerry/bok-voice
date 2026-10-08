@@ -302,6 +302,44 @@ def test_build_llm_provider_fallback(monkeypatch):
     assert isinstance(ds, DeepSeekLLM)
     assert ds._opts.model == "deepseek-chat"
 
+
+_MT_CLOUD_ROUTING = '{"lanes":{"mt":{"provider":"openai","base_url":"https://api.deepseek.com/v1","model":"deepseek-flash","api_key":"sk-test"}}}'
+
+
+def test_mt_cloud_lane_instructed_by_default(monkeypatch):
+    """Wave 1(2026-10-08「MT 全量切 DeepSeek 试」):mt 车道 openai 档**指令化**——
+    不再包 StatelessMTLLM(它只取最后一条 user 套模板,system 指令/滚动对全丢
+    =ASR 纠错能力被锁死,subagent 调研实证)。直接 MlxLlmLLM 吃完整 ctx
+    (_build_mt_context:instructions 含纠错行+滚动对+当前句)=回退档既有形状。"""
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
+
+    monkeypatch.setenv("BOK_MODEL_ROUTING", "1")
+    monkeypatch.delenv("BOK_INTERP_MT_CLOUD_INSTRUCT", raising=False)
+    p = interpret._build_llm_provider({}, "en", routing_raw=_MT_CLOUD_ROUTING)
+    assert isinstance(p, MlxLlmLLM)
+    assert not isinstance(p, StatelessMTLLM)
+    assert str(p._client.base_url).rstrip("/") == "https://api.deepseek.com/v1"
+
+
+def test_mt_cloud_lane_killswitch_restores_template(monkeypatch):
+    """kill-switch BOK_INTERP_MT_CLOUD_INSTRUCT=0:回旧 StatelessMTLLM 模板包裹
+    (「全量切 DeepSeek 试」的逃生口,逐字节旧形状)。"""
+    from agent_runtime.providers.livekit_plugins import StatelessMTLLM
+
+    monkeypatch.setenv("BOK_MODEL_ROUTING", "1")
+    monkeypatch.setenv("BOK_INTERP_MT_CLOUD_INSTRUCT", "0")
+    p = interpret._build_llm_provider({}, "en", routing_raw=_MT_CLOUD_ROUTING)
+    assert isinstance(p, StatelessMTLLM)
+
+
+def test_translation_instructions_asr_correction_rule():
+    """Wave 1 纠错行在场:ASR 同音误听结合上下文纠+绝不虚构/不硬译碎片
+    (c3ed3ef3 云端脑补反例的负例锚)。"""
+    s = interpret._translation_instructions("zh", "en")
+    assert "homophone mishearings" in s
+    assert "Never answer" in s and "never add" in s
+
+
 def test_direction_audio_enabled_rev_text_only_by_default(monkeypatch):
     """2026-10-08 用户翻案(「对方说英文 我要听到英文转普通话的翻译!」):同传
     **双向出声**——fwd(听 me,译文给对方)恒出声;rev(听 other,对方→我)默认
@@ -495,8 +533,9 @@ def test_interpret_source_has_no_llm_max_tokens_setdefault():
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     assert 'setdefault("LLM_MAX_TOKENS"' not in code
     assert "setdefault('LLM_MAX_TOKENS'" not in code
-    # 三个 MlxLlmLLM 构造点 + DeepSeek 回退点都显式 512(代码面,注释剥后)。
-    assert code.count("max_tokens=512") == 4
+    # 四个 MlxLlmLLM 构造点(本地 MT/云端旧模板/云端指令化 Wave1/a_reply 兜底)
+    # + DeepSeek 回退点都显式 512(代码面,注释剥后)。
+    assert code.count("max_tokens=512") == 5
 
 
 def test_mt_worker_exception_path_says_fallback_source_pinned():
