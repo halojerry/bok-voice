@@ -35,8 +35,9 @@ from pathlib import Path
 
 # 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
-# 人设音色 map 解析（单源 core，2026-10-08 B 线人设音色复用；A 线同源）。
-from bok_voice_core.voice_map import parse_voice_map
+# 人设音色 map 解析+整场同声收敛（单源 core，2026-10-08 B 线人设音色复用；
+# A 线同源——B 线三语言=A 线同款人设音色由 collapse 语义保证）。
+from bok_voice_core.voice_map import collapse_voice_map, parse_voice_map
 
 # B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
@@ -624,6 +625,30 @@ def _mt_stream_say_enabled() -> bool:
     return os.environ.get("BOK_INTERP_MT_STREAM_SAY", "1") == "1"
 
 
+# —— W0-2 MT 首 chunk 早交(2026-10-08 时效波) -----------------------------------
+# ③号基线实锤:B 线 MT 腿结构性缺口 +224ms(890 vs A 666)——短句无子句切点,
+# `_cut_clause_piece` 憋到流结束才放,first_ms≈mt_ms(等整句翻完才进 TTS)。
+# 刀=官方 FlushSentinel 车(livekit 1.8.2 say()/TTS 转发路径原生支持:硬段边界
+# 逐段独立合成、下段合成与上段播放重叠):首段按「子句边界 或 N 字」切出即
+# yield 文本 + FlushSentinel() → MiniMax 立即合成(bidi 攒句被官方哨兵打断,
+# 同 A 线 head-flush 语义)。N 缺省 6=A 线 BOK_TTS_FIRST_CHUNK_CHARS 耳测定档;
+# 切点铁闸复用 A 线 _first_chunk_cut(数字/拉丁 run 绝不劈,句界就近 N+6 容差
+# 内让位);首段语言门软失败=弃早交回落子句路径(不误触发整句回退)。
+# kill-switch BOK_INTERP_MT_FIRST_CHUNK_CHARS=0 整档回旧行为。
+_MT_FIRST_CHUNK_ENV = "BOK_INTERP_MT_FIRST_CHUNK_CHARS"
+_MT_FIRST_CHUNK_DEFAULT = 6
+
+
+def _interp_mt_first_chunk_chars() -> int:
+    """首 chunk 早交字数(纯函数,单测直喂):0=关;坏值回缺省 6(A 线耳测定档)。"""
+    raw = os.environ.get(_MT_FIRST_CHUNK_ENV, "")
+    try:
+        v = int(raw) if raw else _MT_FIRST_CHUNK_DEFAULT
+    except ValueError:
+        return _MT_FIRST_CHUNK_DEFAULT
+    return v if v > 0 else 0
+
+
 class _MTStreamGateFail(Exception):
     """首子句语言门违约(yield 前抛出=零播报,调用方可安全回退 _mt_once 旧路径)。"""
 
@@ -635,6 +660,9 @@ async def _mt_stream_say(
 
     开流→delta 缓冲→子句切割→首子句语言门(E5 启发式:looks_like_language,
     违约在 **yield 前**抛出=零播报)→session.say(async 生成器)逐子句喂出。
+    **W0-2 首 chunk 早交**:首段额外按字数硬切(A 线 _first_chunk_cut 铁闸)并
+    yield FlushSentinel()——官方硬段边界,MiniMax 立即起合成(下段边翻边合成
+    与上段播放重叠);早切段语言门软失败=弃早交回落子句路径(不误回退整句)。
     返回 {full, first_ms, yielded, state}:
     - ``clean``     流自然结束(full=全文);
     - ``gate``      首子句语言门违约(零播报)→调用方回退 _mt_once(保留其
@@ -644,11 +672,16 @@ async def _mt_stream_say(
                     播报),full=已出部分,账本照常配对。
     语气标记按子句块换算(_apply_voice_tags 幂等,块内 token 不跨切点=换算完整);
     引号剥除在 provider 层(_StripMTQuoteStream 包流,流式天然继承)。"""
+    from livekit.agents import FlushSentinel
+
+    from .providers.livekit_plugins import _first_chunk_cut
+
     out: dict = {"full": "", "first_ms": 0, "yielded": False, "state": "clean"}
     stream = _mt_open_stream(llm_provider, ctx, retry=False)
     if inspect.isawaitable(stream):
         stream = await stream
     done = asyncio.Event()
+    n0 = _interp_mt_first_chunk_chars()
 
     async def _gen():
         buf = ""
@@ -666,6 +699,28 @@ async def _mt_stream_say(
                 if not content:
                     continue
                 buf += content
+                # W0-2 首 chunk 早交:无标点也按字数硬切(A 线铁闸),切出即
+                # yield + FlushSentinel → 官方硬段边界,合成立即起跑。
+                if first and n0 > 0:
+                    cut = _first_chunk_cut(buf, n0)
+                    if cut:
+                        piece, buf = buf[:cut], buf[cut:]
+                        if (
+                            target_lang
+                            and _mt_lang_guard_enabled()
+                            and not looks_like_language(piece, target_lang)
+                        ):
+                            # 软失败:N 字样本语言证据不足,弃早交回落子句路径
+                            # (整句语言门照旧在子句/末段处把关,不误回退)。
+                            buf = piece + buf
+                        else:
+                            out["first_ms"] = int((time.perf_counter() - t0) * 1000)
+                            first = False
+                            out["yielded"] = True
+                            emitted = _apply_voice_tags(piece) if tags else piece
+                            parts.append(emitted)
+                            yield emitted
+                            yield FlushSentinel()
                 piece, buf = _cut_clause_piece(buf)
                 while piece:
                     if first:
@@ -1512,16 +1567,18 @@ def _interp_frag_merge_enabled() -> bool:
 # 诊断定案(2026-10-08 实弹):豆包 lane 只按 VAD 静音切句(B 线 min_silence=0.45s),
 # 思考停顿/换气即一个 FINAL,一段话被切成 N 段独立烧全链(ASR+DeepSeek MT+TTS),
 # 段间隔 1-2s → 对方听感「断断续续」。刀=**尾部续说观察窗**:END_OF_SPEECH 不
-# 立刻定稿,先等 BOK_INTERP_UTT_WAIT_S(缺省 0.45s)——窗口内续讲=同一 WS 会话
-# 续喂并段(服务端 result.text 单调累积=天然并稿,零拼接账本);静默到底才负 seq
-# 定稿。有效切句边界=说话末音后总静默 0.45+0.45=0.9s(微停顿不再一停一句),
-# 真停顿的 FINAL 比旧路晚 ~0.45s(换来段数砍半+译文连贯)。**B 线专用**(装配点传
+# 立刻定稿,先等 BOK_INTERP_UTT_WAIT_S——窗口内续讲=同一 WS 会话续喂并段(服务端
+# result.text 单调累积=天然并稿,零拼接账本);静默到底才负 seq 定稿。
+# **W0 复核(2026-10-08 晚,A/B 基线 ③号)窗缺省 0.45→0.2**:窗税实弹 +450ms
+# 把 B 线首声盖过 A 线(2332 vs 1763),而窗关档 B 反超(1666);并段收益集中在
+# <0.65s 微停顿带,0.2 窗已覆盖大头——有效切句边界=说话末音后 0.45+0.2=0.65s
+# 总静默(微停顿并段保留,真停顿税砍 250ms)。**B 线专用**(装配点传
 # utt_merge=True;A 线 agent.py 不传=逐字节旧路)。kill-switch
 # BOK_INTERP_UTT_MERGE=0 整档关闭;窗口 BOK_INTERP_UTT_WAIT_S 可调(坏值回缺省,
 # 钳 [0,3])。与 3a 碎片闸互补:本刀治「内容微停顿切碎」,3a 治「纯应承碎片」。
 _UTT_MERGE_ENV = "BOK_INTERP_UTT_MERGE"
 _UTT_WAIT_ENV = "BOK_INTERP_UTT_WAIT_S"
-_UTT_WAIT_DEFAULT_S = 0.45
+_UTT_WAIT_DEFAULT_S = 0.2
 _UTT_WAIT_MAX_S = 3.0
 
 
@@ -1552,6 +1609,43 @@ def _interp_utt_wait_s() -> float:
 def _interp_clause_commit_enabled() -> bool:
     """豆包 lane 说话中成句总闸(默认开;0=旧路径逐字节——FINAL 只在停嘴/尾窗到期)。"""
     return os.environ.get("BOK_INTERP_CLAUSE_COMMIT", "1") == "1"
+
+
+# —— C2·spec not_ready 有界延迟交付(2026-10-08 时效波) --------------------------
+# 实测:spec miss 主因=not_ready(短句 span fire 离句尾近,held PCM 全量排干
+# 赶不上 final)——sim 已过门=必中体,却立刻 miss 付全价 MT。刀=confirm 时对
+# 必中体有界等待(done_callback 到货即 HIT 零合成直播;超时/失败兜底正常
+# 入队)。等待秒 env 可调,缺省 0.6,钳 [0,3];0=关(旧行为逐字节)。
+_SPEC_WAIT_ENV = "BOK_INTERP_SPEC_WAIT_S"
+_SPEC_WAIT_DEFAULT_S = 0.6
+_SPEC_WAIT_MAX_S = 3.0
+
+
+def _interp_spec_wait_s() -> float:
+    """必中体等待秒(纯函数,单测直喂):坏值回缺省 0.6;负数钳 0;上限 3.0。"""
+    raw = os.environ.get(_SPEC_WAIT_ENV, "")
+    try:
+        v = float(raw) if raw else _SPEC_WAIT_DEFAULT_S
+    except ValueError:
+        return _SPEC_WAIT_DEFAULT_S
+    return min(max(v, 0.0), _SPEC_WAIT_MAX_S)
+
+
+def _persona_voice_map(persona: dict) -> dict:
+    """B 线人设音色 → 三语言同把声(纯函数,单测直喂;A 线同款整场同声语义)。
+
+    用户拍板(2026-10-08):「模型音色三语言跟 A 线使用的是一样的人设音效」——
+    即 collapse 语义:取人设主语言(reference_audio 分语言 map,缺则
+    zh→cantonese→en 链)单音色,三语目标同用一把声,而非按目标语言分把。
+    返回 {zh,cantonese,en: 同一音色 ID};人设空/无有效音色={}。"""
+    p = persona if isinstance(persona, dict) else {}
+    single = collapse_voice_map(
+        parse_voice_map(p.get("reference_audio")), str(p.get("language") or "")
+    ).get("zh", "")
+    single = str(single or "").strip()
+    if not single:
+        return {}
+    return {"zh": single, "cantonese": single, "en": single}
 
 
 def _interp_frag_hold_s() -> float:
@@ -1816,6 +1910,8 @@ class _SpecMtController:
         say_cached: Callable,
         enqueue: Callable[[str], None],
         log: Callable[[str], None] = print,
+        note_src: Callable[[str], None] | None = None,
+        spec_wait_s: float | None = None,
     ) -> None:
         self._enabled = enabled
         self._detector = detector
@@ -1825,11 +1921,21 @@ class _SpecMtController:
         self._say_cached = say_cached  # (final_src, text, pcm) -> None(异常上抛)
         self._enqueue = enqueue  # (rest) -> None:余段入 FIFO+记账
         self._log = log
+        # C2(2026-10-08 时效波):not_ready 有界延迟交付——confirm 时 slot 在途但
+        # sim 已过门=必中,等合成落地再 HIT(有界);兜底=正常入队(note_src 先记账
+        # 保配对)。note_src 缺省 None=旧行为(不延迟,立刻 miss)。
+        self._note_src = note_src
+        self._spec_wait_s = (
+            _interp_spec_wait_s() if spec_wait_s is None else max(0.0, float(spec_wait_s))
+        )
+        self._deferred: dict | None = None  # 在途延迟交付单据(单槽)
 
     # ---- interim 入口 -----------------------------------------------------
     def on_interim(self, text: str) -> None:
         if not self._enabled or self._busy_gate():
             return
+        if self._deferred is not None:
+            return  # C2:延迟交付在途——不再开火(防 hold 被新 span 顶掉竞态)
         span = self._detector.feed(text)
         if not span:
             return
@@ -1876,19 +1982,25 @@ class _SpecMtController:
         hold.task = None
         if not span:
             return False
-        if task is not None and not task.done():
-            # 未就绪:预热没赢过说话,投机价值已失——cancel 在途 MT 让路真车道
-            # (本地=abort 即时弃流;云端=客户端断开纯丢弃)。
-            task.cancel()
         text, pcm = hold.text, hold.pcm
         hold.text = ""
         hold.pcm = b""
-        if not text or not pcm:
-            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
-            return False
         sim, rest = _spec_prefix_split(final_text, span)
         if sim < _SPEC_CONFIRM_SIM:
+            if task is not None and not task.done():
+                # sim 不过门:cancel 在途 MT 让路真车道(本地=abort;云端=纯丢弃)。
+                task.cancel()
             self._log(f"[interp] INTERP_SPEC miss chars={len(span)} sim={sim:.2f}")
+            return False
+        if not text or not pcm:
+            # C2(2026-10-08 时效波):not_ready 但 sim 已过门=必中——有界等合成
+            # 落地再 HIT(零合成直播);兜底/超时=正常入队(_enqueue 自带 note_src
+            # 保配对)。sim 先判把「必不中」的 cancel 路前置,只对必中体付等待。
+            if task is not None and not task.done() and self._spec_wait_s > 0:
+                return self._defer_hit(final_text, rest, task)
+            if task is not None and not task.done():
+                task.cancel()
+            self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
             return False
         self._log(
             f"[interp] INTERP_SPEC hit chars={len(span)} rest={len(rest)} sim={sim:.2f}"
@@ -1902,9 +2014,76 @@ class _SpecMtController:
             self._enqueue(rest)
         return True
 
+    def _defer_hit(self, final_text: str, rest: str, task: asyncio.Task) -> bool:
+        """C2:必中在途的有界延迟交付(on_final 是同步回调,等=done_callback+定时)。
+
+        单据 ``_deferred`` 在途时 on_interim 不开火(防 hold 被新 span 顶掉);
+        兜底/超时/失败=``_enqueue(final_text)`` 正常管线(该闭包自带 note_src,
+        与 HIT 余段同源——on_final 已回 True,调用方跳过的记账由它补)。
+        """
+        state: dict = {"done": False, "timer": None}
+        self._deferred = state
+        self._log(
+            f"[interp] INTERP_SPEC defer chars={len(final_text)} wait_s={self._spec_wait_s:g}"
+        )
+
+        def _settle(from_cancel: bool) -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            if self._deferred is state:
+                self._deferred = None
+            timer = state.get("timer")
+            if timer is not None:
+                timer.cancel()
+            text = "" if from_cancel else self.hold.text
+            pcm = b"" if from_cancel else self.hold.pcm
+            self.hold.text = ""
+            self.hold.pcm = b""
+            if text and pcm:
+                try:
+                    self._say_cached(final_text, text, pcm)
+                    self._log(f"[interp] INTERP_SPEC hit chars={len(final_text)} deferred=1")
+                    if rest:
+                        self._enqueue(rest)
+                    return
+                except Exception as exc:  # noqa: BLE001 - 播放失败走兜底入队
+                    self._log(f"[interp] INTERP_SPEC say failed: {exc!r}")
+            self._enqueue(final_text)
+            self._log(f"[interp] INTERP_SPEC defer-fallback chars={len(final_text)}")
+
+        def _on_task_done(t: asyncio.Task) -> None:
+            try:
+                exc = t.exception()
+            except asyncio.CancelledError:
+                exc = RuntimeError("cancelled")
+            _settle(exc is not None)
+
+        task.add_done_callback(_on_task_done)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 理论不可达(事件回调必在 loop 线程)——防御直兜底
+            _settle(True)
+            return True
+        state["timer"] = loop.call_later(self._spec_wait_s, lambda: _settle(False))
+        return True
+
     # ---- 生命周期 ---------------------------------------------------------
     def cancel(self, reason: str = "shutdown") -> None:
-        """teardown/重连卫生:弃 slot + cancel 在途任务(绝不外抛)。"""
+        """teardown/重连卫生:弃 slot + cancel 在途任务(绝不外抛)。
+
+        C2:在途延迟交付单据就地终结(from_cancel=True 不播不兜底入队——
+        会话正在收线,enqueue 只会造孤儿);done_callback 照走但 state 已 done
+        =no-op。"""
+        d = self._deferred
+        if d is not None:
+            d["done"] = True
+            timer = d.get("timer")
+            if timer is not None:
+                timer.cancel()
+            self._deferred = None
+            self.hold.text = ""
+            self.hold.pcm = b""
         task = self.hold.task
         self.hold.src = ""
         self.hold.task = None
@@ -2015,9 +2194,13 @@ async def entrypoint(ctx) -> None:
     if _persona_id:
         try:
             _persona = await cp.get_persona(_persona_id)
-            _persona_voices = parse_voice_map(_persona.get("reference_audio"))
-            _keys = sorted(k for k, v in _persona_voices.items() if str(v or "").strip())
-            print(f"[interp] persona voice id={_persona_id[:16]} keys={_keys}", flush=True)
+            # A 线同款整场同声(collapse):三语言目标同一把人设声,非按语言分把。
+            _persona_voices = _persona_voice_map(_persona)
+            print(
+                f"[interp] persona voice id={_persona_id[:16]} "
+                f"voice={next(iter(_persona_voices.values()), '')[:32]!r} (A-line collapse)",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001 - 人设拉取失败不阻通话
             print(f"[interp] persona fetch failed id={_persona_id[:16]}: {exc!r}", flush=True)
     llm_cfg = settings.get("llm", {}) or {}
@@ -2423,7 +2606,10 @@ async def entrypoint(ctx) -> None:
     _mt_busy = {"flag": False}  # 真 MT 在途旗(投机 busy 闸消费,见 _mt_say_worker)
     _spec_on = _spec_mt_enabled() and tts_provider is not None
     if _spec_on:
-        print("[interp] spec_mt armed (interim prewarm-and-confirm)", flush=True)
+        print(
+            f"[interp] spec_mt armed (prewarm-and-confirm; defer-hit wait={_interp_spec_wait_s():g}s)",
+            flush=True,
+        )
 
     async def _spec_synth_pcm(text: str) -> bytes | None:
         """投机译文 TTS 全量排干成 PCM(不进 say 队列,零播放)。
