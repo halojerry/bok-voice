@@ -625,6 +625,30 @@ def _mt_stream_say_enabled() -> bool:
     return os.environ.get("BOK_INTERP_MT_STREAM_SAY", "1") == "1"
 
 
+# —— W0-2 MT 首 chunk 早交(2026-10-08 时效波) -----------------------------------
+# ③号基线实锤:B 线 MT 腿结构性缺口 +224ms(890 vs A 666)——短句无子句切点,
+# `_cut_clause_piece` 憋到流结束才放,first_ms≈mt_ms(等整句翻完才进 TTS)。
+# 刀=官方 FlushSentinel 车(livekit 1.8.2 say()/TTS 转发路径原生支持:硬段边界
+# 逐段独立合成、下段合成与上段播放重叠):首段按「子句边界 或 N 字」切出即
+# yield 文本 + FlushSentinel() → MiniMax 立即合成(bidi 攒句被官方哨兵打断,
+# 同 A 线 head-flush 语义)。N 缺省 6=A 线 BOK_TTS_FIRST_CHUNK_CHARS 耳测定档;
+# 切点铁闸复用 A 线 _first_chunk_cut(数字/拉丁 run 绝不劈,句界就近 N+6 容差
+# 内让位);首段语言门软失败=弃早交回落子句路径(不误触发整句回退)。
+# kill-switch BOK_INTERP_MT_FIRST_CHUNK_CHARS=0 整档回旧行为。
+_MT_FIRST_CHUNK_ENV = "BOK_INTERP_MT_FIRST_CHUNK_CHARS"
+_MT_FIRST_CHUNK_DEFAULT = 6
+
+
+def _interp_mt_first_chunk_chars() -> int:
+    """首 chunk 早交字数(纯函数,单测直喂):0=关;坏值回缺省 6(A 线耳测定档)。"""
+    raw = os.environ.get(_MT_FIRST_CHUNK_ENV, "")
+    try:
+        v = int(raw) if raw else _MT_FIRST_CHUNK_DEFAULT
+    except ValueError:
+        return _MT_FIRST_CHUNK_DEFAULT
+    return v if v > 0 else 0
+
+
 class _MTStreamGateFail(Exception):
     """首子句语言门违约(yield 前抛出=零播报,调用方可安全回退 _mt_once 旧路径)。"""
 
@@ -636,6 +660,9 @@ async def _mt_stream_say(
 
     开流→delta 缓冲→子句切割→首子句语言门(E5 启发式:looks_like_language,
     违约在 **yield 前**抛出=零播报)→session.say(async 生成器)逐子句喂出。
+    **W0-2 首 chunk 早交**:首段额外按字数硬切(A 线 _first_chunk_cut 铁闸)并
+    yield FlushSentinel()——官方硬段边界,MiniMax 立即起合成(下段边翻边合成
+    与上段播放重叠);早切段语言门软失败=弃早交回落子句路径(不误回退整句)。
     返回 {full, first_ms, yielded, state}:
     - ``clean``     流自然结束(full=全文);
     - ``gate``      首子句语言门违约(零播报)→调用方回退 _mt_once(保留其
@@ -645,11 +672,16 @@ async def _mt_stream_say(
                     播报),full=已出部分,账本照常配对。
     语气标记按子句块换算(_apply_voice_tags 幂等,块内 token 不跨切点=换算完整);
     引号剥除在 provider 层(_StripMTQuoteStream 包流,流式天然继承)。"""
+    from livekit.agents import FlushSentinel
+
+    from .providers.livekit_plugins import _first_chunk_cut
+
     out: dict = {"full": "", "first_ms": 0, "yielded": False, "state": "clean"}
     stream = _mt_open_stream(llm_provider, ctx, retry=False)
     if inspect.isawaitable(stream):
         stream = await stream
     done = asyncio.Event()
+    n0 = _interp_mt_first_chunk_chars()
 
     async def _gen():
         buf = ""
@@ -667,6 +699,28 @@ async def _mt_stream_say(
                 if not content:
                     continue
                 buf += content
+                # W0-2 首 chunk 早交:无标点也按字数硬切(A 线铁闸),切出即
+                # yield + FlushSentinel → 官方硬段边界,合成立即起跑。
+                if first and n0 > 0:
+                    cut = _first_chunk_cut(buf, n0)
+                    if cut:
+                        piece, buf = buf[:cut], buf[cut:]
+                        if (
+                            target_lang
+                            and _mt_lang_guard_enabled()
+                            and not looks_like_language(piece, target_lang)
+                        ):
+                            # 软失败:N 字样本语言证据不足,弃早交回落子句路径
+                            # (整句语言门照旧在子句/末段处把关,不误回退)。
+                            buf = piece + buf
+                        else:
+                            out["first_ms"] = int((time.perf_counter() - t0) * 1000)
+                            first = False
+                            out["yielded"] = True
+                            emitted = _apply_voice_tags(piece) if tags else piece
+                            parts.append(emitted)
+                            yield emitted
+                            yield FlushSentinel()
                 piece, buf = _cut_clause_piece(buf)
                 while piece:
                     if first:
@@ -1513,16 +1567,18 @@ def _interp_frag_merge_enabled() -> bool:
 # 诊断定案(2026-10-08 实弹):豆包 lane 只按 VAD 静音切句(B 线 min_silence=0.45s),
 # 思考停顿/换气即一个 FINAL,一段话被切成 N 段独立烧全链(ASR+DeepSeek MT+TTS),
 # 段间隔 1-2s → 对方听感「断断续续」。刀=**尾部续说观察窗**:END_OF_SPEECH 不
-# 立刻定稿,先等 BOK_INTERP_UTT_WAIT_S(缺省 0.45s)——窗口内续讲=同一 WS 会话
-# 续喂并段(服务端 result.text 单调累积=天然并稿,零拼接账本);静默到底才负 seq
-# 定稿。有效切句边界=说话末音后总静默 0.45+0.45=0.9s(微停顿不再一停一句),
-# 真停顿的 FINAL 比旧路晚 ~0.45s(换来段数砍半+译文连贯)。**B 线专用**(装配点传
+# 立刻定稿,先等 BOK_INTERP_UTT_WAIT_S——窗口内续讲=同一 WS 会话续喂并段(服务端
+# result.text 单调累积=天然并稿,零拼接账本);静默到底才负 seq 定稿。
+# **W0 复核(2026-10-08 晚,A/B 基线 ③号)窗缺省 0.45→0.2**:窗税实弹 +450ms
+# 把 B 线首声盖过 A 线(2332 vs 1763),而窗关档 B 反超(1666);并段收益集中在
+# <0.65s 微停顿带,0.2 窗已覆盖大头——有效切句边界=说话末音后 0.45+0.2=0.65s
+# 总静默(微停顿并段保留,真停顿税砍 250ms)。**B 线专用**(装配点传
 # utt_merge=True;A 线 agent.py 不传=逐字节旧路)。kill-switch
 # BOK_INTERP_UTT_MERGE=0 整档关闭;窗口 BOK_INTERP_UTT_WAIT_S 可调(坏值回缺省,
 # 钳 [0,3])。与 3a 碎片闸互补:本刀治「内容微停顿切碎」,3a 治「纯应承碎片」。
 _UTT_MERGE_ENV = "BOK_INTERP_UTT_MERGE"
 _UTT_WAIT_ENV = "BOK_INTERP_UTT_WAIT_S"
-_UTT_WAIT_DEFAULT_S = 0.45
+_UTT_WAIT_DEFAULT_S = 0.2
 _UTT_WAIT_MAX_S = 3.0
 
 

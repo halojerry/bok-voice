@@ -59,6 +59,44 @@ from probe_cloud_asr import (
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORT_DIR = ROOT / "reports" / "doubao-utterances"
+
+
+# ---- SSRF 护栏（语义镜像生产 providers/doubao_asr.py 的 _ws_host_ok；探针单源
+# 在 probe_cloud_asr，此处为本地诊断工具的等价护栏，不 import 生产件=免拖 livekit）----
+def _ws_host_ok(url: str) -> bool:
+    """仅放行 wss 公网端点（拒环回/私有/保留/明文；IP 字面量按 is_global）。"""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:  # noqa: BLE001
+        return False
+    if parsed.scheme != "wss":
+        return False
+    host = (parsed.hostname or "").lower().strip(".")
+    if not host or host == "localhost" or host.endswith((".local", ".internal", ".lan", ".localhost")):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # 域名放行（连接层解析）
+    return bool(ip.is_global)
+
+
+def _cp_base_ok(cp_base: str) -> bool:
+    """CP 面护栏（SSRF）：仅放行**环回字面量**（127.0.0.1/localhost/::1）+
+    http/https——本探针的设计目标只有本机 CP；内网段/云元数据/任意域名一律拒。"""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(str(cp_base or ""))
+    except Exception:  # noqa: BLE001
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    return host in ("127.0.0.1", "localhost", "::1", "[::1]")
 DOUBAO_RESOURCE_DEFAULT = "volc.seedasr.sauc.duration"  # 生产装配缺省（seedasr 2.0）
 PACKET_BYTES = 16000 * 2 * 200 // 1000  # 200ms@16k mono PCM16 = 6400B
 BYTES_PER_MS = 32.0  # 16k*2B/1000ms
@@ -207,6 +245,8 @@ async def run_session(
 
     log({"evt": "meta", **meta, "config": cfg})
 
+    if not _ws_host_ok(url):
+        raise SystemExit(f"WS 端点非法（仅 wss 公网；拒环回/私有/明文）: {url!r}")
     async with websockets.connect(
         url, additional_headers=headers, open_timeout=10, max_size=20_000_000
     ) as ws:

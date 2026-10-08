@@ -286,13 +286,16 @@ def _mt_once_body() -> str:
 
 
 def test_validator_sits_at_single_point_in_pipeline():
-    """校验器两个出口点（2026-10-08 Wave 2 起）:``_mt_once`` 整句路径(首判+重试
-    复判=2 处)+``_mt_stream_say`` 流式路径首子句门/尾块门(2 处)——同一判据
-    ``looks_like_language`` 单源,只是流式档在 yield 前判首子句(零播报可回退)。"""
+    """校验器出口点（2026-10-08 W0 起）:``_mt_once`` 整句路径(首判+重试复判=2 处)
+    +``_mt_stream_say`` 流式路径首子句门/尾块门(2 处)+首 chunk 早交软门(1 处,
+    失败=弃早交回落子句路径,不回退整句)——同一判据 ``looks_like_language`` 单源。"""
     src = _INTERP.read_text(encoding="utf-8")
     body = _mt_once_body()
     assert body.count("looks_like_language(") == 2, "校验应在 _mt_once 内出现（首判+重试复判）"
-    assert src.count("looks_like_language(") == 4, "整句 2 处(_mt_once)+流式 2 处(_mt_stream_say 首子句门+尾块门)"
+    assert src.count("looks_like_language(") == 5, (
+        "整句 2 处(_mt_once)+流式 2 处(_mt_stream_say 首子句门+尾块门)"
+        "+W0 首 chunk 早交软门 1 处"
+    )
 
 
 def test_single_retry_is_structurally_bounded():
