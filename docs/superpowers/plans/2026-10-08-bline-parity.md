@@ -144,3 +144,16 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   双测+接线 pin+等窗缺省+口径）；web tsc+build 绿+voice-map node 测试 2/2。
   回退：`BOK_INTERP_SPEC_MT=0`（spec 整链关）或摘挂点（会话层喂法自动回
   旧路=饥饿形态回归,勿单独摘）；`BOK_INTERP_SPEC_WAIT_S=0.6` 回旧等窗。
+
+- **spec 复活实弹证据（探针脚本入仓）**：`scripts/probes/probe_interp_spec_live.py`
+  （多子句刺激+停顿挤压=逗号停顿压到 VAD 静音线内,对真人形状;含全静音护栏）
+  call-cf4e2a99：`CLAUSE_COMMIT chars=20 lag=3770(说话中) → INTERP_SPEC fire
+  chars=20 → defer wait=2s → defer-fallback`（DeepSeek 晚峰 2512ms 超 2s 等窗
+  =HIT 未落地,管线全程活着）。注意 TTS 渲染逗号=0.3-0.6s 停顿会被 VAD 劈段
+  （e2e 句形铁律）——多子句刺激必须挤压停顿才逼近真人。
+- **:1236 启动闸补漏（用户质询「为何还启 hy-mt」）**：`_start_mt_llm` 此前
+  不吃 posture——mt 云档仍因「模型在盘」起本地 Hy-MT2（主树=闲置常驻违全云
+  指令;干净树缺 sidecar venv 直接 FileNotFoundError 打死 serve）。已补
+  posture 闸（mt_local=False 跳过,同 :1235/:1237 姿势）。
+- **BOK_AMBIENT_SCENE 移除（用户指令）**：环境音轨污染探针 captured 判据
+  （57s 房间底噪被当译文音频）;栈已按无 ambient 重启。
