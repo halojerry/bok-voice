@@ -1671,6 +1671,107 @@ def _spec_busy_depth() -> int:
     return max(1, v)
 
 
+# —— W3b·刀2 本向回声/重复去重(2026-10-08,体检:同文本 10s 重复译文 26 次+
+# 跨向重复 34 次) -------------------------------------------------------
+# 一体台双麦同桌面串音=同一句话两个方向都成轮(译文播两遍);同向 ASR 重复
+# final 也实测在案("Hello. How are you?" 一通译 3 遍)。本向可判的两类:
+# ①dup-final:同归一文本在窗内重复(同 mic 串音/ASR 重发);
+# ②self-heard:final ≈ 本向近期输出译文(≥0.85)——输出被自家输入侧再转写。
+# 真·跨向并发去重需 CP 中转两 worker 状态(票据留档,不硬造)。
+# 命中=整轮丢弃(不落原文行/不进队/不烧 spec)。同传语义:数秒内逐字重复几乎
+# 必是串音而非客户意图。kill-switch BOK_INTERP_ECHO_DEDUP(默认开)。
+_ECHO_DEDUP_ENV = "BOK_INTERP_ECHO_DEDUP"
+_ECHO_DUP_WINDOW_ENV = "BOK_INTERP_ECHO_DUP_WINDOW_S"
+_ECHO_DUP_WINDOW_DEFAULT_S = 8.0
+_ECHO_SIM_GATE = 0.85
+
+
+def _echo_dedup_enabled() -> bool:
+    return os.environ.get(_ECHO_DEDUP_ENV, "1") == "1"
+
+
+def _echo_dup_window_s() -> float:
+    """dup-final 判重窗秒(纯函数):坏值回 8.0;负数钳 0。"""
+    raw = os.environ.get(_ECHO_DUP_WINDOW_ENV, "")
+    try:
+        v = float(raw) if raw else _ECHO_DUP_WINDOW_DEFAULT_S
+    except ValueError:
+        return _ECHO_DUP_WINDOW_DEFAULT_S
+    return max(0.0, v)
+
+
+class _InterpEchoDedup:
+    """本向回声/重复判重器(纯逻辑,时钟注入可单测)。
+
+    ``check(text, now, own_translations)`` → 命中原因串(""=放行)。recent 环
+    只存归一文本(≤8 条),与秒级 final 节奏匹配。"""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._recent: deque = deque(maxlen=8)
+
+    def check(self, text: str, now: float | None = None, own_translations: "tuple[str, ...]" = ()) -> str:
+        ts = float(self._clock()) if now is None else float(now)
+        norm = _spec_norm(text)
+        if not norm:
+            return ""
+        window = _echo_dup_window_s()
+        for t, n in self._recent:
+            if ts - t <= window and n == norm:
+                return "dup-final"
+        # self-heard:输出侧译文被输入侧再转写(语言相同时才可能高相似)
+        for tr in own_translations:
+            ntr = _spec_norm(tr)
+            if not ntr:
+                continue
+            if difflib.SequenceMatcher(a=norm, b=ntr).ratio() >= _ECHO_SIM_GATE:
+                return "self-heard"
+        self._recent.append((ts, norm))
+        return ""
+
+
+# —— W3b·刀3 结巴清理(2026-10-08,体检:结巴照译「我我我我我，要不要？」) ------
+# 确定性重复折叠(纯本地,只进 MT 输入副本——原文单轨铁律):CJK 单字连续 ≥3
+# 折 1;同双字组连续 ≥3 折 1 组。拉丁/数字 run 不动(型号/编号风险)。
+# 服务端官方臂=豆包 enable_ddc(BOK_DOUBAO_DDC,默认关——会剥语气词,与语气
+# 标记 v2 冲突,A/B 耳测定档);客户端折叠=本层,kill-switch
+# BOK_INTERP_STUTTER_FIX(默认开)。
+_STUTTER_FIX_ENV = "BOK_INTERP_STUTTER_FIX"
+_CJK_CHAR = r"\u4e00-\u9fff"
+_STUTTER_SINGLE_RE = re.compile(rf"([{_CJK_CHAR}])\1{{2,}}")
+
+
+def _stutter_fix_enabled() -> bool:
+    return os.environ.get(_STUTTER_FIX_ENV, "1") == "1"
+
+
+def _fold_stutter(text: str) -> str:
+    """确定性结巴折叠(纯函数,单测直喂):单字 run ≥3→1;2/3 字组重复 ≥3→1 组。
+
+    3 字组覆盖 A-not-A 型口吃单元(要不要/是不是/对不对——中文高频结巴形状)。"""
+    if not text:
+        return text
+    out = _STUTTER_SINGLE_RE.sub(r"\1", text)
+    changed = True
+    while changed:
+        changed = False
+        for k in (2, 3):  # 组长:双字(好的好的)/三字(A-not-A)
+            for i in range(0, max(0, len(out) - k * 3)):
+                unit = out[i : i + k]
+                if len(unit) < k or not all("\u4e00" <= ch <= "\u9fff" for ch in unit):
+                    continue
+                if out.startswith(unit * 3, i):
+                    j = i + k * 3
+                    while out.startswith(unit, j):
+                        j += k
+                    out = out[:i] + unit + out[j:]
+                    changed = True
+                    break
+            if changed:
+                break
+    return out
+
+
 def _persona_voice_map(persona: dict) -> dict:
     """B 线人设音色 → 三语言同把声(纯函数,单测直喂;A 线同款整场同声语义)。
 
@@ -2505,6 +2606,8 @@ async def entrypoint(ctx) -> None:
     # 积压由 _PlaybackBacklog 门槛追最新弃旧。
     _llm_instructions = _translation_instructions(source_lang, target_lang, _glossary)
     _mt_pairs: deque = deque(maxlen=8)  # (源,译) 滚动对——_rolling_pairs 的参考料
+    # W3b 刀2:本向回声/重复判重器(时钟真钟;单测直接构造注入)。
+    _echo_dedup = _InterpEchoDedup()
     _mt_latency = {"ms": 0}
     # Wave 2 首子句时延(流式 say 才有语义:final→首子句交 TTS;整句路径=0)
     _mt_first = {"ms": 0}
@@ -2581,6 +2684,11 @@ async def entrypoint(ctx) -> None:
                 # ——与 A 线 ContextAwareLLM 冻结点同构。四语源(de/fr/ja/pt)表空
                 # 且 detect 有误判风险,直通。
                 text_mt = _polish_for_mt(text, source_lang)
+                # W3b 刀3:确定性结巴折叠(单字 run≥3 折 1/双字组重复≥3 折 1 组;
+                # 只进 MT 输入副本,原文单轨铁律;拉丁数字 run 不动)。官方臂
+                # enable_ddc 在 doubao_asr 请求体(BOK_DOUBAO_DDC,默认关)。
+                if _stutter_fix_enabled():
+                    text_mt = _fold_stutter(text_mt)
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text_mt)
                 # Wave 2 流式交付(2026-10-08):流式 say 逐子句喂出,首子句即合成
                 # 开播——旧「整句排干再合成」的尾段等待被吃掉;一源句=一 say=一
@@ -2788,6 +2896,21 @@ async def entrypoint(ctx) -> None:
                 spec_ctl.on_interim(text)
             return
         last_user["text"] = text
+        # W3b 刀2 本向回声/重复去重:一体台双麦串音/ASR 重发——命中整轮丢弃
+        # (不落原文行/不进队/不烧 spec)。跨向真并发去重需 CP 中转(票据留档)。
+        if _echo_dedup_enabled():
+            _drop = _echo_dedup.check(
+                text,
+                now=time.monotonic(),
+                own_translations=tuple(t for _, t in list(_mt_pairs)[-3:]),
+            )
+            if _drop:
+                print(
+                    f"[interp] INTERP_ECHO_DROP reason={_drop} chars={len(text)} "
+                    f"text={text[:24]!r}",
+                    flush=True,
+                )
+                return
         _spawn_ledger(_add_turn(f"原文：{text}", source_lang))
         if spec_ctl.on_final(text):
             return

@@ -97,3 +97,112 @@ def test_busy_gate_wiring_source_pinned():
     # 立法双面:_FORWARD_ENV 表 + _interp_env B 线透传白名单同键。
     assert '"BOK_INTERP_SPEC_BUSY_DEPTH",' in ENV_SRC
     assert ENV_SRC.count('"BOK_INTERP_SPEC_BUSY_DEPTH"') >= 2
+
+
+# ---------------------------------------------------------------------------
+# 刀2:本向回声/重复去重(_InterpEchoDedup)
+# ---------------------------------------------------------------------------
+
+
+def test_echo_dedup_dup_final_window():
+    """同归一文本窗内重复→drop;出窗→放行;标点/空白差异不改判定(_spec_norm)。"""
+    from agent_runtime.interpret import _InterpEchoDedup
+
+    d = _InterpEchoDedup(clock=lambda: 0.0)
+    assert d.check("你好呀我想问一下。", now=100.0) == ""
+    assert d.check("你好呀我想问一下！", now=101.5) == "dup-final"  # 归一后同文本
+    assert d.check("另外一句完全不同。", now=102.0) == ""
+    # 出窗(默认 8s)放行
+    assert d.check("你好呀我想问一下。", now=108.5) == ""
+
+
+def test_echo_dedup_self_heard_against_own_translations():
+    """final ≈ 本向近期输出译文(≥0.85)→self-heard 丢弃(输出被自家输入再转写)。"""
+    from agent_runtime.interpret import _InterpEchoDedup
+
+    d = _InterpEchoDedup(clock=lambda: 0.0)
+    assert (
+        d.check("唔好意思呢句聽唔清楚", now=100.0, own_translations=("唔好意思，呢句聽唔清楚。",))
+        == "self-heard"
+    )
+    # 低相似(不同内容)放行
+    assert d.check("完全无关的另一句话", now=100.0, own_translations=("唔好意思，呢句聽唔清楚。",)) == ""
+
+
+def test_echo_dedup_env_gates(monkeypatch):
+    from agent_runtime import interpret
+
+    monkeypatch.delenv("BOK_INTERP_ECHO_DEDUP", raising=False)
+    monkeypatch.delenv("BOK_INTERP_ECHO_DUP_WINDOW_S", raising=False)
+    assert interpret._echo_dedup_enabled() is True
+    assert interpret._echo_dup_window_s() == 8.0
+    monkeypatch.setenv("BOK_INTERP_ECHO_DEDUP", "0")
+    assert interpret._echo_dedup_enabled() is False
+    monkeypatch.setenv("BOK_INTERP_ECHO_DUP_WINDOW_S", "junk")
+    monkeypatch.delenv("BOK_INTERP_ECHO_DEDUP", raising=False)
+    assert interpret._echo_dup_window_s() == 8.0
+    monkeypatch.setenv("BOK_INTERP_ECHO_DUP_WINDOW_S", "-2")
+    assert interpret._echo_dup_window_s() == 0.0  # 负数钳 0=判重窗全关
+
+
+def test_echo_dedup_wiring_pins():
+    assert "INTERP_ECHO_DROP reason=" in INTERP_SRC
+    assert "_echo_dedup.check(" in INTERP_SRC
+    assert "_echo_dedup_enabled()" in INTERP_SRC
+    assert "_echo_dedup = _InterpEchoDedup()" in INTERP_SRC
+
+
+# ---------------------------------------------------------------------------
+# 刀3:结巴折叠(_fold_stutter)+豆包官方三臂
+# ---------------------------------------------------------------------------
+
+
+def test_fold_stutter_single_char_run():
+    from agent_runtime.interpret import _fold_stutter
+
+    assert _fold_stutter("我我我我我，要不要？") == "我，要不要？"
+    assert _fold_stutter("普通句子没有结巴。") == "普通句子没有结巴。"
+    # 拉丁/数字 run 绝不折叠(型号/编号风险)
+    assert _fold_stutter("AAAA123") == "AAAA123"
+
+
+def test_fold_stutter_pair_repeat():
+    from agent_runtime.interpret import _fold_stutter
+
+    assert _fold_stutter("要不要要不要要不要去广州") == "要不要去广州"
+    # 两次重复(<3)不折叠——正常强调语气保留
+    assert _fold_stutter("要不要要不要去") == "要不要要不要去"
+
+
+def test_fold_stutter_gate_and_wiring(monkeypatch):
+    from agent_runtime import interpret
+
+    monkeypatch.delenv("BOK_INTERP_STUTTER_FIX", raising=False)
+    assert interpret._stutter_fix_enabled() is True
+    monkeypatch.setenv("BOK_INTERP_STUTTER_FIX", "0")
+    assert interpret._stutter_fix_enabled() is False
+    # 接线:折叠在 polish 之后(MT 输入副本链上),原文单轨不触碰
+    assert "text_mt = _fold_stutter(text_mt)" in INTERP_SRC
+    polish_at = INTERP_SRC.index("text_mt = _polish_for_mt(text, source_lang)")
+    fold_at = INTERP_SRC.index("text_mt = _fold_stutter(text_mt)")
+    assert fold_at > polish_at
+
+
+def test_doubao_official_arms_default_off(monkeypatch):
+    """官方三臂默认全关=请求体逐字节旧形状;开臂才见对应键。"""
+    from agent_runtime.providers.doubao_asr import DoubaoSTT
+
+    for k in ("BOK_DOUBAO_NONSTREAM", "BOK_DOUBAO_DDC", "BOK_DOUBAO_FIRST_TOKEN_BOOST"):
+        monkeypatch.delenv(k, raising=False)
+    stt = DoubaoSTT(api_key="k")
+    req = stt._config()["request"]
+    assert "enable_nonstream" not in req and "enable_ddc" not in req
+    assert "enable_accelerate_text" not in req
+
+    monkeypatch.setenv("BOK_DOUBAO_NONSTREAM", "1")
+    monkeypatch.setenv("BOK_DOUBAO_DDC", "1")
+    monkeypatch.setenv("BOK_DOUBAO_FIRST_TOKEN_BOOST", "1")
+    req2 = DoubaoSTT(api_key="k")._config()["request"]
+    assert req2["enable_nonstream"] is True
+    assert req2["enable_ddc"] is True
+    assert req2["enable_accelerate_text"] is True and req2["accelerate_score"] == 3

@@ -179,3 +179,25 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   心跳→1.05-1.35x 变速追帧替代弃音,FFT 相位声码器）与**专用翻译端点**
   （厂商 qwen-mt-flash 首字 265-448ms;火山 doubao-seed-translation 候选,
   凭据已在手）——两票待拍板。
+
+## W3 纪要（2026-10-08 深夜，subagent 额度阵亡主会话接管）
+
+- **刀1 spec busy 闸放宽**（subagent 完成+主会话收尾）：FIFO「非空即封」→深度门
+  （BOK_INTERP_SPEC_BUSY_DEPTH 默认 2；1=旧档回退）；frag hold 期 _mt_busy 不
+  再置位（hold=等合并非真忙，spec 可开火）；fired/blocked 累计+封锁 episode
+  首拍 busy 行。目标命中率 4/108→≥30%（真人通验证）。
+- **刀2 本向回声/重复去重**：`_InterpEchoDedup`——同归一文本 8s 窗重复 final
+  （账本 26 次）+ self-heard（final≈本向近期译文 ≥0.85，一体台双麦串音）。
+  命中整轮丢弃。**真·跨向并发去重需 CP 中转两 worker 状态=票据留档**。
+- **刀3 结巴清理**：`_fold_stutter` 确定性折叠（单字 run≥3→1；**2/3 字组**重复
+  ≥3→1 组——3 字组覆盖 A-not-A 型「要不要/是不是」中文高频口吃单元；拉丁/
+  数字 run 不动）只进 MT 输入副本；官方臂 enable_ddc 入 doubao 请求体
+  （BOK_DOUBAO_DDC 默认关——剥语气词与语气标记 v2 冲突）。
+- **官方三臂**：BOK_DOUBAO_NONSTREAM（二遍识别）/BOK_DOUBAO_DDC/
+  BOK_DOUBAO_FIRST_TOKEN_BOOST（首字加速 score=3）——默认全关，耳测 A/B 定档。
+  env 立法 278→284。
+- **刀4 carry buffer 缓期（口径修正）**：原规格把「短残句前插」放 FIFO 层，
+  但体检残留「快 TTS 档子句 B 被吞」根因是 **doubao VAD START 迟到吃句头**
+  （阈值无关，音频层）——FIFO 层 carry 治不了它。正确落点=provider VAD
+  边界处理，独立票。
+- 验收：test_interp_w3bfix 11 绿 + 全量 **5049 passed/4 skipped**。
