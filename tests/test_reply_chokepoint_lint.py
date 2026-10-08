@@ -64,7 +64,10 @@ _ALLOW_REPLY_DONE_SET: dict[tuple[str, str], int] = {
     # 会话收尾：on_close 全量解除等待
     ("agent.py", "_on_close"): 1,
     # turn 钩子内的出口车道（10 处：打断/风暴/暂停/静默放弃等，EX-2 审计集）
-    ("agent.py", "on_user_turn_completed"): 10,
+    # W2 刀4（2026-10-08）+1=11：burst-merge 连发窗——合并补答在途（窗尾
+    # generate_reply 一次性应答窗内全部轮），本轮 StopResponse=「交付在途的
+    # 放弃边」，judge 须放行。
+    ("agent.py", "on_user_turn_completed"): 11,
     # 打断 watcher（speech_created 触发的放弃边；第七波审计漏网、十二波补洞）
     ("agent.py", "_watch"): 1,
     # FIX-3（2026-10-02 批3 合流）：复读全吞=有意静默的放弃边——judge 不等

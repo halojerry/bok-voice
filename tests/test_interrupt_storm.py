@@ -177,8 +177,9 @@ def test_storm_expiry_timer_wiring_source_pins():
     assert src.count("_arm_storm_expiry(_STORM_QUIET_S)") == 2, "engage+续期两处拨钟"
     # 总闸判定调用 3 处:engage(独立 if)/续期(独立 if)/nudge 让位(内联 and)
     assert src.count("_storm_expiry_resume_enabled()") == 4, "def 行+三处调用"
-    # cancel 四处命中:def 定义行 + arm 内重拨 + 用户轮 resume + teardown finally
-    assert src.count("_cancel_storm_expiry()") == 4, "def+arm重拨+resume+teardown"
+    # cancel 五处命中:def 定义行 + arm 内重拨 + 用户轮 resume + teardown finally
+    # + W2 刀2(2026-10-08) REPEAT 承应豁免(清风暴账时收旧钟)
+    assert src.count("_cancel_storm_expiry()") == 5, "def+arm重拨+resume+teardown+repeat豁免"
     # fire 判据=逐值比对(自毁守卫回归钉:fire 醒来时 now≥active_until 恒真,
     # 用 _storm_active 判 fire=no-op 恒成立——probe_storm_expiry 第一版实证)
     assert "_storm_expiry_should_clear(_storm, _armed_until)" in src

@@ -1427,6 +1427,18 @@ def _starve_ack_line(lang: str) -> str:
     return "在的，您讲，我马上答复您。"
 
 
+def _repeat_ack_line(lang: str) -> str:
+    """REPEAT 轮承应句(W2 刀2,2026-10-08):客户显式要求重复时先出声应一下,
+    再由复述指引车道补真内容——静默消费路径(风暴静听吞轮)的强制出声兜底。
+    零内容承诺、≤14 字,落 _ack_anchor_texts(唔进【你上一句】锚/摘要)。
+    BOK_REPEAT_ACK=0 关。"""
+    if lang == "cantonese":
+        return "好，我再講一次。"
+    if lang == "en":
+        return "Sure — let me say that again."
+    return "好的，我再讲一遍。"
+
+
 def _reap_generation_idle(stream) -> bool:
     """D1 收尸孤儿门控(2026-09-30 终修):仅当包装流链**最内层**的生成任务
     已结束(或拿不到任务引用)才允许收尸。
@@ -1584,7 +1596,9 @@ def _ack_anchor_texts() -> frozenset[str]:
     EX-2(2026-09-28)补 followup-ack:跟进建单确认语同为「零内容承诺应承」,
     落进【你上一句】锚/摘要会污染(context 只留真回复)。
     EX-2(2026-09-28)再补 garbled-reask:碎片重问行同为无内容承诺语,且含道歉词,
-    进锚/摘要会教 4B 道歉敷衍口气(同 _is_ack_anchor_text docstring)。"""
+    进锚/摘要会教 4B 道歉敷衍口气(同 _is_ack_anchor_text docstring)。
+    W2 刀2(2026-10-08)补 repeat-ack:复述请求承应句同为零内容承诺行。
+    """
     lines: set[str] = set()
     for fn in (
         _llm_fallback_line,
@@ -1593,6 +1607,7 @@ def _ack_anchor_texts() -> frozenset[str]:
         _defer_ack_line,
         _followup_ack_line,
         _garbled_reask_line,
+        _repeat_ack_line,
     ):
         for lang in ("zh", "cantonese", "en"):
             lines.add(_clean_transcript(strip_voice_style(fn(lang))))
@@ -1632,7 +1647,7 @@ _REPLY_LANES: tuple[str, ...] = (
     "qa-fastpath", "graph-play", "graph-jump", "graph-notify", "graph-catchall",
     "branch-canned",
     "farewell", "nudge", "followup-ack", "pause-ack", "fallback-ack",
-    "garbled-reask", "wa-confirm",
+    "garbled-reask", "wa-confirm", "repeat-ack",
 )
 
 
@@ -1658,6 +1673,57 @@ def _reply_similarity(a: str, b: str) -> float:
     if not na or not nb:
         return 0.0
     return difflib.SequenceMatcher(a=na, b=nb).ratio()
+
+
+def _is_repeat_fragment_pollution(
+    text: str,
+    frags,
+    *,
+    sim_threshold: float = 0.85,
+    min_norm_chars: int = 6,
+) -> bool:
+    """interrupted 轮「前缀同源片」判定(W2 刀3,2026-10-08;纯函数,单测用)。
+
+    病理(架构体检 2026-10-08):10-07 的 interrupted-item corpus skip 走
+    ``item.interrupted`` 旗——旗没送到(事件形态差异/late item)时,被打断的
+    前缀残片仍进重复锚/账本,风暴后重生成同答案的首句被误判复读
+    (REPEAT_GUARD_CANCEL_DROP first_sent=1 家族,10-05 以来 38 次)。
+
+    判据:text 与任一在案打断残片 归一后 相等 / 前缀同源(任一方向
+    startswith 且较短侧 ≥min_norm_chars)/ 相似 ≥sim_threshold——即「同源
+    内容的截断形态」。False 的情况:残片账空、双方过短、kill-switch
+    ``BOK_REPEAT_CROSS_TURN=0``(残片清洗随跨轮复读防线同闸,=0 全关回旧)。
+    只影响语料写入(item 侧豁免出口复用),不阻出声。
+    """
+    if os.environ.get("BOK_REPEAT_CROSS_TURN", "1") != "1":
+        return False
+    t = _ticket_norm(text)
+    if len(t) < min_norm_chars:
+        return False
+    for frag in frags or []:
+        f = _ticket_norm(str(frag or ""))
+        if not f:
+            continue
+        if t == f:
+            return True
+        shorter = min(len(t), len(f))
+        if shorter >= min_norm_chars and (t.startswith(f) or f.startswith(t)):
+            return True
+        if _reply_similarity(t, f) >= sim_threshold:
+            return True
+    return False
+
+
+def _burst_merge_window_s() -> float:
+    """句级提交连发窗(W2 刀4,2026-10-08):BOK_BURST_MERGE_WINDOW_S,秒。
+
+    默认 3.0;``0`=关(回旧行为:每个句级提交轮独立抢答);坏值回缺省;负值
+    按关处理。进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。"""
+    try:
+        v = float(os.environ.get("BOK_BURST_MERGE_WINDOW_S", "3.0") or 3.0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 3.0
+    return v if v > 0 else 0.0
 
 
 def _late_answer_dedup_verdict(
@@ -3662,6 +3728,18 @@ async def entrypoint(ctx):
     # DSN 缺席/SDK 缺席=完整 no-op,绝不阻 job)。
     _init_sentry("agent-worker")
 
+    # W2 刀1(2026-10-08):粤语音系补位依赖预 import——qa_phonetic 的 vendored
+    # ToJyutping 首用 import 触发 trie 解析 ~160-280ms(账本 465 次 "event loop
+    # blocked"),惰性点在首个粤语 QA 查询=通话中烧算力。挪到 job 启动早段
+    # (会话建立前付清,运行时纯缓存命中);失败静默=补位层原惰性路径逐字节
+    # 兜底。纯启动期时机移动,零运行时行为变化,无 kill-switch。
+    try:
+        from bok_voice_core.qa_phonetic import warm_up as _qa_phonetic_warm_up
+
+        _qa_phonetic_warm_up()
+    except Exception:  # noqa: BLE001 - 预热失败唔阻通话(惰性路径照旧)
+        pass
+
     # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
     # run_agent()/worker 主进程的安装对 serving 进程无效。
     from .preemptive_debug import install_preemptive_debug
@@ -4017,6 +4095,15 @@ async def entrypoint(ctx):
     # B4 打断轮部分文本 tee(ContextAwareLLM 注入)——回复被框架打断时 item 永不
     # added,这里留着已生成的文本给 speech watcher 补记 gen=interrupted 行。
     _reply_partial: dict = {"text": ""}
+    # W2 刀3 打断残片账(2026-10-08):被打断回复的已生成文本(partial+guard
+    # buffer,watcher 补账点采集,有界 4 条)——「前缀同源片」清洗的语料面,
+    # item 侧重复锚/账本写入前过滤(详见 _is_repeat_fragment_pollution)。
+    _interrupted_frags: list = []
+    # W2 刀4 连发窗账(2026-10-08):ts=最近一次用户轮提交时刻(monotonic);
+    # answered=最近一次提交后是否已有 assistant 出声(item 或可闻车道登记)。
+    # flush=在途合并补答任务(单飞,新轮 hook 入口先收)。
+    _burst_state: dict = {"ts": 0.0, "answered": True}
+    _burst_flush_task: dict = {"task": None}
     # B3 连环打断风暴:滚动窗打断时刻 + 静听模式截止时刻。
     _storm: dict = {"ts": [], "active_until": 0.0, "rounds": 0}
     # W1f deferred abandon(2026-10-06 demo-quality wave):打断确证才弃流——
@@ -5599,6 +5686,9 @@ async def entrypoint(ctx):
         if notify:
             _pending_lane["lane"] = str(lane or "")
             return
+        # W2 刀4(2026-10-08):可闻车道登记=连发窗链「已应答」——下一用户轮
+        # 不再并入合并补答(可闻 ack 也算接住上一轮,A3 同口径)。
+        _burst_state["answered"] = True
         if not history:
             # D6:ack 出声即接住上一用户轮(A3 语义),item_added 不再发生;
             # 不推票据(5s 新鲜度窗的误领面消灭)。
@@ -5742,6 +5832,8 @@ async def entrypoint(ctx):
             )
             return
         _assistant_out["on"] = True  # A3:assistant 轮出现=上一用户轮已被接住
+        # W2 刀4(2026-10-08):assistant item 交付=连发窗链「已应答」。
+        _burst_state["answered"] = True
         _reply_partial["text"] = ""  # B4:轮已正常落库,tee 清零(watcher 唔会再补记)
         # EX-2 chokepoint 消费点:FIFO 取本车道票据(文本配对→最旧兜底);无票据=
         # 纯 LLM 轮,gen=llm。notify 车道顺延的 provider 在此并归(同轮打铃+罐头
@@ -5796,6 +5888,58 @@ async def entrypoint(ctx):
                 print(f"REPORT_TASK_ERR {t.exception()!r}", flush=True)
 
         task.add_done_callback(_done)
+
+    def _cancel_burst_flush() -> None:
+        """W2 刀4:收在途合并补答任务(单飞)——每个用户轮 hook 入口先收:
+        本轮接管全上下文,旧 flush 不该再发。"""
+        _t = _burst_flush_task.get("task")
+        if _t is not None and not _t.done():
+            _t.cancel()
+        _burst_flush_task["task"] = None
+
+    def _arm_burst_flush(delay_s: float, *, postpone_left: int = 8) -> None:
+        """W2 刀4:排合并补答——delay_s 后客户仍安静则 generate_reply() 一次性
+        应答窗内合并的全部 user 轮(chat ctx 已含各轮消息,_try_append_user_
+        message 补写)。
+
+        - 客户中途再开口(user_state=speaking)→ 顺延 0.5s 重排(至多
+          postpone_left 次,防与在途语音对撞;到顶放行,barge-in 兜底);
+        - 暂停/收线 → 不发(降级为丢弃:恢复后由客户下一轮接管);
+        - 真正开火时置 answered(补答即 assistant 交付,后续轮不再并入)。
+        走 _spawn_report 池(挂断收线不丢任务;裸 create_task 弱引用教训)。
+        """
+        _cancel_burst_flush()
+
+        async def _flush() -> None:
+            try:
+                await asyncio.sleep(max(0.05, float(delay_s)))
+            except asyncio.CancelledError:
+                return  # 被新轮 hook 入口收掉=正常合并链
+            if closed.is_set():
+                return
+            if getattr(agent, "paused", False):
+                if postpone_left > 0:
+                    _arm_burst_flush(1.0, postpone_left=postpone_left - 1)
+                return
+            try:
+                _u_state = str(getattr(session, "user_state", "") or "")
+            except Exception:  # noqa: BLE001 - 状态拿不到=按安静放行
+                _u_state = ""
+            if _u_state == "speaking" and postpone_left > 0:
+                _arm_burst_flush(0.5, postpone_left=postpone_left - 1)
+                return
+            _burst_state["answered"] = True
+            print(
+                f"BURST_MERGE flush -> generate_reply gap_window="
+                f"{_burst_merge_window_s():.1f}s (call {room_name})",
+                flush=True,
+            )
+            try:
+                session.generate_reply()
+            except Exception as exc:  # noqa: BLE001 - 会话已关等
+                print(f"[agent] burst flush generate failed: {exc!r} (call {room_name})", flush=True)
+
+        _burst_flush_task["task"] = _spawn_report(_flush())
 
     async def _report_assistant_turn(
         text: str, latency: int, gen: str, provider: str, step: int, started_ms: int,
@@ -5892,6 +6036,15 @@ async def entrypoint(ctx):
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
+    def _is_interrupted_fragment_text(t: str) -> bool:
+        """W2 刀3(2026-10-08):文本是否与在案打断残片「前缀同源」——item.interrupted
+        旗没送到的事件形态下,被打断半截 item 的语料面兜底过滤(语料账=
+        _interrupted_frags,watcher 补账点采集;kill-switch 复用 BOK_REPEAT_CROSS_TURN)。"""
+        try:
+            return _is_repeat_fragment_pollution(t, _interrupted_frags)
+        except Exception:  # noqa: BLE001 - 清洗异常=不过滤(旧行为)
+            return False
+
     def _on_item_for_context(ev):
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -5924,11 +6077,17 @@ async def entrypoint(ctx):
                 # 有意识修复,碎片不配当比对语料。上句锚保留风暴前最后一条完整
                 # 回复(ack 豁免同机制)。prefill 历史喂入不受影响(KV 前缀字节
                 # 对齐:历史怎么落就怎么喂)。
+                # W2 刀3(2026-10-08)补「前缀同源片」面:interrupted 旗没送到的
+                # 形态(item 文本与在案打断残片相等/前缀同源/高相似)同走豁免——
+                # 残片账由 watcher 补账点采集(_interrupted_frags,有界 4 条)。
                 _item_interrupted = bool(getattr(item, "interrupted", False))
-                if _item_interrupted and not _assistant_ack:
+                _item_frag_hit = (not _item_interrupted) and _is_interrupted_fragment_text(text)
+                if (_item_interrupted or _item_frag_hit) and not _assistant_ack:
                     _assistant_ack = True  # 复用豁免通道:锚/账本/摘要全让开
                     print(
-                        f"[agent] interrupted-item corpus skip {str(text)[:24]!r} 不进重复锚/账本",
+                        f"[agent] interrupted-item corpus skip "
+                        f"reason={'flag' if _item_interrupted else 'fragment'} "
+                        f"{str(text)[:24]!r} 不进重复锚/账本",
                         flush=True,
                     )
                 if _assistant_ack:
@@ -6702,6 +6861,15 @@ async def entrypoint(ctx):
             # 后台 judge 不准进 :1235(见 _reply_done_event 声明处)。本轮真交付
             # (assistant item 落账)或纯 StopResponse 出口各自 set 回来。
             _reply_done_event.clear()
+            # W2 刀4(2026-10-08)连发窗账轮转:先取上一轮快照(距上一提交的间隔
+            # +期间是否已有 assistant 出声),再落本轮戳。hook 入口此刻 _assistant_out
+            # 仍持上一轮的结局(本轮重置在其后)——快照必须在重置前取。
+            _burst_prev_ts = float(_burst_state["ts"])
+            _burst_prev_answered = bool(_burst_state["answered"])
+            _burst_state["ts"] = time.monotonic()
+            _burst_state["answered"] = False
+            # 旧 flush 作废:本轮已接管全上下文(合并补答不再发)。
+            _cancel_burst_flush()
             # W4 ②(2026-09-24):commit 墙钟戳——钩子入口即提交时刻,后续回复首
             # 音频(_on_reply_first_audio_timing)消费打 BOK_TURN_TIMING 行。
             # 单槽覆盖:barge-in 轮新戳顶旧戳(打断轮延迟本就含糊,近似可接受)。
@@ -6957,10 +7125,66 @@ async def entrypoint(ctx):
             # (A3 交接,独白不哑);过期/cap resume 时清 ts+starve(防旧计数复燃、
             # 防恢复首轮被 starve 吃掉)。Storm 轮照落库(provider=storm-listen,
             # ack 轮=starve-ack)。BOK_INTERRUPT_STORM_BACKOFF=0 整闸关。
+            # ---- W2 刀2 REPEAT 承应豁免(2026-10-08,call-123d4a21 静默票):风暴
+            # 静听把「再说一次/听唔清」类显式重复请求轮整段吞掉(rounds 1/2/4 静默、
+            # 3/5 让路语——都不是复述)——静听前提「客户在独白」被显式复述请求证伪。
+            # 豁免=清风暴账(ts/rounds/active_until 归零+到期钟收)+直念三语短承应
+            # (零 TTFT 罐头线),**唔 raise**——落穿回正常轮路径,复述指引车道
+            # (verdict==REPEAT→allow_repeat)接手把上一句关键内容真讲一遍。
+            # 判据单源=flow.is_repeat_request_text(与 decide_advance REPEAT 分支
+            # 同一对象)。BOK_REPEAT_ACK=0 回旧行为(风暴静听照旧吞 REPEAT 轮)。
+            _storm_repeat_bypass = False
+            if (
+                os.environ.get("BOK_INTERRUPT_STORM_BACKOFF", "1") == "1"
+                and os.environ.get("BOK_REPEAT_ACK", "1") == "1"
+                and _storm.get("active_until", 0.0) > 0.0
+                and not closed.is_set()
+            ):
+                try:
+                    from .flow import is_repeat_request_text as _is_repeat_req
+
+                    _storm_repeat_bypass = _is_repeat_req(user_text)
+                except Exception:  # noqa: BLE001 - 判据异常=不豁免(旧行为)
+                    _storm_repeat_bypass = False
+            if _storm_repeat_bypass:
+                _storm["ts"] = []
+                _storm["rounds"] = 0
+                _storm["active_until"] = 0.0
+                _cancel_storm_expiry()
+                _starve["n"] = 0
+                _rack = _repeat_ack_line(language_state.lang)
+                # history=False(ack 出声 item 永不发生)+cancel_watchdog=False
+                # (落穿后的 LLM 复述回复还需要响应看门狗兜底)。
+                _register_reply_lane(
+                    lane="repeat-ack", text=_rack, history=False, cancel_watchdog=False
+                )
+                try:
+                    _ra_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="repeat-ack",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_ra_ms, ended_ms=_ra_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻承应
+                    pass
+                print(
+                    f"REPEAT_ACK storm-break rounds_cleared (call {room_name})",
+                    flush=True,
+                )
+                try:
+                    await _say_script(
+                        session, tts_provider, _tts_cache, _rack, add_to_chat_ctx=False
+                    )
+                    await _ledger_ack_line("repeat-ack", _rack)
+                except Exception as exc:  # noqa: BLE001 - 承应失败唔阻复述车道
+                    print(f"[agent] repeat-ack say failed: {exc!r} (call {room_name})", flush=True)
+                # 唔 raise——落穿回正常轮路径(复述指引→LLM 讲真内容)
             if (
                 os.environ.get("BOK_INTERRUPT_STORM_BACKOFF", "1") == "1"
                 and _storm.get("active_until", 0.0) > 0.0
                 and not closed.is_set()
+                and not _storm_repeat_bypass
             ):
                 _now = time.monotonic()
                 _verdict = _storm_on_turn(
@@ -8660,6 +8884,49 @@ async def entrypoint(ctx):
                         _filler.hint_category(_hint_cat)
                     except Exception:  # noqa: BLE001
                         pass
+            # ---- W2 刀4 句级提交连发窗(2026-10-08):上一轮提交 <窗口秒 且期间
+            # 零 assistant 出声(上一轮 AI 未及出答/被框架打断——打断在框架侧
+            # 先于本钩子发生,本钩子拦不住那一下)→ 本轮不再独立抢答:本轮 user
+            # 消息补进 chat ctx(_try_append_user_message 官方姿势)+StopResponse,
+            # 排合并补答(窗尾 generate_reply 一次性应答窗内合并的全部轮)。链式
+            # 连发:每个新轮 hook 入口收旧 flush,窗尾重排→补答恒落在最后一轮
+            # 提交 + 窗口处。快车道(defer-ack/say/QA 罐头/ storms)全部在上方
+            # StopResponse,不受影响;REPEAT 轮豁免(承应铁律:重复请求要快答,
+            # 刀2 同源)。BOK_BURST_MERGE_WINDOW_S=0 整闸关=旧行为逐字节。
+            _burst_window = _burst_merge_window_s()
+            _burst_gap = float(_burst_state["ts"]) - _burst_prev_ts
+            if (
+                _burst_window > 0
+                and _burst_prev_ts > 0.0
+                and not _burst_prev_answered
+                and 0 < _burst_gap <= _burst_window
+                and not closed.is_set()
+                and not getattr(self, "paused", False)
+                and str(flow_ctrl.last_verdict or "") != REPEAT
+            ):
+                _append_ok = await self._try_append_user_message(new_message)
+                try:
+                    _bm_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="burst-merge",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_bm_ms, ended_ms=_bm_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻合并
+                    pass
+                # 补答已在途=本轮「会被接住」,饿死账归零(防链中误触发 starve-ack)。
+                _starve["n"] = 0
+                _cancel_response_watchdog()
+                _arm_burst_flush(_burst_window - _burst_gap)
+                print(
+                    f"BURST_MERGE hold gap={_burst_gap:.2f}s window={_burst_window:.1f}s "
+                    f"ctx_appended={int(_append_ok)} (call {room_name})",
+                    flush=True,
+                )
+                # W-GATE:合并补答在途,本轮无即时交付 → 放行让位 judge
+                _reply_done_event.set()
+                raise StopResponse()
             _filler.arm()
 
         async def _try_append_user_message(self, new_message) -> bool:
@@ -8967,6 +9234,15 @@ async def entrypoint(ctx):
                 print(f"[agent] interrupted reply guard-buffer appended chars={len(_gb)} (call {room_name})", flush=True)
             if closed.is_set() or not bool(getattr(handle, "interrupted", False)):
                 return
+            # W2 刀3(2026-10-08)打断残片入账:本轮已生成文本(tee+guard buffer,
+            # 上方 partial)是「前缀同源片」清洗的语料——item 侧重复锚/账本写入前
+            # 按 _is_repeat_fragment_pollution 过滤(interrupted 旗没送到的形态
+            # 兜底)。有界 4 条,零产出轮(空 partial)不记。BOK_REPEAT_CROSS_TURN=0
+            # 时过滤判定恒 False=账留着也零行为(与跨轮防线同闸)。
+            if partial.strip():
+                _interrupted_frags.append(partial)
+                if len(_interrupted_frags) > 4:
+                    del _interrupted_frags[:-4]
             # W-GATE 打断面补洞（2026-10-01 call-231aa92a 实弹）：打断轮的回复
             # 车道就此终结（无 item 交付、_report_assistant_turn 不会来）——20 站点
             # 审计漏了这条路，事件不置位 → 等待中的 judge 挂到 15s 硬帽过期才放行，

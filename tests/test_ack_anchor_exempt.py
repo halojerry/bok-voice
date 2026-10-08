@@ -43,7 +43,8 @@ def test_real_replies_not_exempt():
 
 def test_exempt_set_shape():
     s = _ack_anchor_texts()
-    assert len(s) == 6 * 3  # EX-2：6 族(含 followup-ack / garbled-reask) × 3 语言,无碰撞
+    # W2 刀2(2026-10-08)起 7 族(+repeat-ack)× 3 语言,无碰撞
+    assert len(s) == 7 * 3
     assert all(isinstance(x, str) and x for x in s)
 
 
