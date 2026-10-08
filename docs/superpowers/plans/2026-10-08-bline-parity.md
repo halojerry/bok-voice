@@ -180,6 +180,19 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   （厂商 qwen-mt-flash 首字 265-448ms;火山 doubao-seed-translation 候选,
   凭据已在手）——两票待拍板。
 
+## W1 纪要·MT 端点矩阵第一轮（2026-10-08 23:16 轻载档）
+
+- **探针入仓**：`scripts/probes/probe_mt_matrix.py`（四臂逐 delta 计时+译文
+  质量+术语落地;SSRF 五域白名单 chokepoint;opencode 需 UA+x-opencode-session
+  双头,方舟 key 与豆包 ASR key 不通用）。
+- **轻载读数**：DeepSeek 官方最快（first 425-1230ms,方差但恒最佳）;
+  **qwen-mt-flash 术语原生落地**（顺丰→SF Express ✓,译文地道）但 first
+  1231-6107ms+通用域一次 63s 尖刺（RPM 60 排队面）——轻载档不配当主车道;
+  opencode zen=订阅扣款失效（"Go subscription ended"）阻塞;方舟=缺
+  ARK_API_KEY（豆包 key 401 实证不通用）。
+- **判定悬念留给晚峰复测**（18:00-22:00）：DeepSeek 晚峰整包缓冲是否被
+  qwen-mt/方舟反超——那才是换车道的唯一理由。轻载档结论=DeepSeek 留任。
+
 ## W3 纪要（2026-10-08 深夜，subagent 额度阵亡主会话接管）
 
 - **刀1 spec busy 闸放宽**（subagent 完成+主会话收尾）：FIFO「非空即封」→深度门
