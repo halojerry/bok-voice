@@ -67,6 +67,33 @@ e2e 8/8；A 线零漂移（旗不传）；402/429 监控（请求变多、缓存
 - 计划档/AGENTS/LATENCY_BUDGETS 同步；三 subagent 报告要点回写
   S2S_ROADMAP 增补二。
 
+## 执行纪要（2026-10-08 晚，#225/#224/#226/#227 四 PR 全合流）
+
+- **W0（#225+#227）**：观察窗缺省 0.45→0.2（窗税 −250ms）；MT 首 chunk
+  早交。**热修**：首版用 FlushSentinel 被证伪——哨兵属 generate/llm_node
+  车道，`say()` 签名 `AsyncIterable[str]` 不认（e2e I6「gen not drained」
+  红的实证），热修改纯文本早放；且发现 MiniMax bidi 插件内建 A 线同款
+  `_first_chunk_cut`+head-flush 对 say 流生效——早放文本即全部所需。
+  wiring pin 立代码级禁令（say 车道禁哨兵）。
+- **W2（#224）**：C2 必中体有界等待（`BOK_INTERP_SPEC_WAIT_S` 0.6s）+
+  B2 人设音色 collapse（三语=A 线同把声，`_persona_voice_map`）+ C1 裁剪
+  （spec-ready 缩窗废弃）+ ①号探针入库（SSRF 护栏：CP 环回 allowlist+
+  wss 公网门）+ 本计划档/S2S_ROADMAP 增补二。
+- **W1（#226）**：DoubaoSTT `clause_commit`（B 线专用旗，A 线零漂移）——
+  interim 子句级闸（A 线 `_sentence_boundary` 移植单点 import）说话中发
+  FINAL；committed-prefix 对齐（exact→归一→失配重置）；`BOK_INTERP_CLAUSE_COMMIT`
+  缺省开。env 立法三键并立（_FORWARD_ENV 274→277）。
+- **集成验收**：全量 5035 passed/2 skipped；e2e_interpret **8/8**（热修后）；
+  装配观测「utt-merge wait=0.2s, clause-commit=on; spec defer-hit 0.6s」全在场。
+- **遗留真相（探针未过账如实记）**：①延迟探针 3522/4391>3500——当夜
+  DeepSeek 首 token 878→1452ms 恶化+**服务端整体缓冲实锤**（11 delta 同帧
+  到达：短输出假流式，first_ms≈mt_ms 结构性，客户端无解）；②探针语料=
+  15 字单子句句，CLAUSE_COMMIT 闸（逗号前需 ≥6 字）结构性不触发——W1 的
+  赢面（说话中重叠）需多子句长语料或真人通话才可观测，下一刀=探针语料
+  补多子句刺激+真人实弹采 CLAUSE_COMMIT 命中率；③DeepSeek 首 token 是
+  当前最大单腿（0.9-1.5s），杠杆=前缀缓存命中率核查（usage
+  prompt_cache_hit_tokens）+ flash/v4-pro A/B。
+
 ## 风险与回退
 
 - 每刀独立 kill-switch：`BOK_INTERP_UTT_WAIT_S`（=0.45 回旧窗）、
