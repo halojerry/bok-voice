@@ -20,6 +20,7 @@ test_uncommitted_redecode_correction_dropped_and_continuation_kept。
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -574,3 +575,165 @@ def test_mt_once_timeout_raises():
         raise AssertionError("expected TimeoutError")
     except asyncio.TimeoutError:
         pass
+
+
+# ---- 7. Wave 2 流式交付(2026-10-08「B 线 A 线化」)----
+
+
+def test_cut_clause_piece_boundaries():
+    """子句切割:边界标点切;小数/千分位保护;超长强切;不足返空。"""
+    cut = interpret._cut_clause_piece
+    assert cut("你好，") == ("你好，", "")
+    assert cut("你好，世界") == ("你好，", "世界")
+    assert cut("呃，你在说什么？哈哈哈。") == ("呃，", "你在说什么？哈哈哈。")
+    # 小数保护:3.14 的 '.' 不是句界
+    assert cut("价格是 3.14 元，") == ("价格是 3.14 元，", "")
+    assert cut("1,000 个包裹。") == ("1,000 个包裹。", "")
+    # 无边界不足:返空
+    assert cut("还没有边界") == ("", "还没有边界")
+    # 强切:超上限无句界
+    long_no_punct = "啊" * 80
+    piece, rest = cut(long_no_punct)
+    assert piece and len(piece) <= interpret._CLAUSE_CUT_MAX_CHARS
+    assert piece + rest == long_no_punct
+
+
+class _FakeDelta:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChunk:
+    def __init__(self, content):
+        self.delta = _FakeDelta(content)
+
+
+class _FakeMTStream:
+    """假 LLM 流:逐 chunk 吐 content;aclose 记账。"""
+
+    def __init__(self, chunks, err_at=None):
+        self._chunks = list(chunks)
+        self._err_at = err_at
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        if self._err_at is not None and len(self._chunks) == self._err_at:
+            raise RuntimeError("boom-mid")
+        return _FakeChunk(self._chunks.pop(0))
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _FakeMTLLM:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def chat(self, *, chat_ctx, conn_options=None, **kw):
+        return self._stream
+
+
+class _FakeSession:
+    """假 session:say(text) 只收 AsyncIterable 并排干(记录 yield 序列)。"""
+
+    def __init__(self):
+        self.yields: list[str] = []
+
+    def say(self, text, **kw):
+        async def _consume():
+            if hasattr(text, "__aiter__"):
+                async for piece in text:
+                    self.yields.append(piece)
+        import asyncio as _a
+
+        _a.get_event_loop().create_task(_consume()) if False else None
+        # 同步排干不现实(生成器消费在调用方事件循环)——由测试用例 asyncio.run 驱动:
+        # 这里只入队,由 _mt_stream_say 的 done.wait 兜底;为单测确定性,改为立即驱动。
+        import asyncio as _aio
+
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.create_task(_consume())
+        return None
+
+
+def test_mt_stream_say_clean(monkeypatch):
+    """clean 态:逐子句 yield(带语气标记换算)、full=全文、first_ms 记录、流关闸。"""
+    import time as _time
+
+    monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
+    stream = _FakeMTStream(["你好，", "世界。", "哈哈。"])
+    sess = _FakeSession()
+
+    async def _run():
+        ctx = interpret._build_mt_context("", [], "源句")
+        return await interpret._mt_stream_say(
+            sess, _FakeMTLLM(stream), ctx, target_lang="zh", tags=True, t0=_time.perf_counter()
+        )
+
+    out = asyncio.run(_run())
+    assert out["state"] == "clean"
+    assert out["yielded"] is True
+    assert out["full"] == "你好，世界。(laughs)"
+    assert out["first_ms"] >= 0
+    assert stream.closed is True
+    # say 收到的子句序列(逐子句,非整句)
+    assert "".join(sess.yields) == out["full"]
+    assert len(sess.yields) >= 2
+
+
+def test_mt_stream_say_gate_fallback(monkeypatch):
+    """gate 态:首子句语言不符(目标 en 出中文)→yield 前抛 gate、零播报、状态=gate。"""
+    monkeypatch.delenv("BOK_INTERP_MT_LANGGUARD", raising=False)
+    stream = _FakeMTStream(["这是中文句子，没有英文。"])
+    sess = _FakeSession()
+
+    async def _run():
+        ctx = interpret._build_mt_context("", [], "源句")
+        return await interpret._mt_stream_say(
+            sess, _FakeMTLLM(stream), ctx, target_lang="en", tags=False, t0=0.0
+        )
+
+    out = asyncio.run(_run())
+    assert out["state"] == "gate"
+    assert out["yielded"] is False
+    assert sess.yields == []  # 零播报=调用方可安全回退 _mt_once
+    assert stream.closed is True
+
+
+def test_mt_stream_say_mid_error_keeps_partial():
+    """error_mid:已 yield 后流错误——部分译文成立(full=已出部分),不回退防重复播报。"""
+    stream = _FakeMTStream(["第一句。", "第二句。", "第三句。"], err_at=2)
+    sess = _FakeSession()
+
+    async def _run():
+        ctx = interpret._build_mt_context("", [], "源句")
+        return await interpret._mt_stream_say(
+            sess, _FakeMTLLM(stream), ctx, target_lang="zh", tags=False, t0=0.0
+        )
+
+    out = asyncio.run(_run())
+    assert out["state"] == "error_mid"
+    assert out["yielded"] is True
+    assert out["full"] == "第一句。"
+    assert stream.closed is True
+
+
+def test_mt_stream_say_wiring_pins():
+    """接线 pin:worker 走 _mt_stream_say(默认)+回退路径保留;字幕先出与 kill-switch
+    同闸;INTERP_LAG 带 first_ms 列(字符串变更须过本测试认账)。"""
+    assert "if _mt_stream_say_enabled():" in INTERP_SRC
+    assert 'if _sr["state"] in ("clean", "error_mid"):' in INTERP_SRC
+    assert "MT_STREAM fallback state=" in INTERP_SRC
+    assert "sync_transcription=not _mt_stream_say_enabled()" in INTERP_SRC
+    assert "first_ms={_mt_first.get('ms') or 0}" in INTERP_SRC
+    # 回退路径(旧整句 say)保留
+    assert "if not _streamed:" in INTERP_SRC

@@ -764,6 +764,10 @@ _FORWARD_ENV = (
     #    openai 档去 StatelessMTLLM 模板包裹（system 指令曾被丢=ASR 纠错锁死），
     #    缺省开；0=回旧模板包裹（试验逃生口；_interp_env 透传白名单同键） ——
     "BOK_INTERP_MT_CLOUD_INSTRUCT",
+    # —— B 线流式交付（2026-10-08 Wave 2「B 线 A 线化」）：MT 流逐子句喂
+    #    say(AsyncIterable) 框架自切句首子句即合成；字幕先出（sync_transcription
+    #    同闸）；缺省开，0=回旧整句排干+同步字幕档（_interp_env 透传白名单同键） ——
+    "BOK_INTERP_MT_STREAM_SAY",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
@@ -937,6 +941,10 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # 模板包裹（system 指令曾被丢=纠错能力锁死），缺省开；0=回旧模板包裹
         # （「MT 全量切 DeepSeek 试」的逃生口，B 线 worker 专属）。
         "BOK_INTERP_MT_CLOUD_INSTRUCT",
+        # B 线流式交付 2026-10-08 Wave 2：MT 流逐子句喂 say(AsyncIterable)——框架
+        # 自切句首子句即合成;字幕先出(sync_transcription=False 同闸);缺省开,
+        # 0=回旧整句排干+同步字幕档（B 线 worker 专属）。
+        "BOK_INTERP_MT_STREAM_SAY",
         # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",

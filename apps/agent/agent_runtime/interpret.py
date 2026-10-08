@@ -584,6 +584,149 @@ async def _src_track_watch_loop(
             print(f"[interp] SRC_TRACK_WATCH_ERR {exc!r}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Wave 2 流式交付(2026-10-08「B 线 A 线化」):MT 流逐子句喂 session.say(
+# AsyncIterable)——框架 tee 后自切句、首子句即合成开播、余句边播边合成
+# (agent_activity _produce_segments,与 A 线 generate_reply 同机制);一源句=
+# 一 say=一 item,账本/_on_item/字幕口径全部不变。DeepSeek 首 token ~350ms,
+# 首子句约 +400ms 即交 TTS——旧路径(整句排干再合成)的尾段等待被吃掉。
+# kill-switch BOK_INTERP_MT_STREAM_SAY=0 回旧整句路径(字节回退钉)。
+# ---------------------------------------------------------------------------
+
+_CLAUSE_CUT_RE = re.compile(r"[，。！？；、,.!?;:…\n]")
+# 强切上限:缓冲无任何句界标点(极端长从句/无标点语流)时防卡流的硬顶。
+_CLAUSE_CUT_MAX_CHARS = 60
+
+
+def _cut_clause_piece(buf: str, *, max_chars: int = _CLAUSE_CUT_MAX_CHARS) -> tuple[str, str]:
+    """缓冲 → (可发射子句前缀, 余量)(纯函数,单测直喂)。
+
+    切点=子句边界标点(中英逗号/句读/省略/换行);**小数/千分位保护**:前后皆
+    数字字符的 `.`/`,` 不是句界(「3.14」「1,000」永不劈);超 max_chars 无边界
+    则强切(拉丁空格优先,CJK 硬切)——TTS 侧框架还有一层句切,这里切得糙一点
+    只影响语气标记换算的粒度,不影响合成正确性。"""
+    for m in _CLAUSE_CUT_RE.finditer(buf):
+        i = m.start()
+        if buf[i] in ".,," and 0 < i < len(buf) - 1 and buf[i - 1].isdigit() and buf[i + 1].isdigit():
+            continue
+        return buf[: i + 1], buf[i + 1 :]
+    if len(buf) >= max_chars:
+        j = buf.rfind(" ", 8, max_chars)
+        cut = j if j > 0 else max_chars
+        return buf[:cut], buf[cut:]
+    return "", buf
+
+
+def _mt_stream_say_enabled() -> bool:
+    """Wave 2 总闸(缺省开;0=回旧「整句排干再 say」路径,含字幕同步时序)。"""
+    return os.environ.get("BOK_INTERP_MT_STREAM_SAY", "1") == "1"
+
+
+class _MTStreamGateFail(Exception):
+    """首子句语言门违约(yield 前抛出=零播报,调用方可安全回退 _mt_once 旧路径)。"""
+
+
+async def _mt_stream_say(
+    session, llm_provider, ctx, *, target_lang: str, tags: bool, t0: float, timeout_s: float = 15.0
+) -> dict:
+    """流式翻译交付(纯装配层,零 session 依赖面=可假 session 单测)。
+
+    开流→delta 缓冲→子句切割→首子句语言门(E5 启发式:looks_like_language,
+    违约在 **yield 前**抛出=零播报)→session.say(async 生成器)逐子句喂出。
+    返回 {full, first_ms, yielded, state}:
+    - ``clean``     流自然结束(full=全文);
+    - ``gate``      首子句语言门违约(零播报)→调用方回退 _mt_once(保留其
+                    chat_retry 强化重试语义);
+    - ``error_pre`` 首 yield 前流错误/超时(零播报)→回退;
+    - ``error_mid`` 已 yield 后流错误——部分译文已出声,**不回退**(回退=重复
+                    播报),full=已出部分,账本照常配对。
+    语气标记按子句块换算(_apply_voice_tags 幂等,块内 token 不跨切点=换算完整);
+    引号剥除在 provider 层(_StripMTQuoteStream 包流,流式天然继承)。"""
+    out: dict = {"full": "", "first_ms": 0, "yielded": False, "state": "clean"}
+    stream = _mt_open_stream(llm_provider, ctx, retry=False)
+    if inspect.isawaitable(stream):
+        stream = await stream
+    done = asyncio.Event()
+
+    async def _gen():
+        buf = ""
+        parts: list[str] = []
+        first = True
+        deadline = time.monotonic() + timeout_s
+        try:
+            async for chunk in stream:
+                if time.monotonic() > deadline:
+                    out["state"] = "error_mid" if out["yielded"] else "error_pre"
+                    print(f"[interp] MT_STREAM deadline_s={timeout_s} state={out['state']}", flush=True)
+                    break
+                delta = getattr(chunk, "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                if not content:
+                    continue
+                buf += content
+                piece, buf = _cut_clause_piece(buf)
+                while piece:
+                    if first:
+                        if (
+                            target_lang
+                            and _mt_lang_guard_enabled()
+                            and not looks_like_language(piece, target_lang)
+                        ):
+                            out["state"] = "gate"
+                            raise _MTStreamGateFail(piece)
+                        out["first_ms"] = int((time.perf_counter() - t0) * 1000)
+                        first = False
+                    out["yielded"] = True
+                    emitted = _apply_voice_tags(piece) if tags else piece
+                    parts.append(emitted)
+                    yield emitted
+                    piece, buf = _cut_clause_piece(buf)
+            if buf and out["state"] == "clean":
+                if first:
+                    if (
+                        target_lang
+                        and _mt_lang_guard_enabled()
+                        and not looks_like_language(buf, target_lang)
+                    ):
+                        out["state"] = "gate"
+                        raise _MTStreamGateFail(buf)
+                    out["first_ms"] = int((time.perf_counter() - t0) * 1000)
+                out["yielded"] = True
+                emitted = _apply_voice_tags(buf) if tags else buf
+                parts.append(emitted)
+                yield emitted
+        except _MTStreamGateFail:
+            pass  # state 已置 gate;调用方回退(零播报)
+        except asyncio.CancelledError:
+            out["state"] = "error_mid" if out["yielded"] else "error_pre"
+            raise
+        except Exception as exc:  # noqa: BLE001 - 流错误:按 yield 前后分类
+            out["state"] = "error_mid" if out["yielded"] else "error_pre"
+            print(f"[interp] MT_STREAM err state={out['state']} {exc!r}", flush=True)
+        finally:
+            try:
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            except Exception:  # noqa: BLE001 - 关流尽力而为
+                pass
+            out["full"] = "".join(parts).strip()
+            done.set()
+
+    try:
+        session.say(_gen())
+    except Exception as exc:  # noqa: BLE001 - say 提交失败(error_pre,回退)
+        out["state"] = "error_pre"
+        print(f"[interp] MT_STREAM say submit failed {exc!r}", flush=True)
+        return out
+    try:
+        # 等 gen 排干:say 消费端停止拉取(打断/收线)时 finally 也会 set。
+        await asyncio.wait_for(done.wait(), timeout=timeout_s + 3.0)
+    except asyncio.TimeoutError:
+        print("[interp] MT_STREAM gen not drained in time", flush=True)
+    return out
+
+
 async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: str = "") -> str:
     """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
 
@@ -1898,6 +2041,8 @@ async def entrypoint(ctx) -> None:
     _llm_instructions = _translation_instructions(source_lang, target_lang, _glossary)
     _mt_pairs: deque = deque(maxlen=8)  # (源,译) 滚动对——_rolling_pairs 的参考料
     _mt_latency = {"ms": 0}
+    # Wave 2 首子句时延(流式 say 才有语义:final→首子句交 TTS;整句路径=0)
+    _mt_first = {"ms": 0}
     _src_q: asyncio.Queue = asyncio.Queue(maxsize=48)
 
     def _on_item(ev) -> None:
@@ -1922,9 +2067,10 @@ async def entrypoint(ctx) -> None:
                 )
                 print(
                     f"[interp] INTERP_LAG src_chars={_rec[1]} mt_ms={_rec[2]} "
-                    f"perceived_ms={_perceived_ms}",
+                    f"first_ms={_mt_first.get('ms') or 0} perceived_ms={_perceived_ms}",
                     flush=True,
                 )
+                _mt_first["ms"] = 0
                 _spawn_ledger(
                     _add_turn(
                         f"译文：{_caption_text(text, target_lang)}", target_lang, latency,
@@ -1960,13 +2106,36 @@ async def entrypoint(ctx) -> None:
                 # 且 detect 有误判风险,直通。
                 text_mt = _polish_for_mt(text, source_lang)
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text_mt)
-                translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
+                # Wave 2 流式交付(2026-10-08):流式 say 逐子句喂出,首子句即合成
+                # 开播——旧「整句排干再合成」的尾段等待被吃掉;一源句=一 say=一
+                # item(账本/_on_item 口径不变)。gate/error_pre(零播报)→回退
+                # _mt_once 旧路径(保留 chat_retry 语义);error_mid(部分已出声)
+                # **不回退**防重复播报。kill-switch BOK_INTERP_MT_STREAM_SAY=0 整段
+                # 跳过=旧路径逐字节。
+                _streamed = False
+                if _mt_stream_say_enabled():
+                    _sr = await _mt_stream_say(
+                        session, llm_provider, ctx, target_lang=target_lang, tags=voice_tags, t0=t0
+                    )
+                    if _sr["state"] in ("clean", "error_mid"):
+                        translated = _sr["full"]
+                        _mt_first["ms"] = _sr["first_ms"]
+                        _streamed = True
+                    else:
+                        print(
+                            f"[interp] MT_STREAM fallback state={_sr['state']} round={_round}",
+                            flush=True,
+                        )
+                if not _streamed:
+                    translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
+                    _mt_first["ms"] = 0
                 _mt_latency["ms"] = int((time.perf_counter() - t0) * 1000)
                 if translated:
                     _mt_pairs.append((text_mt, translated))
                     # 先 say 后记账:say 失败(会话关闭)不留 pending 孤儿——待配对
                     # 队列只装「交付已发起」的句,与 item 到达序仍一一对应(RC-8)。
-                    session.say(_speech_text(translated, voice_tags))
+                    if not _streamed:
+                        session.say(_speech_text(translated, voice_tags))
                     _lag.done_mt(_mt_latency["ms"])
                 else:
                     _lag.drop_src()
@@ -2239,6 +2408,11 @@ async def entrypoint(ctx) -> None:
         room_output_options=RoomOutputOptions(
             audio_enabled=_direction_audio_enabled(speaker_role),
             audio_track_name=f"trans-{target_lang}",
+            # 字幕先出(Wave 2 2026-10-08):缺省 TranscriptSynchronizer 会把 agent
+            # 转写拉平到语音节拍(按播放进度发词)——关掉=delta 随生成流出,前端
+            # 字幕先于语音;item(账本)仍是播完落,口径不变。kill-switch 同
+            # BOK_INTERP_MT_STREAM_SAY(0=回同步字幕+整句 say 旧档)。
+            sync_transcription=not _mt_stream_say_enabled(),
         ),
     )
 
