@@ -267,6 +267,9 @@ def test_settle_deferred_when_humans_still_active_source_pins():
 
 def test_textonly_direction_skips_tts_assembly_source_pins():
     """text-only 方向(BOK_INTERP_REV_AUDIO=0 回退档;2026-10-08 起双向出声为默认)
-    不构造/不连云端 TTS(零收益连接根除)。"""
-    assert "_build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None" in INTERP_SRC
+    不构造/不连云端 TTS(零收益连接根除)。2026-10-08 人设音色复用波:调用改多行
+    形状(persona_voices 参入),门语义不变(_dir_audio False→None)。"""
+    assert "_build_tts_provider(\n        _build_tts_provider" not in INTERP_SRC  # 防手滑双写
+    src_pos = INTERP_SRC.index("_build_tts_provider(tts_cfg, target_lang, session_voices, persona_voices=_persona_voices)")
+    assert "if _dir_audio" in INTERP_SRC[src_pos:src_pos + 300]
     assert "voice_tags = (\n        _dir_audio" in INTERP_SRC  # 语气标记同门(无合成=纯噪音)

@@ -35,6 +35,8 @@ from pathlib import Path
 
 # 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+# 人设音色 map 解析（单源 core，2026-10-08 B 线人设音色复用；A 线同源）。
+from bok_voice_core.voice_map import parse_voice_map
 
 # B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
@@ -1085,12 +1087,14 @@ def _build_local_qwen3_tts(tts_cfg: dict, target_lang: str, tts_ls):
     )
 
 
-def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
+def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None, persona_voices=None):
     """组装 B 线 TTS:settings 指定 minimax → 云端 MiniMax;否则本地 Qwen3-TTS 兜底。
 
     音色锁口音——粤语音色读普/英自然,普通话音色读粤文变广普,故按 target_lang
-    三键换音色;音色优先级=会话级(同传页建单选定,session_voices)>设置页三键>
-    硬编码默认。B 线默认 turbo 档(agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
+    三键换音色;音色优先级=会话级(同传页建单选定,session_voices)>**人设层**
+    (建单绑定的 persona.reference_audio,B 线人设音色复用 2026-10-08,A 线
+    parse_voice_map 同源解析)>设置页三键>硬编码默认。B 线默认 turbo 档
+    (agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
 
     MiniMax 档回退(2026-09-27):云端 SSL 校验失败/「AudioEmitter isn't started」
     bidi 错误实测令整通零译文出声(call-b347f691:8 源句 0 译文,纯静音)。现按 A
@@ -1112,7 +1116,23 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
             vid = _cloud_voice(str(tts_cfg.get(key) or ""))
             if vid:
                 voice_map[lang] = vid
-        # 会话级音色最优先,覆盖设置三键;误配本地音色同样过滤 → 回落设置/默认。
+
+        # 人设层（2026-10-08 B 线人设音色复用）：覆盖设置三键（会话级仍在最上）。
+        # 本地 Qwen3 音色 ID 同样过滤（误配防 2054）；人设 map 只有三语键，
+        # 四语目标天然缺席=回落下层。
+        if isinstance(persona_voices, str):
+            persona_voices = parse_voice_map(persona_voices)
+        for lang_raw, vid_raw in (persona_voices or {}).items():
+            lang = _norm_lang(str(lang_raw), default="")
+            if lang not in keymap:
+                continue
+            vid = _cloud_voice(str(vid_raw or ""))
+            if not vid:
+                continue
+            if voice_map.get(lang) != vid:
+                print(f"[interp] persona voice {lang}: {voice_map.get(lang) or '(default)'} -> {vid}", flush=True)
+            voice_map[lang] = vid
+        # 会话级音色最优先,覆盖人设/设置;误配本地音色同样过滤 → 回落人设/设置/默认。
         if isinstance(session_voices, str):
             session_voices = _parse_session_voices(session_voices)
         for lang_raw, vid_raw in (session_voices or {}).items():
@@ -1486,6 +1506,38 @@ _FRAG_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 def _interp_frag_merge_enabled() -> bool:
     """碎片闸总门(默认开;0=旧路径逐字节——worker 侧短路,零额外 await)。"""
     return os.environ.get(_FRAG_MERGE_ENV, "1") == "1"
+
+
+# —— B 线豆包尾部续说观察窗(Wave 3b,2026-10-08「切碎」主刀) -------------------
+# 诊断定案(2026-10-08 实弹):豆包 lane 只按 VAD 静音切句(B 线 min_silence=0.45s),
+# 思考停顿/换气即一个 FINAL,一段话被切成 N 段独立烧全链(ASR+DeepSeek MT+TTS),
+# 段间隔 1-2s → 对方听感「断断续续」。刀=**尾部续说观察窗**:END_OF_SPEECH 不
+# 立刻定稿,先等 BOK_INTERP_UTT_WAIT_S(缺省 0.45s)——窗口内续讲=同一 WS 会话
+# 续喂并段(服务端 result.text 单调累积=天然并稿,零拼接账本);静默到底才负 seq
+# 定稿。有效切句边界=说话末音后总静默 0.45+0.45=0.9s(微停顿不再一停一句),
+# 真停顿的 FINAL 比旧路晚 ~0.45s(换来段数砍半+译文连贯)。**B 线专用**(装配点传
+# utt_merge=True;A 线 agent.py 不传=逐字节旧路)。kill-switch
+# BOK_INTERP_UTT_MERGE=0 整档关闭;窗口 BOK_INTERP_UTT_WAIT_S 可调(坏值回缺省,
+# 钳 [0,3])。与 3a 碎片闸互补:本刀治「内容微停顿切碎」,3a 治「纯应承碎片」。
+_UTT_MERGE_ENV = "BOK_INTERP_UTT_MERGE"
+_UTT_WAIT_ENV = "BOK_INTERP_UTT_WAIT_S"
+_UTT_WAIT_DEFAULT_S = 0.45
+_UTT_WAIT_MAX_S = 3.0
+
+
+def _interp_utt_merge_enabled() -> bool:
+    """豆包尾部续说观察窗总闸(默认开;0=旧路径逐字节)。"""
+    return os.environ.get(_UTT_MERGE_ENV, "1") == "1"
+
+
+def _interp_utt_wait_s() -> float:
+    """观察窗秒(纯函数,单测直喂):坏值回缺省 0.45;负数钳 0;上限 3.0。"""
+    raw = os.environ.get(_UTT_WAIT_ENV, "")
+    try:
+        v = float(raw) if raw else _UTT_WAIT_DEFAULT_S
+    except ValueError:
+        return _UTT_WAIT_DEFAULT_S
+    return min(max(v, 0.0), _UTT_WAIT_MAX_S)
 
 
 def _interp_frag_hold_s() -> float:
@@ -1939,6 +1991,21 @@ async def entrypoint(ctx) -> None:
         settings = await cp.get_settings()
     except Exception as exc:  # pragma: no cover - 设置失败回退默认
         print(f"[interp] settings resolve failed: {exc!r}", flush=True)
+    # —— B 线人设音色复用（2026-10-08）：同传台建单可绑人设（persona_id 随
+    # dispatch metadata 下发），音色链插「人设层」（复用 A 线 parse_voice_map
+    # 单源=A 线同一份 reference_audio 解析）。优先级=会话级 voices > 人设 >
+    # 设置三键 > 硬编码；拉取失败=该层缺席，链路回落零损伤。四语目标
+    # （de/fr/ja/pt）不在人设 map 内=天然回落设置/默认。
+    _persona_voices: dict = {}
+    _persona_id = str(meta.get("persona_id") or "").strip()
+    if _persona_id:
+        try:
+            _persona = await cp.get_persona(_persona_id)
+            _persona_voices = parse_voice_map(_persona.get("reference_audio"))
+            _keys = sorted(k for k, v in _persona_voices.items() if str(v or "").strip())
+            print(f"[interp] persona voice id={_persona_id[:16]} keys={_keys}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 人设拉取失败不阻通话
+            print(f"[interp] persona fetch failed id={_persona_id[:16]}: {exc!r}", flush=True)
     llm_cfg = settings.get("llm", {}) or {}
     asr_cfg = settings.get("asr", {}) or {}
     tts_cfg = settings.get("tts", {}) or {}
@@ -2028,9 +2095,16 @@ async def entrypoint(ctx) -> None:
             language_state=asr_ls,
             hotword_terms=list(_parse_vocab_terms(_asr_hotword_ctx)),
             vad_=vad_provider,
+            # B 线 3b 尾部续说观察窗(A 线不传=逐字节旧路);kill-switch/调窗见
+            # _interp_utt_* 纯函数块注释。
+            utt_merge=_interp_utt_merge_enabled(),
+            utt_wait_s=_interp_utt_wait_s(),
         )
         print(
-            f"[interp] asr=doubao (cloud SAUC, resource={stt_provider._resource_id})",
+            f"[interp] asr=doubao (cloud SAUC, resource={stt_provider._resource_id}"
+            + (
+                f", utt-merge wait={_interp_utt_wait_s():g}s)" if _interp_utt_merge_enabled() else ")"
+            ),
             flush=True,
         )
     else:
@@ -2063,7 +2137,11 @@ async def entrypoint(ctx) -> None:
     # RoomOutputOptions.audio_enabled=False 下 TTS 永不被调用=零收益连接,
     # 还与在途方向抢握手。音频向关闭的方向直接不装配 TTS。
     _dir_audio = _direction_audio_enabled(speaker_role)
-    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None
+    tts_provider = (
+        _build_tts_provider(tts_cfg, target_lang, session_voices, persona_voices=_persona_voices)
+        if _dir_audio
+        else None
+    )
     # 语气词标记(2026-09-16 用户拍板;2026-10-08 v2):Hy-MT2/云端 MT 都会把语气照
     # 词翻译(Hahaha/哈哈),say 前由 _speech_text→_apply_voice_tags 换成 MiniMax
     # 2.8 括号标记——合成层出真声(笑/咳/叹),不再是假人念稿;v2 收任意位置笑声

@@ -497,3 +497,154 @@ def test_speaker_lock_env_off_byte_identical(monkeypatch, capsys):
     assert [t for n, t in events if n == "FINAL_TRANSCRIPT"] == ["正常出稿"]
     out = capsys.readouterr().out
     assert "SPEAKER_LOCK_DROP" not in out and "SPEAKER_LOCK_ENROLL" not in out
+
+
+# ---- 尾部续说观察窗（B 线 3b，2026-10-08） ----
+
+
+def _make_connect_replies(monkeypatch, *, replies: list, final_text: str):
+    """fake connect：on_audio 逐包吐 replies、末包吐 definite final。"""
+    calls = {"n": 0}
+
+    def _connect(*a, **kw):
+        calls["n"] += 1
+        fake = _FakeWS(
+            on_audio=[_srv_frame(_text_payload(t), seq=1) for t in replies],
+            on_last=[_srv_frame(_text_payload(final_text, definite=True), last=True)],
+        )
+        calls["ws"] = fake
+
+        async def _ret():
+            return fake
+
+        return _ret()
+
+    monkeypatch.setattr("websockets.connect", _connect)
+    return calls
+
+
+async def _drive_utt(stt: DoubaoSTT, vad: _FakeVad, *, resume: bool, settle_s: float):
+    """utt 档驱动：START→INFERENCE→END→(resume: START→INFERENCE→END)→等定稿。"""
+    stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if vad.streams:
+            break
+    vs = vad.streams[0]
+    got: list[tuple[str, str]] = []
+
+    async def _collect() -> None:
+        try:
+            while True:
+                ev = await asyncio.wait_for(stream.__anext__(), timeout=0.8)
+                text = ev.alternatives[0].text if getattr(ev, "alternatives", None) else ""
+                got.append((ev.type.name, text))
+        except (asyncio.TimeoutError, StopAsyncIteration):
+            return
+
+    collector = asyncio.create_task(_collect())
+
+    def _fire(ev):
+        vs.q.put_nowait(ev)
+
+    _fire(_ev(da.vad.VADEventType.START_OF_SPEECH,
+              frames=[types.SimpleNamespace(data=b"\x11\x11" * 800)]))
+    await asyncio.sleep(0.03)
+    _fire(_ev(da.vad.VADEventType.INFERENCE_DONE,
+              frames=[types.SimpleNamespace(data=b"\x22\x22" * 3200)]))
+    await asyncio.sleep(0.03)
+    _fire(_ev(da.vad.VADEventType.END_OF_SPEECH))
+    if resume:
+        await asyncio.sleep(0.06)  # < utt_wait：尾窗内续讲=并段
+        _fire(_ev(da.vad.VADEventType.START_OF_SPEECH,
+                  frames=[types.SimpleNamespace(data=b"\x33\x33" * 800)]))
+        await asyncio.sleep(0.03)
+        _fire(_ev(da.vad.VADEventType.INFERENCE_DONE,
+                  frames=[types.SimpleNamespace(data=b"\x44\x44" * 3200)]))
+        await asyncio.sleep(0.03)
+        _fire(_ev(da.vad.VADEventType.END_OF_SPEECH))
+    await asyncio.sleep(settle_s)
+    stream._input_ch.close()
+    try:
+        await asyncio.wait_for(collector, 3)
+    except asyncio.TimeoutError:
+        collector.cancel()
+    await stream.aclose()
+    return got
+
+
+def test_utt_merge_resume_merges_micro_pause(monkeypatch, capsys):
+    """微停顿并段：尾窗内续讲→同会话续喂(连接数 1)、单条 FINAL=单调累积全文、
+    DOUBAO_UTT_MERGE 观测行在场、DOUBAO_ASR_TEXT 带 utt_merges=1。"""
+    _fake_merge(monkeypatch)
+    calls = _make_connect_replies(
+        monkeypatch, replies=["你好", "你好我想问下订单"], final_text="你好，我想问下订单。"
+    )
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, utt_merge=True, utt_wait_s=0.25)
+
+    events = asyncio.run(_drive_utt(stt, vad, resume=True, settle_s=0.5))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好，我想问下订单。"]  # 单条 FINAL=两段并一稿
+    assert calls["n"] == 1  # 同一 WS 会话跨停顿存活（并段关键）
+    out = capsys.readouterr().out
+    assert "DOUBAO_UTT_MERGE resume" in out
+    assert "utt_merges=1" in out
+
+
+def test_utt_merge_timeout_finalizes(monkeypatch, capsys):
+    """真停顿：尾窗睡满→负 seq 定稿单段 FINAL；无并段观测行。"""
+    _fake_merge(monkeypatch)
+    calls = _make_connect_replies(monkeypatch, replies=["你好"], final_text="你好，帮我查单。")
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad, utt_merge=True, utt_wait_s=0.12)
+
+    events = asyncio.run(_drive_utt(stt, vad, resume=False, settle_s=0.4))
+    names = [n for n, _ in events]
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好，帮我查单。"]
+    assert names.index("END_OF_SPEECH") < names.index("FINAL_TRANSCRIPT")
+    assert calls["n"] == 1
+    out = capsys.readouterr().out
+    assert "DOUBAO_UTT_MERGE" not in out and "utt_merges=0" in out
+
+
+def test_utt_merge_default_off_is_legacy(monkeypatch):
+    """缺省不传旗=A 线姿势逐字节旧路：utt 旗 False、END 立刻定稿（无尾窗延迟）。"""
+    _fake_merge(monkeypatch)
+    assert DoubaoSTT(api_key="k")._utt_merge is False
+    assert DoubaoSTT(api_key="k", utt_merge=True)._utt_merge is True
+    _make_connect_replies(monkeypatch, replies=["你好"], final_text="旧路定稿。")
+    vad = _FakeVad()
+    stt = DoubaoSTT(api_key="k", vad_=vad)
+    events = asyncio.run(_drive_utt(stt, vad, resume=False, settle_s=0.4))
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["旧路定稿。"]
+
+
+def test_utt_merge_interpret_wiring_pins():
+    """接线 pin：B 线装配传 utt_merge/utt_wait_s；A 线 agent.py 装配零触碰。"""
+    import agent_runtime.interpret as interpret
+
+    interp_src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(encoding="utf-8")
+    agent_src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    assert "utt_merge=_interp_utt_merge_enabled()," in interp_src
+    assert "utt_wait_s=_interp_utt_wait_s()," in interp_src
+    assert "utt_merge" not in agent_src.split('stt_provider = DoubaoSTT(')[1].split(")")[0]
+    # env 纯函数：缺省 0.45/坏值回缺省/负钳 0/上限 3.0
+    import os
+
+    assert interpret._interp_utt_wait_s() == 0.45
+    os.environ["BOK_INTERP_UTT_WAIT_S"] = "1.2"
+    assert interpret._interp_utt_wait_s() == 1.2
+    os.environ["BOK_INTERP_UTT_WAIT_S"] = "abc"
+    assert interpret._interp_utt_wait_s() == 0.45
+    os.environ["BOK_INTERP_UTT_WAIT_S"] = "-1"
+    assert interpret._interp_utt_wait_s() == 0.0
+    os.environ["BOK_INTERP_UTT_WAIT_S"] = "9"
+    assert interpret._interp_utt_wait_s() == 3.0
+    del os.environ["BOK_INTERP_UTT_WAIT_S"]
+    assert interpret._interp_utt_merge_enabled() is True
+    os.environ["BOK_INTERP_UTT_MERGE"] = "0"
+    assert interpret._interp_utt_merge_enabled() is False
+    del os.environ["BOK_INTERP_UTT_MERGE"]

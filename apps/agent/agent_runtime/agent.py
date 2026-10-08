@@ -35,6 +35,8 @@ from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 # a-line-speed-asr-decision-verification.md §26.2-E1/E2);装配编译/每轮消费/
 # kill-switch 的接线在 agent 侧(见 _asr_postprocess)。
 from bok_voice_core.hotword_leak import sanitize as _hotword_leak_sanitize
+# 人设音色 map 解析（单源 core，2026-10-08 上收；A/B 线共用防拷贝漂移）。
+from bok_voice_core.voice_map import parse_voice_map
 from bok_voice_core.snippets import apply_snippets as _apply_snippet_rules
 from bok_voice_core.snippets import compile_rules_with_skipped as _compile_snippet_rules
 from bok_voice_core.snippets import merge_rules as _merge_snippet_rules
@@ -647,17 +649,9 @@ def _intent_judge_candidates(
     return eligible_judge_intents(graph, step_1based=step_1based, fired=fired)
 
 
-def _parse_voice_map(raw) -> dict:
-    # 分语言键只有 zh/cantonese/en;新写入一律 cantonese。
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip().startswith("{"):
-        try:
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else {"zh": raw}
-        except Exception:
-            return {"zh": raw}
-    return {"zh": str(raw or "")}
+# 人设音色 map 解析单源（2026-10-08 B 线人设音色复用波上收 core：
+# bok_voice_core.voice_map.parse_voice_map）；本名保留=A 线既有调用面零变化。
+_parse_voice_map = parse_voice_map
 
 
 def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
