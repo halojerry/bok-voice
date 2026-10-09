@@ -163,7 +163,8 @@ def test_lite_doubao_config_official_arms():
     assert req["enable_nonstream"] is True  # 官方推荐：二遍识别
     assert req["force_to_speech_time"] == 1000  # 官方推荐值
     assert "enable_ddc" not in req  # 与语气标记冲突，不开
-    assert stt._clause_commit is False and stt._utt_merge is False  # 提交闸全家=官方参数接手
+    # 说话中出译已开（2026-10-09 用户拍板「必须边讲边出声」）：与旧线 B 档同旗。
+    assert stt._clause_commit is True and stt._utt_merge is True
 
 
 def test_lite_doubao_accelerate_arm_uses_existing_key(monkeypatch):

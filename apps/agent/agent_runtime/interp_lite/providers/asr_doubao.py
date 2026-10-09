@@ -15,8 +15,9 @@
 - 明确**不开**：``enable_ddc`` 语义顺滑——官方删语气词，与语气标记 v2 冲突
   （旧线臂注同判）；``end_window_size`` 不设（段会话模型下不参战）。
 
-旧 provider 文件零改动（子类覆写 ``_config()``）；``clause_commit``/``utt_merge``
-恒 False——提交闸全家由官方参数+段会话边界替代（计划档 §8 不带项审计表）。
+旧 provider 文件零改动（子类覆写 ``_config()``）；**说话中出译已开**（2026-10-09
+用户拍板，见 __init__ 注释）；真·提交闸（次级标点/长度档/限速）由 provider 内
+既有 QWEN3_ASR_CLAUSE_* env 驱动——bokctl 对 lite worker 同源下发。
 """
 
 from __future__ import annotations
@@ -32,9 +33,15 @@ class LiteDoubaoSTT(DoubaoSTT):
     model = "doubao-asr-lite"
 
     def __init__(self, **kwargs):
-        # 提交闸全家显式关死：这些是本地 ASR 时代的补偿，薄线由官方参数接手。
-        kwargs.setdefault("clause_commit", False)
-        kwargs.setdefault("utt_merge", False)
+        # 说话中出译（2026-10-09 用户拍板「必须边讲边出声」，审计表触发条件命中）：
+        # clause_commit=豆包 interim 上子句边界稳定即提前交 FINAL（说话中 MT 起跑，
+        # 子句粒度流水线，对方全程滞后 1-2s 跟读）；utt_merge=句尾续说观察窗（减少
+        # 尾巴碎片 FINAL）。两旗与旧线 B 档同默认、同一份 provider 代码（单源），
+        # 闸门参数（字数/限速）走既有 QWEN3_ASR_CLAUSE_* env（bokctl _interp_env
+        # 对 lite worker 同样下发）。窗 B 评估官方 `fixed_prefix_result`/end_window_size
+        # 替代自家闸（蓝图 §8 该行已更新为「已开」）。
+        kwargs.setdefault("clause_commit", True)
+        kwargs.setdefault("utt_merge", True)
         super().__init__(**kwargs)
 
     def _config(self) -> dict:

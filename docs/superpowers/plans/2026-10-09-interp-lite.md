@@ -117,7 +117,7 @@ settle 半场闸、SessionReport 带 worker 标识。
 | spec-mt 投机翻译 | 旧线 MT 腿 ~260ms（15 字句），投机的收益窗已被流式 say 吃掉大半 | 延迟探针 first_ms 显著劣于旧线且归因到 MT 等待 |
 | 碎片闸（frag hold-and-merge） | 豆包 VAD 段会话=天然提交边界；碎片形态源于本地 ASR 提交 | e2e I4 长流出现碎片轮 |
 | backlog 背压/摘译 | 试点演示档并发低；say 队列串行本身就是背压 | 探针/实弹出现 lag 雪球（连续语流 >6s 积压） |
-| clause-commit/限速/长度档 | 豆包服务端 VAD+我们段会话已定提交节奏 | I4 断句稳定性不过 |
+| ~~clause-commit~~ **已开（2026-10-09 用户拍板「必须边讲边出声」，当日触发当日开）** | 试点首版误判「可不带」——真连续无停顿长讲会整段等讲完才翻；现 `LiteDoubaoSTT(clause_commit=True, utt_merge=True)` 与旧线 B 档同旗同源，说话中子句边界（~1s 一拍）提前交 FINAL、MT 说话中起跑、对方滞后 1-2s 跟读 | 窗 B 评估官方 `fixed_prefix_result`/`end_window_size` 替代自家闸门（官方替代表 §2 该行的真身） |
 | echo-dedup/回声守卫 | 双端各自订阅定向轨，串音面小 | 实弹出现本向回声轮 |
 | asr_polish/stutter fold | DeepSeek prompt 已含 ASR 噪声纠错规则；`correct_table` 官方位待接 | e2e 误听率明显高于旧线 |
 | 抢跑/preemptive | DeepSeek 首 token ~350ms + 流式 say 已流水线化 | first_ms 归因到 prefill 等待 |
