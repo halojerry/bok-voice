@@ -162,13 +162,33 @@ class InterpPipeline:
         lang = self.target_lang
         head = ""  # 首段语言门的软证据累积（不碰 gate 内部状态）
 
+        # MT 与 say 解耦（2026-10-09 流畅度收口）：框架 speech 队列串行拉生成器
+        # ——上一段播完前下一个 say 的 gen 无人拉取=MT 流根本没起跑（实弹：尾巴
+        # 单元 first_ms 6-7.8s = 上一段播报时长 + 真实 MT 0.6s，缓存全健康）。
+        # pump 独立任务先把 DeepSeek 流拉进缓冲，gen 只消费：MT 全程并发，框架
+        # 到点即有货可播。None=流尽哨兵；异常对象=流错误透传。
+        buf: asyncio.Queue = asyncio.Queue()
+
+        async def _pump():
+            try:
+                stream = self.mt.stream(msgs)
+                async for delta in stream:
+                    await buf.put(delta)
+                await buf.put(None)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - 错误透传给 gen 分类
+                await buf.put(exc)
+
+        pump_task = asyncio.create_task(_pump())
+
         async def _gen():
             nonlocal head
             deadline = time.monotonic() + _SENT_TIMEOUT_S
             first = {"done": False}
 
             def _emit(piece: str) -> str | None:
-                """首段过语言门后放行；返回 None=证据不足继续攒；违约直接抛 _GateFail。"""
+                """首段过语言门后放行；返回 None=证据不足继续攒；违约直接抛 _GateFailError。"""
                 nonlocal head
                 if first["done"]:
                     return piece
@@ -183,15 +203,20 @@ class InterpPipeline:
                 return head
 
             try:
-                async for delta in self.mt.stream(msgs):
+                while True:
+                    item = await buf.get()
+                    if item is None:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
                     if time.monotonic() > deadline:
                         out["state"] = "error_mid" if out["yielded"] else "error_pre"
                         print(f"[interp-lite] MT_STREAM deadline state={out['state']}", flush=True)
                         break
-                    if not delta:
+                    if not item:
                         continue
-                    raw.append(delta)
-                    piece = gate.feed(delta)
+                    raw.append(item)
+                    piece = gate.feed(item)
                     if not piece:
                         continue
                     verdict = _emit(piece)
@@ -214,6 +239,7 @@ class InterpPipeline:
                 out["state"] = "error_mid" if out["yielded"] else "error_pre"
                 print(f"[interp-lite] MT_STREAM err state={out['state']} {exc!r}", flush=True)
             finally:
+                pump_task.cancel()
                 done.set()
 
         try:
