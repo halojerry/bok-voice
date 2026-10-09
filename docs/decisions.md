@@ -60,7 +60,7 @@
 - [LATENCY_BUDGETS](LATENCY_BUDGETS.md) — 延迟预算与超时政策**单一事实源**（改默认值必同步）
 - [RUNTIME_TOPOLOGY](RUNTIME_TOPOLOGY.md) — 运行时拓扑（改端口/数据流前先读）
 - [QWEN-TTS-VOICE-WRITING](QWEN-TTS-VOICE-WRITING.md) — Qwen3-TTS 无标记系统正稿写法手册
-- [SECURITY-SCAN-TRIAGE-2026-10-01](SECURITY-SCAN-TRIAGE-2026-10-01.md) — 安全扫描分诊（文件名带日期）
+- [SECURITY-SCAN-TRIAGE-2026-10-09](SECURITY-SCAN-TRIAGE-2026-10-09.md) — 安全扫描分诊（文件名带日期；10-01 版已归档 archive/）
 - [ORCH-CLEANUP-CONTRACT](ORCH-CLEANUP-CONTRACT.md) — 编排梳理波冻结契约（17 波已落项与所有权）
 - [SCENE_CANVAS](SCENE_CANVAS.md) — 场景画布定稿（一步 = 一场景 = 一张画布）
 - [SECURITY_REDTEAM](SECURITY_REDTEAM.md) — CP 认证/节点面攻击面清点（防御性红队交付）
