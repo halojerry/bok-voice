@@ -164,6 +164,10 @@ class InterpPipeline:
         utt = _Utterance(time.perf_counter())
         utt.chunk_task = asyncio.create_task(self._chunk_runner(utt))
         try:
+            # 「播报中照样听」不在 say 旗上实现：allow_interruptions=True 实证会被
+            # 用户语音打断译文播放（canceled×3 零出声，call-f6d655fd）。正确开关=
+            # worker 侧 turn_handling.discard_audio_if_uninterruptible=False（says
+            # 保持不可打断=译文播完整，ASR 不被静音替换=播报期间照样听）。
             self.session.say(self._gen(utt))
         except Exception as exc:  # noqa: BLE001 - say 提交失败=本话段放弃（罕见）
             print(f"[interp-lite] MT_STREAM say submit failed {exc!r}", flush=True)

@@ -426,7 +426,7 @@ class FakeSession:
         self.spoken: list[list[str]] = []
         self._tasks: set = set()
 
-    def say(self, x):
+    def say(self, x, **_kw):  # **_kw 吞 allow_interruptions 等真 say 旗（v2 静音替换解除）
         self.said.append(x)
         if hasattr(x, "__aiter__"):
             bucket: list[str] = []

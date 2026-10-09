@@ -195,3 +195,29 @@ call-e376e7a9（尾窗修好后换病：**首块 8 字保险丝中词劈 + 每�
 
 **遗留**（下一窗）：真栈 soak 后 serve 默认翻转；首块 min_first/hold 的实弹 A/B；
 provider 共源化搬移；probe_interp_fluency 判据适配 v2（段时长改话段口径）。
+
+## 「译员一开口就聋」根修（2026-10-09 16 时，call-9e0dada0 自测闭环定案）
+
+**机制（livekit-agents 1.8.2 源码 agent_activity.push_audio 钉死）**：say 的
+`allow_interruptions=False`（缺省）+ 会话 `interruption.discard_audio_if_uninterruptible`
+（缺省 True）→ **播报期间框架把麦克风整条替换成静音帧喂 STT**（VAD/打断检测器
+仍吃真帧）——译员播多久聋多久，播报期间的续讲整段丢失。自测复现（MiniMax 生产
+音色合成 Ethan 提供的三句发布公告+0.7s 句距）：修复前三句只认出 4 个句尾碎片
+（7/10/6/7 字），句身全丢=9e0dada0「切分后别的内容不识别不翻译不出声」。
+
+**修法（两否一立，实证排雷）**：
+- ✅ worker `turn_handling["interruption"]["discard_audio_if_uninterruptible"]=False`
+  （says 保持不可打断=译文播完整；STT 不再被静音替换=播报中照样听）；
+- ❌ `say(allow_interruptions=True)`（第一反应）——实证被用户语音打断译文播放
+  （canceled×3、12 条译文零出声，call-f6d655fd），弃用；
+- 修复后自测：**三句全文识别**（12 条原文 turn：'开放平台最新模型发布动态！
+  覆盖语言、视频、声音。图像、音乐等模态模型信息。'+尾句全齐）。
+- **旧线 interpret.py 同病**（自旧行为：播报期不翻=「VAD START 迟到吃句头」
+  残留的真身），provider 共源化搬移时一并修。
+- 自测台架：`probe_interp_continuous` 增 `BOK_PROBE_SENTENCES`（"|"分句）+
+  `BOK_PROBE_JOIN_GAP_S`（句距>min_silence=段定稿+续讲撞播报的病灶形状）；
+  `BOK_PROBE_STIMULUS=cloud`=MiniMax 生产音色刺激（Ethan 指令：自产语音自测）。
+- 取证插桩四件（fe84218）：SEG_EOS/SEG_STREAM_END/SESSION_CLOSED_BY_PEER/CONNECT。
+
+**遗留**：末轮「译文不被打断」验收被机上 w8a 会话栈占用所阻（端口互斥），
+让出后一轮 probe 收尾；`test_supervisor_listen` 时序 flake 另票。

@@ -180,6 +180,13 @@ async def entrypoint(ctx) -> None:
         print(f"[interp-lite] glossary {len(glossary_pairs)} terms -> asr+mt", flush=True)
 
     turn_handling = _turn_handling_opts()
+    # 同传铁律「播报中照样听」（call-9e0dada0/c8014df8 定案）：框架缺省
+    # discard_audio_if_uninterruptible=True 会把播报期麦克风整条替换成静音帧
+    # 喂 STT（allow_interruptions=False 的 say 触发）＝译员一开口就聋，播报
+    # 期间的续讲整段丢失（自测三句话只认出 4 个句尾碎片）。关掉它；says 保持
+    # 不可打断＝译文播完整（allow_interruptions=True 路实证会被用户语音打断
+    # 播放，canceled×3 零出声，不可用）。旧线 interpret.py 同病，共源化时一并。
+    turn_handling.setdefault("interruption", {})["discard_audio_if_uninterruptible"] = False
     session = AgentSession(
         vad=vad_provider,
         stt=stt_provider,
