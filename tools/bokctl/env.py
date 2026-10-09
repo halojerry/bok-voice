@@ -709,6 +709,10 @@ _FORWARD_ENV = (
     "MINIMAX_BIDI_PREWARM_RETRY",
     "MINIMAX_BIDI_STALL_MAX_HEALS",
     "MINIMAX_BIDI_SYNTH_WARMUP",
+    #    flush 后 recv 尾窗空闲秒数（call-dd85e5f5 截尾翻案：0.5s 会撞服务端
+    #    句间合成隙误收摊，孤儿音频落下一流纪元门禁被丢=译文截半；缺省 2.5，
+    #    钳 [0.3,10]；task_finished 事件仍即时收摊不受此窗影响） ——
+    "MINIMAX_BIDI_TAIL_IDLE_S",
     "MINIMAX_CONTINUOUS_SOUND",
     "MINIMAX_EMOTION",
     "MINIMAX_FIRST_AUDIO_TIMEOUT_S",
