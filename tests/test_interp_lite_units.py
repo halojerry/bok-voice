@@ -291,6 +291,33 @@ def test_server_definite_commits_stream():
     assert all("你好" not in i or i.endswith("怎么样") or i == "你好，今天天气怎么样" for i in interims)
 
 
+def test_starve_threshold_derived_from_end_window(monkeypatch):
+    """饥饿接管阈值=end_window 派生（call-6f92bfd4）：等过窗仍无 definite 即接管。
+
+    env 同键 ``BOK_DOUBAO_END_WINDOW_MS``；钳 [0.4,2.0]s——300ms 窗也至少
+    0.4s（防 definite/本地闸贴脸双发），2000ms 封顶（防调窗把闸饿死）。"""
+    import asyncio
+
+    from agent_runtime.providers import doubao_asr as da
+    from agent_runtime.providers.doubao_asr import DoubaoSTT, _DoubaoLiveStream
+
+    async def _starve_s(ew_ms: str) -> float:
+        monkeypatch.setenv("BOK_DOUBAO_END_WINDOW_MS", ew_ms)
+        stt = DoubaoSTT(api_key="k", clause_commit=True, server_utterances=True)
+        return _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())._cc_starve_s
+
+    assert asyncio.run(_starve_s("500")) == 0.5
+    assert asyncio.run(_starve_s("300")) == 0.4  # 下钳
+    assert asyncio.run(_starve_s("2000")) == 2.0  # 上钳
+
+    async def _bad():
+        monkeypatch.setenv("BOK_DOUBAO_END_WINDOW_MS", "notanumber")
+        stt = DoubaoSTT(api_key="k", clause_commit=True, server_utterances=True)
+        return _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())._cc_starve_s
+
+    assert asyncio.run(_bad()) == 0.5  # 坏值回缺省
+
+
 def test_server_hybrid_starve_and_merge(monkeypatch):
     """混合档：连续语流饥饿→本地闸接管；definite 后到→前缀合并只发增量不重发。"""
     import asyncio

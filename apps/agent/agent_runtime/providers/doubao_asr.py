@@ -616,11 +616,21 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # stt_._server_utterances=False（缺省）=本地闸档=旧线逐字节零变化。
         self._server_utt = bool(getattr(stt_, "_server_utterances", False))
         self._su_emitted = 0  # 已发 FINAL 的 definite 分句计数（按序单调）
+        # 饥饿接管阈值=end_window 派生（call-6f92bfd4）：definite 只在停顿后
+        # end_window 内到达，连续语流中途恒零——等过窗仍无 definite 即本地闸
+        # 接管，多等无增益只顶高首声。env 同键 BOK_DOUBAO_END_WINDOW_MS，
+        # 钳 [0.4,2.0]s（300ms 窗也至少等 0.4s，防 definite/本地闸贴脸双发）。
+        try:
+            _ew_ms = int(os.environ.get("BOK_DOUBAO_END_WINDOW_MS", "500") or 500)
+        except ValueError:
+            _ew_ms = 500
+        self._cc_starve_s = max(0.4, min(2.0, _ew_ms / 1000.0))
         self._su_concat = ""  # 服务端 definite 累积文本（与本地闸前缀坐标合并用）
         self._cc_starve_t0 = 0.0  # 饥饿钟（server_utt 档：definite 未到的连续语流计时）
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
+        _t_conn = time.monotonic()
         if not _ws_host_ok(self._stt_._ws_url):
             self._session_error = "ws_url_rejected"
             print(f"DOUBAO_ASR_URL_REJECTED {self._stt_._ws_url!r}", flush=True)
@@ -655,7 +665,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 持引用任务（禁裸 create_task：异常回收 + 关闭时 cancel 需要句柄）。
         self._sender_task = asyncio.create_task(self._sender(ws))
         self._receiver_task = asyncio.create_task(self._receiver(ws))
-        print("DOUBAO_ASR_CONNECT ok", flush=True)
+        print(f"DOUBAO_ASR_CONNECT ok connect_ms={int((time.monotonic() - _t_conn) * 1000)}", flush=True)
 
     async def _close_session(self) -> None:
         self._session_alive = False
@@ -822,8 +832,11 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             uncommitted = text[self._cc_committed_len:] if text.startswith(self._cc_committed_text or "\x00") else text
             if self._cc_starve_t0 <= 0.0 and len(uncommitted.strip()) >= 4:
                 self._cc_starve_t0 = now  # 未提交文本开始积了：饥饿钟起跑
-            if self._cc_starve_t0 > 0.0 and now - self._cc_starve_t0 >= 1.2:
-                # 连续语流 ≥1.2s 无 definite → 本地闸接管（意群档 12/15/1.2 env）
+            if self._cc_starve_t0 > 0.0 and now - self._cc_starve_t0 >= self._cc_starve_s:
+                # 连续语流无 definite → 本地闸接管（意群档 12/15/1.2 env）。
+                # 阈值=end_window（call-6f92bfd4 翻案：实弹 definite 只在停顿后
+                # 到达=每 utterance 1 次，连续语流中途恒零——1.2s 死等纯浪费且
+                # 直接顶高首声；若 definite 要来，end_window 内必到，等过窗即接管）。
                 self._maybe_clause_commit(text, _prev)
             if self._cc_committed_text and text.startswith(self._cc_committed_text):
                 display = text[self._cc_committed_len:]
