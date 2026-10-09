@@ -17,6 +17,8 @@ extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor", "services/s2
 #     E713/E714 —— CI 与 pre-commit 都跑这一层;
 #  ② 风格类(E501/W191/F401/I001…) = 只对**新增文件**强制(CI diff-filter=A 步);
 #     存量文件的存量行不追——G2 拆包新模块天然生在全量规则之下。
+# 2026-10-09 起 services（除 s2s fork，见 extend-exclude）纳入 ① 真 bug 类门
+# （ci.yml 路径表同款 select；存量读数零违规实证后落地）。
 # 改本 select 须同步 .github/workflows/ci.yml 两步与 .pre-commit-config.yaml。
 select = ["E", "F", "W", "I"]
 
