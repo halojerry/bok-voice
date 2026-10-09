@@ -354,11 +354,7 @@ _FORWARD_ENV_SNAPSHOT: frozenset[str] = frozenset({
     "VOLC_TTS_ENDPOINT",
     "WEB_SEARCH",
 })
-<<<<<<< HEAD
 assert len(_FORWARD_ENV_SNAPSHOT) == 305, "快照含重复键（生成脚本口径坏了）"
-=======
-assert len(_FORWARD_ENV_SNAPSHOT) == 305, "快照含重复键（生成脚本口径坏了）"
->>>>>>> session-20261009-s2defer
 
 
 def test_forward_env_table_literal_is_unique_in_tools():
