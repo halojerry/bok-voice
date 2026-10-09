@@ -851,6 +851,36 @@ def _mt_fail_line(target_lang: str) -> str:
     return lines.get(target_lang, lines["zh"])
 
 
+# 402 黑洞短路(W1-②,2026-10-08):DeepSeek 余额打空时 call-0bdf1392/07684e13
+# 两通 perceived 39.7s——每句都付「流式开流失败→回退 _mt_once 再失败→兜底」
+# 双跑+排队,账本全是兜底句。余额/鉴权类错误**重试永远不会好**——首次命中即
+# 标记本通 MT 车道死亡,后续句秒走兜底(零 provider 调用),spec 投机同步封。
+# 刻意不含 429/超时/finish_reason=insufficient_system_resource(瞬态,重试有
+# 意义);观测行 `[interp] MT_LANE_DEAD` 供告警 grep(运营动作=充值/切道)。
+_MT_FATAL_MARKERS = (
+    "insufficient balance",
+    "payment required",
+    "402",
+    "unauthorized",
+    "401",
+    "invalid api key",
+    "api key doesn't exist",
+    "authenticationerror",
+)
+
+
+def _mt_fatal_provider_error(exc: BaseException) -> str:
+    """致命供应商错误分类器(纯函数,单测直喂):命中返回 marker,否则空串。
+
+    大小写不敏感子串匹配 repr;瞬时错误(超时/429/连接重置/系统资源不足)不
+    命中——它们走原有重试/回退链。"""
+    text = repr(exc).lower()
+    for marker in _MT_FATAL_MARKERS:
+        if marker in text:
+            return marker
+    return ""
+
+
 def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
     """sidecar 地址解析:settings 值 > env > 缺省(去尾部斜杠)。"""
     return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
@@ -2296,6 +2326,16 @@ async def entrypoint(ctx) -> None:
         _asr_engine_from_cfg,
         _parse_vocab_terms,
     )
+    # Sentry(R3 单点;W1-② 2026-10-08 补线):B 线 worker 此前**从未初始化**——
+    # DSN 设了也只 A 线/CP 有事件。幂等+缺席 no-op(sentry_hook 纪律)。
+    try:
+        from bok_voice_obs.sentry_hook import capture as _sentry_capture
+        from bok_voice_obs.sentry_hook import init_sentry as _init_sentry
+
+        _init_sentry("agent-worker")
+    except Exception:  # noqa: BLE001 - 观测缺席绝不阻业务
+        def _sentry_capture(*_a, **_k):  # type: ignore[misc]
+            return None
 
     meta: dict = {}
     try:
@@ -2612,6 +2652,22 @@ async def entrypoint(ctx) -> None:
     # Wave 2 首子句时延(流式 say 才有语义:final→首子句交 TTS;整句路径=0)
     _mt_first = {"ms": 0}
     _src_q: asyncio.Queue = asyncio.Queue(maxsize=48)
+    # W1-② 402 黑洞短路(2026-10-08):致命供应商错误(余额/鉴权)标记本通死道——
+    # 后续句秒走兜底零 provider 调用;spec 投机同步封(busy 闸并门)。只在当通
+    # 内存,挂断即清,无跨通污染。
+    _mt_lane_dead = {"reason": ""}
+    # Sentry 每通去重账本(W1-②):同 key 只报一次防刷屏(超时/兜底可能连续多句)。
+    _sentry_once: set[str] = set()
+
+    def _sentry_event(key: str, message: str, **tags: str) -> None:
+        """运营关键事件上报(去重;SDK 缺席/DSN 空=完整 no-op)。"""
+        if key in _sentry_once:
+            return
+        _sentry_once.add(key)
+        try:
+            _sentry_capture(RuntimeError(message), room=room_name, line="b", **tags)
+        except Exception:  # noqa: BLE001 - 观测件永不外抛
+            pass
 
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
@@ -2657,6 +2713,12 @@ async def entrypoint(ctx) -> None:
             text = await _src_q.get()
             _round += 1
             try:
+                # W1-② 死道快败:致命错误已标记 → 该句零 provider 调用直走兜底
+                # (402 类重试永不好;治 call-0bdf1392 每句双跑黑洞)。
+                if _mt_lane_dead["reason"]:
+                    session.say(_mt_fail_line(target_lang))
+                    _lag.done_mt(0)  # 兜底句配对记账,防 _on_item 偷弹下一条
+                    continue
                 # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
                 # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
                 if _mt_consume_skip(backlog, text):
@@ -2735,6 +2797,10 @@ async def entrypoint(ctx) -> None:
                     f"lang={target_lang}",
                     flush=True,
                 )
+                _sentry_event(
+                    "mt_timeout", f"MT_TIMEOUT_FALLBACK lang={target_lang}",
+                    lane="mt", kind="timeout",
+                )
                 try:
                     session.say(_mt_fail_line(target_lang))
                     # 兜底句也是一次交付(2026-10-02 LagLedger 错位根修):say 出声
@@ -2751,6 +2817,25 @@ async def entrypoint(ctx) -> None:
                 # 声音,与超时静默(已修的兄弟 bug)同构。与超时分支同款:目标语中性
                 # 请示语兜底,绝不回放源文;译文行故意不补(诚实缺行)。say 再包 try。
                 print(f"[interp] mt/say failed: {exc!r}", flush=True)
+                # W1-② 402 短路:致命供应商错误(余额/鉴权)标记本通死道——后续句
+                # 秒走兜底;告警行+Sentry 一次(运营动作=充值/切道)。
+                _fatal = _mt_fatal_provider_error(exc)
+                if _fatal:
+                    _mt_lane_dead["reason"] = _fatal
+                    print(
+                        f"[interp] MT_LANE_DEAD reason={_fatal} round={_round} "
+                        f"room={room_name} (fast-fail till call end — 充值/切道后下一通恢复)",
+                        flush=True,
+                    )
+                    _sentry_event(
+                        "mt_lane_dead",
+                        f"MT_LANE_DEAD reason={_fatal}",
+                        lane="mt", kind="fatal-provider",
+                    )
+                else:
+                    _sentry_event(
+                        "mt_fail", f"mt/say failed: {exc!r}"[:180], lane="mt", kind="error"
+                    )
                 try:
                     session.say(_mt_fail_line(target_lang))
                     _lag.done_mt(0)  # 同上:兜底句配对记账,防 _on_item 错位
@@ -2819,10 +2904,14 @@ async def entrypoint(ctx) -> None:
         """真车道忙闸(闭包后绑 backlog——事件只在 session.start 后流动,装配序安全):
         FIFO 深度 ≥ BOK_INTERP_SPEC_BUSY_DEPTH(默认 2;1=旧「非空即封」档)/真 MT
         在途/背压摘译 pending 任一真=投机让路。封锁 episode 首拍打 INTERP_SPEC
-        busy 行(fired/blocked 累计计数,每 episode 一行不刷屏)。"""
+        busy 行(fired/blocked 累计计数,每 episode 一行不刷屏)。
+        W1-②:死道(402/鉴权)并门——投机在死道上只会白烧快速失败。"""
         depth = _spec_busy_depth()
         busy = bool(
-            _src_q.qsize() >= depth or _mt_busy["flag"] or backlog.source_drops_pending
+            _src_q.qsize() >= depth
+            or _mt_busy["flag"]
+            or backlog.source_drops_pending
+            or _mt_lane_dead["reason"]
         )
         st = _spec_stats
         if busy:
@@ -2833,6 +2922,7 @@ async def entrypoint(ctx) -> None:
                     f"[interp] INTERP_SPEC busy depth={depth} fifo={_src_q.qsize()} "
                     f"mt={int(bool(_mt_busy['flag']))} "
                     f"skip={int(bool(backlog.source_drops_pending))} "
+                    f"dead={int(bool(_mt_lane_dead['reason']))} "
                     f"fired={st['fired']} blocked={st['blocked']}",
                     flush=True,
                 )
