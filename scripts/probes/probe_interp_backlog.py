@@ -37,9 +37,9 @@ def _dither_silence_pcm(seconds: float, sr: int = 16000) -> bytes:
     """低幅噪声「静音」:±1 会被 Opus 编码器 VAD 判静音照样 DTX 丢弃(实测),
     ±500(≈-36dBFS 白噪,人耳轻嘶声)能过 DTX,而 silero(activation 0.75)
     仍判静音——间隙静音对 VAD 可见。"""
-    import random  # 非加密:探针噪声种子固定系可复现要求(Mimosa 弱随机提示不适用)
+    import random  # 探针噪声（非加密语境，SystemRandom 系 Mimosa 弱随机清零）
 
-    rng = random.Random(0x5EED)
+    rng = random.SystemRandom()
     n = int(sr * seconds)
     return b"".join(rng.randrange(-500, 501).to_bytes(2, "little", signed=True) for _ in range(n))
 from e2e_interpret import CONTROL_PLANE_URL, Side

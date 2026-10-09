@@ -50,6 +50,7 @@
 | `scripts/lib/mm_voice.py` | MiniMax 云合成 16k PCM 探针话音线(2026-09-13)。 | probe_stimulus.py import / test_cantonese_terminology.py | 是 | 2026-10-04 |
 | `scripts/lib/probe_stimulus.py` | 探针/E2E 客户话音刺激源单点开关(2026-09-21)。 | 13 脚本 import / test_probe_stimulus.py | 是 | 2026-10-02 |
 | `scripts/lib/urlguard_gate.py` | 脚本面出站守卫单点（Mimosa SSRF 修复；被大量脚本 import）。 | 24 脚本 import / e2e_edge_cases.py | 否 | 2026-09-23 |
+| `scripts/lib/cp_outbound.py` | 诊断脚本 CP 出站共享单点（发送期闸 guard_url + urllib/httpx 唯一 sink + 两个 CP 便捷面；Mimosa L3 收敛 2026-10-09）。 | mine_qa/import_xkt_qa/load_intent_catalog/e2e_real_customer(+probe 族经 erc) import / test_cp_outbound.py | 否 | 2026-10-09 |
 | `scripts/ops/check_doc_paths.py` | 活文档仓内路径断链检查（G1a 治理，2026-10-04）。 | 无(手动) | 否 | 2026-10-04 |
 | `scripts/ops/check_doc_anchors.py` | 活文档 `.py:行号` 锚计数棘轮（G3b 治理，2026-10-05）：总量只准降不准升，降基线/放行新增锚须显式 `--update`；基线 `doc_anchor_baseline.json`。 | tests/test_doc_hygiene.py | 否 | 2026-10-05 |
 | `scripts/ops/check_schema_drift.py` | Supabase schema 漂移门禁:scripts/artifacts/.p0_supabase_schema.sql 产物 ≡ build_engine() 代码? | CI schema-drift.yml / test_schema_reverse_parity.py | 否 | 2026-10-04 |
@@ -96,6 +97,10 @@
 | `scripts/probes/probe_interp_backlog.py` | B 线播放背压实弹探针（P2 `_PlaybackBacklog`，2026-09-16）。 | test_probe_backlog_count.py import / test_probe_backlog_count.py | 是 | 2026-10-02 |
 | `scripts/probes/probe_interp_continuous.py` | B 线「边说边译」连续语流探针（2026-09-17 长度触发子句提交验收）。 | test_probe_stimulus.py / security/mimosa/suppressions.json | 是 | 2026-09-21 |
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
+| `scripts/probes/probe_minimax_bidi_native.py` | MiniMax t2a_v2_bidi 服务端攒句可行性探针（W7-P1，2026-10-09）：逐字直喂/flush 催尾/cancel 存活/ping RTT/早切对照+HTTP 字节对照，量「官方攒句可否替代客户端攒句/早切」。 | agent livekit_plugins.py（MiniMaxTTS bidi）/ probe_cloud_asr.py（取钥同源） | 是 | 2026-10-09 |
+| `scripts/probes/probe_doubao_native_arms.py` | 豆包 SAUC 官方参数臂探针（W7-P2，2026-10-09）：end_window_size 判停窗实测（缺省≈3s 金子发现）/enable_nonstream 二遍 CER/enable_ddc 结巴顺滑/force_to_speech_time 句头/result_type=single 形状。 | probe_cloud_asr.py（协议帧/语料/折叠评分 import 复用） | 是 | 2026-10-09 |
+| `scripts/probes/probe_interp_official_chain.py` | B 线官方化裸链探针（W7-P3，2026-10-09）：DeepSeek 流式 token 逐 delta 直发 MiniMax bidi，量 utterance 级 EVS/token 节奏/投机预热（缓存块粒度判定）。 | probe_deepseek_stream.py（取钥同源）/ livekit_plugins.py（bidi 端点） | 是 | 2026-10-09 |
+| `scripts/probes/probe_mt_lane_ttft.py` | MT 车道 TTFT 竞测探针（W7-P5，2026-10-09）：deepseek-flash vs 方舟 seed-2.0/2.1-lite vs qwen-flash 三臂流式首 token/速率/术语/粤译质量——贴着说话出声的译道定盘。 | probe_mt_matrix.py（方舟臂鉴权/env 同源） | 是 | 2026-10-09 |
 | `scripts/probes/probe_mt_matrix.py` | B 线 MT 车道选型矩阵探针（2026-10-08 W1）：deepseek官方/qwen-mt-flash(translation_options.terms)/方舟v4.1-flash/opencode zen 四臂逐 delta 计时+译文质量+术语落地;晚峰复测定车道。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_deepseek_stream.py` | DeepSeek 流式真伪归因探针（2026-10-08）：chat 流式/Responses API/非流式三形状逐 delta 计时+TTFB+缓存臂;Responses 思考开关=reasoning.effort "none"。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_spec_live.py` | B 线投机翻译实弹探针（2026-10-08 spec 复活验收）：多子句刺激（TTS 逗号停顿挤压到 VAD 静音线内=真人形状）→fire/CLAUSE_COMMIT/defer 日志判据。 | test_scripts_index.py | 是 | 2026-10-08 |

@@ -26,6 +26,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useSession } from "@/components/session-context";
+import { guardDirtyNavClick } from "@/lib/dirty-signal";
 import {
   Tooltip,
   TooltipContent,
@@ -77,6 +78,7 @@ function SidebarNavLink({
     <Link
       href={item.href}
       aria-current={active ? "page" : undefined}
+      onClick={guardDirtyNavClick}
       className={cn(
         "relative flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors",
         collapsed && "justify-center px-0",

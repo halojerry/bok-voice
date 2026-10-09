@@ -50,9 +50,14 @@ def _safe_urlopen(req, *, timeout: float, data=None):
     本脚本目标=本机 CP / 本地 mlx 端点（缺省环回，env 显式覆盖）。"""
     parts = urllib.parse.urlsplit(req.full_url)
     host = (parts.hostname or "").lower()
+    _extra_hosts = {  # W7-B：远程 CP 显式扩展口（BOK_CP_ALLOW_HOSTS）；环回缺省
+        h.strip().lower()
+        for h in os.environ.get("BOK_CP_ALLOW_HOSTS", "").split(",")
+        if h.strip()
+    }
     if not (
         parts.scheme in ("http", "https")
-        and (host in _LOOPBACK_HOSTS or bool(host))
+        and (host in _LOOPBACK_HOSTS or host in _extra_hosts)
         and not parts.username
         and not parts.password
     ):
@@ -81,7 +86,35 @@ from bok_voice_core.qa_cluster import (  # noqa: E402
 )
 
 
+_LOCAL_CP_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _cp_base_ok(base: str) -> bool:
+    """出站护栏（2026-10-09 W7-B，Mimosa 修复）：`--cp` 是 CLI 传入的出站基址，
+    不得任意出站——默认只放环回四件套；远程 CP 用 env ``BOK_CP_ALLOW_HOSTS``
+    （逗号分隔 host，小写比较，与 import_xkt_qa._safe_urlopen 同名同语义）
+    显式扩展；拒绝 userinfo 注入与非 http(s) scheme。"""
+    try:
+        parts = urllib.parse.urlsplit(base.strip())
+    except ValueError:
+        return False
+    extra = {
+        h.strip().lower()
+        for h in os.environ.get("BOK_CP_ALLOW_HOSTS", "").split(",")
+        if h.strip()
+    }
+    host = (parts.hostname or "").lower()
+    return bool(
+        parts.scheme in ("http", "https")
+        and not parts.username
+        and not parts.password
+        and (host in _LOCAL_CP_HOSTS or host in extra)
+    )
+
+
 def _cp_request(base: str, path: str, token: str, *, method: str = "GET", payload: dict | None = None) -> object:
+    if not _cp_base_ok(base):
+        raise PermissionError(f"出站 URL 未过护栏（拒发；远程 CP 需 BOK_MINEQA_ALLOW_HOSTS）: {base}")
     req = urllib.request.Request(f"{base.rstrip('/')}{path}", method=method)
     req.add_header("Content-Type", "application/json")
     if token:

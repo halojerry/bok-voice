@@ -27,18 +27,25 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# 出站 allowlist（2026-10-09 W7-B，Mimosa 修复）：本脚本目标=本机 CP；远程 CP
+# 需 env BOK_CP_ALLOW_HOSTS（逗号分隔 host，小写比较）显式扩展。
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+_ALLOWED_CP_HOSTS = frozenset(_LOOPBACK_HOSTS | {
+    h.strip().lower()
+    for h in os.environ.get("BOK_CP_ALLOW_HOSTS", "").split(",")
+    if h.strip()
+})
 
 
 def _safe_urlopen(req, *, timeout: float, data=None):
-    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
-    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
-    本脚本目标=本机 CP（缺省环回，BOK_CP_URL 显式覆盖）。"""
+    """出站闸门（2026-10-09 W7-B 收紧为真 allowlist）：仅 http/https、无
+    userinfo、host 必须命中环回四件套或 BOK_CP_ALLOW_HOSTS 扩展——不过闸=
+    PermissionError。（旧形状 ``host in _LOOPBACK or bool(host)`` 恒真=橡皮章，已废。）"""
     parts = urllib.parse.urlsplit(req.full_url)
     host = (parts.hostname or "").lower()
     if not (
         parts.scheme in ("http", "https")
-        and (host in _LOOPBACK_HOSTS or bool(host))
+        and host in _ALLOWED_CP_HOSTS
         and not parts.username
         and not parts.password
     ):

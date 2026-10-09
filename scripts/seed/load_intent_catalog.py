@@ -30,14 +30,12 @@ for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
 
 import argparse
 import hashlib
-import ipaddress
 import json
 import os
-import socket
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
+
+import cp_outbound  # noqa: E402  CP 出站共享单点（G1 引导头后可裸 import scripts/lib）
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG_PATH = os.path.join(REPO_ROOT, "scripts", "data", "intent_catalog_v1.json")
@@ -98,55 +96,30 @@ def _validate_client(graph: dict) -> list[str]:
     return validate_flow_graph(json.dumps(graph, ensure_ascii=False))
 
 
-def _assert_safe_cp_url(cp: str, *, allow_remote: bool) -> None:
-    """SSRF 边界:协议限 http/https,主机解析后逐 IP 校验。
+def _allow_hosts(cp: str, allow_remote: bool) -> tuple[str, ...]:
+    """--allow-remote-host 语义映射：显式拍板放行的 CP host 进共享闸 extra_hosts。
 
-    默认档只放行环回(本机 CP 是这个工具的唯一常态目标);--allow-remote-host
-    才放行解析到的非环回地址(带 Bearer token 出网=人工拍板动作)。解析失败、
-    缺主机、非常规协议一律拒绝。
-    """
-    parsed = urllib.parse.urlparse(cp)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"unsupported CP url scheme: {parsed.scheme!r} (http/https only)")
-    host = parsed.hostname or ""
-    if not host:
-        raise ValueError("CP url missing host")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    for _, _, _, _, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_loopback:
-            continue
-        if allow_remote:
-            continue
-        raise ValueError(
-            f"CP url host {host} resolves to non-loopback {ip}; pass --allow-remote-host if intended"
-        )
+    （带 Bearer token 出网是人工拍板动作——旗标开=把该 CP host 显式声明进
+    白名单；共享闸另认 env BOK_PROBE_EXTRA_HOSTS 扩展口。）"""
+    if not allow_remote:
+        return ()
+    host = (urllib.parse.urlsplit(cp).hostname or "").strip().lower()
+    return (host,) if host else ()
 
 
 def _cp_request(cp: str, path: str, *, method: str = "GET", body: dict | None = None,
                 _allow_remote: bool = False) -> tuple[int, object]:
-    # 出站闸与 sink 同函数体（Mimosa L3 污点纪律）：每次请求前就地过环回/DNS
-    # 边界校验——main 的入口校验保留为 fail-fast 第一道，此处为 sink 级第二道。
-    _assert_safe_cp_url(cp, allow_remote=_allow_remote)
-    url = f"{cp.rstrip('/')}{path}"
-    data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    token = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode()
-            return resp.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode()
-        try:
-            return exc.code, json.loads(raw)
-        except Exception:  # noqa: BLE001
-            return exc.code, raw
+    """CP sanctioned 写入口——出站闸与 urlopen sink 在共享单点
+    scripts/lib/cp_outbound.cp_request_status（2026-10-09 L3 收敛；HTTPError
+    内捕返回 (status, parsed-or-raw) 的旧形状原样）。每次请求前过闸=边界
+    校验与 sink 同函数体（main 入口校验保留为 fail-fast 第一道，此处为
+    sink 级第二道）。"""
+    return cp_outbound.cp_request_status(
+        cp, path,
+        token=os.environ.get("BOK_CP_TOKEN", "").strip(),
+        method=method, payload=body,
+        extra_hosts=_allow_hosts(cp, _allow_remote),
+    )
 
 
 def main() -> int:
@@ -160,9 +133,9 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        _assert_safe_cp_url(args.cp, allow_remote=args.allow_remote_host)
-    except ValueError as exc:
-        print(f"FAIL: {exc}")
+        cp_outbound.guard_url(args.cp, extra_hosts=_allow_hosts(args.cp, args.allow_remote_host))
+    except PermissionError as exc:
+        print(f"FAIL: {exc}（远程 CP：--allow-remote-host 或 env BOK_PROBE_EXTRA_HOSTS 显式放行）")
         return 1
 
     with open(args.catalog, encoding="utf-8") as fh:

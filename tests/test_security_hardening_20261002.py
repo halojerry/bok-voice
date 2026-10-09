@@ -93,10 +93,27 @@ def test_assert_cp_origin_foreign_origin_refused():
 # ---- BokMarkdownSource scheme 白名单 ----
 
 
-def test_markdown_source_accepts_http_https():
+def test_markdown_source_accepts_http_https(monkeypatch):
+    import socket
+
     from bok_voice_knowledge.markdown_source import BokMarkdownSource
 
+    # 2026-10-08 护栏升级：环回/私网基址默认拒——历史缺省 127.0.0.1 断言挂到
+    # 显式放行档（BOK_KNOWLEDGE_ALLOW_PRIVATE=1）；公网域名构造期 DNS 全验，
+    # stub getaddrinfo 免真实网络。
+    monkeypatch.setenv("BOK_KNOWLEDGE_ALLOW_PRIVATE", "1")
     BokMarkdownSource("http://127.0.0.1:8771/v1")
+    monkeypatch.delenv("BOK_KNOWLEDGE_ALLOW_PRIVATE")
+
+    import bok_voice_core.urlguard as urlguard
+
+    monkeypatch.setattr(
+        urlguard.socket,
+        "getaddrinfo",
+        lambda host, port, *a, **kw: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))
+        ],
+    )
     BokMarkdownSource("https://bok.example.com/v1", token="t")
 
 
