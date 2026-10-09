@@ -105,6 +105,11 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # (cantonese→"Chinese,Yue")同产品 minimax 车道政策——只豁免该映射行,
     # 探针内部语言字段一律 cantonese。
     "scripts/probes/probe_interp_official_chain.py": re.compile(r'"Chinese,Yue"'),
+    # W7-P4 官方管线真形探针对(2026-10-09):同款 MiniMax language_boost 外部枚举
+    # (cantonese→Chinese,Yue,docstring 摘要/装配行两形态)——只豁免该字面量,
+    # 探针内部语言字段一律 cantonese。
+    "scripts/probes/w7p4_official_agent.py": re.compile(r"Chinese,Yue"),
+    "scripts/probes/probe_official_session.py": re.compile(r"Chinese,Yue"),
     # vendored s2s（Apache-2.0 上游镜像 @81b688b4）：Whisper/SenseVoice 的 BCP-47
     # 语言枚举（"yue" token 表/解码选项/`"yue"→"cantonese"` 上游映射）是
     # 「别人的接口」类不透明标识符——上游镜像不改写；我方接线
