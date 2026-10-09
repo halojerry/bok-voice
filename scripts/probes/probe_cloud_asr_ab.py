@@ -24,6 +24,9 @@ POST {base}/api/v1/services/aigc/multimodal-generation/generation
   DASHSCOPE_ASR_URL(完整端点，默认官方域) / DASHSCOPE_ASR_MODEL(默认
   qwen3-asr-flash) / CLOUD_AB_LIMIT(冒烟截前 N 句) / CLOUD_AB_SKIP_DIGITS=1 /
   CLOUD_AB_WAV_DIR(默认 /tmp/bok_cloud_asr_ab，临时 wav 缓存)
+云端端点过公网出站闸（urlguard_gate.gate_public）：公网域名/公网 IP 放行，
+环回/私网/链路本地默认拒；内网测试端点设 BOK_PROBE_ALLOW_PRIVATE=1 显式放行
+（云元数据段无口子）。
 结果落 JSON：scripts/.probe_cloud_asr_ab.<tag>.json
 """
 from __future__ import annotations
@@ -53,6 +56,7 @@ sys.path.insert(0, str(_SCRIPTS))
 
 import probe_asr_digits_ab as dab  # noqa: E402
 import probe_hotword_ab as hab  # noqa: E402
+from urlguard_gate import gate_public  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 API_KEY_ENV = "DASHSCOPE_API_KEY"
@@ -169,6 +173,11 @@ def main() -> int:
     if not os.environ.get(API_KEY_ENV, ""):
         print(f"ERROR: 缺少 env {API_KEY_ENV}（key 只从 env 读，勿写文件）")
         return 2
+    # 云端出站闸（公网档，2026-10-08 advisory 收口）：放 key 快速退出之后、
+    # 首个出站请求之前——无 key 路径保持零网络（离线 --help 可跑）；有 key 时
+    # DNS 全验在发请求前 fail-fast（e2e 底座 import 期闸不适用的原因：默认
+    # 官方域是公网域名，import 期 DNS 解析会打断零网络/离线启动）。
+    gate_public(CLOUD_URL)
     cert_env()
     sentences = hab.SENTENCES[:LIMIT] if LIMIT > 0 else hab.SENTENCES
     n = len(sentences)

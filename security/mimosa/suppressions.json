@@ -12,7 +12,7 @@
     "advisories": [
       "tts_cache sha1 缓存键（hook 侧弱算法告警）：内容寻址缓存键非安全边界，换 sha256 将作废全部已钉罐头（greetings/fillers/qa）——accepted-risk，勿顺手改",
       "logger.ts trace id 的 Math.random 回退：非凭据（主路径 crypto.randomUUID）——accepted-risk",
-      "probe_cloud_asr_ab CLOUD_URL：云端 ASR API 客户端（官方端点默认+key），未上环回闸——候选后续用 assert_public_http_url 档加固",
+      "probe_cloud_asr_ab CLOUD_URL：已上公网出站闸（2026-10-08 收口）——urlguard_gate.gate_public 地址类档（http(s)+无 userinfo+IP 字面量/域名 DNS 解析后拒环回/私网/链路本地/保留段；core assert_public_http_url 门面），私网/自建端点 BOK_PROBE_ALLOW_PRIVATE=1 显式 opt-in（云元数据段无口子）；默认官方端点 dashscope.aliyuncs.com 放行",
       "node_handshake_smoke：CI 基建脚本（workflow 注入云 CP 地址，受信 CI 面），不上环回闸"
     ]
   },
@@ -100,9 +100,9 @@
       "id": "accepted-knowledge-source-fetch",
       "publicClass": "other-security",
       "path_glob": "apps/control-plane/*",
-      "verdict": "accepted-risk",
-      "reason": "main.py→markdown_source 的污点=知识库源抓取特性（URL 来自 admin 配置的知识源）；管理面配置+权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
-      "evidence": "packages/knowledge markdown_source 适配器; §50 知识抓取=配置型适配器核验"
+      "verdict": "fixed",
+      "reason": "main.py→markdown_source 的污点=知识库源抓取特性（URL 来自 admin 配置的知识源）；管理面配置+权限闸在位。2026-10-08 后续候选已落地：适配器出站统一过 _guard_outbound_url 公网守卫（默认拒私网/环回/云 metadata，BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行内网知识源；userinfo 恒拒；read path urlencode 防注入）",
+      "evidence": "packages/knowledge markdown_source 适配器 _guard_outbound_url 单闸; tests/test_markdown_source_netguard.py; §50 知识抓取=配置型适配器核验"
     },
     {
       "id": "fp-sidecar-taint",
@@ -172,17 +172,17 @@
       "id": "accepted-cp-knowledge-source-chain",
       "publicClass": "other-security",
       "path_glob": "apps/control-plane/control_plane/main.py",
-      "verdict": "accepted-risk",
-      "reason": "『环境变量→markdown_source.py:79 SSRF』链=CP 把 BOK_URL/BOK_KNOWLEDGE_* env 传给知识源抓取适配器;markdown_source 构造期非 http(s) 显式拒(ValueError 启动面炸)+write/read sink 级 scheme/host/userinfo 闸(2026-10-05 逐行核验)——与 accepted-knowledge-source-ssrf 同裁定面,风险=运维配错而非注入",
-      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py 构造器 scheme 校验+write() sink 闸注释;security-policy.json threatModel 攻击面第 2 条已列"
+      "verdict": "fixed",
+      "reason": "『环境变量→markdown_source.py:79 SSRF』链=CP 把 BOK_URL/BOK_KNOWLEDGE_* env 传给知识源抓取适配器;2026-10-08 适配器出站统一过 _guard_outbound_url 单闸（构造器 resolve=True 保存期 DNS 全验+read/write 发送期复验,对标 CP webhook 双重校验;地址策略单源委托 bok_voice_core.urlguard,环回/私网/保留段默认拒、解析失败 fail-closed、多 A 记录任一命中即拒、云 metadata/link-local 恒拒无口子;BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行内网知识源;read path urlencode 消除 query/CRLF 注入）——与 accepted-knowledge-source-ssrf 同裁定面,一并翻 fixed",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py _guard_outbound_url; tests/test_markdown_source_netguard.py 26 用例零网络; security-policy.json threatModel 攻击面第 2 条已列"
     },
     {
       "id": "accepted-knowledge-source-ssrf",
       "publicClass": "ssrf",
       "path_glob": "packages/knowledge/*",
-      "verdict": "accepted-risk",
-      "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
-      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py; §50 配置型适配器核验"
+      "verdict": "fixed",
+      "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。2026-10-08 护栏升级：read()/write() 出站与构造器统一过 _guard_outbound_url 单闸——scheme 白名单 http/https+host 非空+userinfo 恒拒+地址策略单源委托 bok_voice_core.urlguard（环回/私网/保留段 DNS 解析后默认拒，解析失败 fail-closed，多 A 记录任一命中即拒；云 metadata/link-local 恒拒无口子）；运维合法内网走 BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行；read path 经 urlencode 消除 query/CRLF 注入",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py _guard_outbound_url（构造器 resolve=True 保存期全验+发送期复验，对标 CP webhook 双重校验）；tests/test_markdown_source_netguard.py 26 用例零网络"
     },
     {
       "id": "fp-queue-proxy-room-claim-taint",

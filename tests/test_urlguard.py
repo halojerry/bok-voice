@@ -14,13 +14,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "packages" / "core") not in sys.path:
     sys.path.insert(0, str(ROOT / "packages" / "core"))
+if str(ROOT / "scripts" / "lib") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts" / "lib"))
 
+import urlguard_gate  # noqa: E402
 from bok_voice_core.urlguard import (  # noqa: E402
     UrlGuardError,
     assert_local_diag_url,
     assert_public_http_url,
 )
-
 
 # ---- assert_local_diag_url ----
 
@@ -183,3 +185,78 @@ def test_error_messages_carry_no_query_string():
         assert_public_http_url("http://127.0.0.1/cb?token=sekrit-value")
     except UrlGuardError as exc:
         assert "sekrit-value" not in str(exc)
+
+
+# ---- urlguard_gate 公网出站档（gate_public + scripts 侧 assert_public_http_url 包装）----
+# 云端探针档（probe_cloud_asr_ab CLOUD_URL，2026-10-08 advisory 收口）：默认打
+# 公网官方 API，判定=地址类而非环回白名单；userinfo 拒；私网 opt-in=
+# BOK_PROBE_ALLOW_PRIVATE（布尔，与 EXTRA_HOSTS 的 host 枚举语义不同构）。
+
+
+def test_gate_public_http_accepts_public_domain_and_public_ip(monkeypatch):
+    monkeypatch.delenv("BOK_PROBE_ALLOW_PRIVATE", raising=False)
+    # 桩地址必须真公网（RFC 5737 文档段 203.0.113.0/24 被 ipaddress 判 is_private）
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_resolver(["93.184.216.34"]))
+    official = (
+        "https://dashscope.aliyuncs.com"
+        "/api/v1/services/aigc/multimodal-generation/generation"
+    )
+    assert urlguard_gate.assert_public_http_url(official) == official  # 公网域名放行
+    assert urlguard_gate.assert_public_http_url("https://93.184.216.34/v1/asr")
+    # gate_public 同官方端点不退出（探针默认姿势不炸）
+    urlguard_gate.gate_public(official)
+
+
+def test_gate_public_http_rejects_loopback_and_private_literals(monkeypatch):
+    monkeypatch.delenv("BOK_PROBE_ALLOW_PRIVATE", raising=False)
+    for bad in ("http://127.0.0.1:8787/x", "http://10.0.0.5/x", "http://192.168.1.5/x"):
+        with pytest.raises(UrlGuardError):
+            urlguard_gate.assert_public_http_url(bad)
+        # gate 面 fail-fast：SystemExit(2)，坏端点在发第一个请求前死掉
+        with pytest.raises(SystemExit) as excinfo:
+            urlguard_gate.gate_public(bad)
+        assert excinfo.value.code == 2
+
+
+def test_gate_public_http_rejects_metadata_even_with_opt_in(monkeypatch):
+    monkeypatch.setenv("BOK_PROBE_ALLOW_PRIVATE", "1")
+    with pytest.raises(UrlGuardError):
+        urlguard_gate.assert_public_http_url("http://169.254.169.254/latest/meta-data")
+    with pytest.raises(SystemExit):
+        urlguard_gate.gate_public("http://169.254.169.254/latest/meta-data")
+
+
+def test_gate_public_http_rejects_userinfo_and_non_http_scheme(monkeypatch):
+    with pytest.raises(UrlGuardError, match="userinfo"):
+        urlguard_gate.assert_public_http_url("http://user:pass@93.184.216.34/v1/asr")
+    with pytest.raises(UrlGuardError, match="userinfo"):
+        urlguard_gate.assert_public_http_url("http://@93.184.216.34/v1/asr")
+    for bad in ("ftp://93.184.216.34/x", "file:///tmp/x", ""):
+        with pytest.raises(UrlGuardError):
+            urlguard_gate.assert_public_http_url(bad)
+
+
+def test_gate_public_http_opt_in_env_allows_private_endpoints(monkeypatch):
+    monkeypatch.setenv("BOK_PROBE_ALLOW_PRIVATE", "1")
+    assert urlguard_gate.assert_public_http_url("http://10.1.2.3:8787/x")
+    assert urlguard_gate.assert_public_http_url("http://127.0.0.1:8787/x")
+    assert urlguard_gate.assert_public_http_url("http://172.16.0.9/x")
+    urlguard_gate.gate_public("http://10.0.0.5/x")  # opt-in 后不退出
+
+
+def test_gate_public_http_domain_to_private_dns_rejected(monkeypatch):
+    monkeypatch.delenv("BOK_PROBE_ALLOW_PRIVATE", raising=False)
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_resolver(["172.16.0.9"]))
+    with pytest.raises(UrlGuardError, match="blocked address"):
+        urlguard_gate.assert_public_http_url("https://lab-gw.internal/x")
+
+
+def test_gate_public_http_dns_failure_fail_closed(monkeypatch):
+    monkeypatch.delenv("BOK_PROBE_ALLOW_PRIVATE", raising=False)
+
+    def _boom(host, *a, **kw):
+        raise OSError("nx")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    with pytest.raises(UrlGuardError, match="resolution failed"):
+        urlguard_gate.assert_public_http_url("https://unresolvable.example.com/x")
