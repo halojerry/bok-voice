@@ -25,6 +25,9 @@ export function registryBase(): string {
 }
 
 async function toError(res: Response): Promise<Error> {
+  // W②（2026-10-09）会话中账号到期：CP identity_gate 403 + X-Bok-Code 头 →
+  // 硬刷新走 me()（豁免端点）重取会话，app-shell 渲染整站续费页。
+  handleAccountExpired(res);
   // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
   // detail 三形态：string / 数组（CP graph 校验 400 {"error":…,"detail":[…]}）/
   // 嵌套对象（steps 分支校验 400 {"detail":{"error":"invalid_branch_text","detail":[…]}}）
@@ -72,6 +75,19 @@ function handleUnauthorized(path: string) {
   if (window.location.pathname.startsWith("/login")) return;
   window.localStorage.removeItem("bok_token");
   window.location.href = "/login/";
+}
+
+/** W② 到期重载去重旗（多请求并发 403 只触发一次 reload）。 */
+let _expiredReloading = false;
+
+/** W②（2026-10-09）会话中账号到期：X-Bok-Code: account_expired → 硬刷新。
+ * me() 是豁免端点，刷新后 session-context 拿到 account_expired=true → app-shell
+ * ExpiredGate 渲染整站续费页（闸在服务端逐请求重估，这里只是显示层切换）。 */
+function handleAccountExpired(res: Response) {
+  if (_expiredReloading || typeof window === "undefined") return;
+  if (res.headers.get("X-Bok-Code") !== "account_expired") return;
+  _expiredReloading = true;
+  window.location.reload();
 }
 
 async function request<T>(path: string, init?: RequestInit, base?: string): Promise<T> {
@@ -806,6 +822,9 @@ export type SessionInfo = {
   account_id: string;
   /** 有效权限键（页面 8 键+管理 6 键，下发制见 permissions.py；root=全量，admin='' 存量=全量） */
   permissions: string[];
+  /** W② 账号订阅态（root/匿名/账号行缺失恒 false）；ISO 串空=永久 */
+  account_expired?: boolean;
+  account_expires_at?: string;
 };
 
 export type UserRow = {

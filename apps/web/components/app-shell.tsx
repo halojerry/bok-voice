@@ -17,6 +17,7 @@ import {
   hasPage,
   isManager,
   useSession,
+  useSessionActions,
 } from "@/components/session-context";
 import { friendlyErrorText } from "@/lib/api-ready";
 
@@ -61,6 +62,29 @@ function SessionReady({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/** W②（2026-10-09）整站续费页：账号订阅到期 → 除退出登录外整站阻断。
+ * 数据源=me() 的 account_expired（豁免端点，服务端仍在逐请求重估——这里是
+ * 显示层，真闸在 CP identity_gate）。匿名/root 不进本门（服务端同款口径）。 */
+function ExpiredGate({ children }: { children: React.ReactNode }) {
+  const session = useSession();
+  const { logout } = useSessionActions();
+  const expired = Boolean(session && !session.anonymous && session.account_expired);
+  if (!expired) return <>{children}</>;
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background p-6">
+      <div className="w-full max-w-md space-y-4 rounded-xl border p-8 text-center">
+        <h1 className="text-lg font-semibold">服务已到期</h1>
+        <p className="muted text-sm leading-relaxed">
+          您的订阅有效期已结束，续费后即可恢复使用。请联系平台管理员续费。
+        </p>
+        <button className="btn-ghost text-xs" onClick={logout}>
+          退出登录
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** 路由守卫（契约 §4）：路径前缀 → 权限键 / 主管专属 / root 专属；未匹配前缀放行。 */
 function RouteGuard({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -93,6 +117,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <SessionProvider>
       <SessionReady>
+        <ExpiredGate>
         <AccountProvider>
           {/* SWR 全局默认（2026-10-02 数据层）：切回标签页自动重验 + 短窗去重；
               keepPreviousData=换 key（如分页 limit 增长）时旧列表先留屏不闪白。 */}
@@ -123,6 +148,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </ToastProvider>
           </SWRConfig>
         </AccountProvider>
+        </ExpiredGate>
       </SessionReady>
     </SessionProvider>
   );

@@ -1951,6 +1951,12 @@ def auth_me(request: Request) -> dict:
     # B4：权限逐请求查库（JWT 只装身份）——主管改权限对已签发 token 即时生效；
     # 行缺失（删号后旧 token）按 '' 兜底不炸（=默认集，见 permissions.py 模块注释）。
     user = _repo().get_user(identity.user_id) or {}
+    # W②（2026-10-09）账号订阅态：直查库不走 TTL 缓存（me 是整站续费页的数据
+    # 源，renew 后立刻翻绿）；root/机器通道/账号行缺失=空串+False（零执法）。
+    account_row = (
+        _repo().get_account(identity.account_id) if identity.account_id else None
+    ) or {}
+    account_expires_at = str(account_row.get("expires_at") or "")
     return {
         "user_id": identity.user_id,
         "username": identity.username,
@@ -1961,6 +1967,9 @@ def auth_me(request: Request) -> dict:
         "permissions": effective_permissions(
             str(user.get("role") or identity.role), str(user.get("permissions_json") or "")
         ),
+        "account_expires_at": account_expires_at,
+        "account_expired": _account_is_expired(account_expires_at)
+        if identity.role in ("admin", "user") else False,
     }
 
 

@@ -312,6 +312,23 @@ def _unauthorized() -> Response:
     return Response(status_code=401, content=b'{"detail":"unauthorized"}', media_type="application/json")
 
 
+# W② 到期闸豁免（登录已在 _EXEMPT_PATHS，到不了身份段）：me 是前端渲染
+# 整站续费页的数据源，必须放行；登出走客户端弃 token（无服务端端点）。
+_EXPIRY_EXEMPT_PATHS = frozenset({"/api/auth/me"})
+
+
+def _account_expired_response() -> Response:
+    """403 + X-Bok-Code: account_expired——web 侧据此切整站续费页（W②）。"""
+    import json as _json
+
+    return Response(
+        status_code=403,
+        content=_json.dumps({"detail": "订阅已到期，请联系平台管理员续费"}, ensure_ascii=False),
+        media_type="application/json",
+        headers={"X-Bok-Code": "account_expired"},
+    )
+
+
 def _override_correlation_user(request: Request, user_id: str) -> None:
     """无验证身份的通道（机器/豁免/静态）覆写 correlation.user_id——审计 actor
     不可被客户端 X-User-ID 头伪造（2026-09-16 深测 P2：机器通道曾可自带
@@ -366,6 +383,14 @@ async def identity_gate(request: Request, call_next):
             return _unauthorized()
         # 角色以库为准：降权（admin→user）即时生效，require_role 不再信过期 claim。
         identity.role = str(row.get("role") or identity.role)
+    # W②（2026-10-09）账号订阅到期闸：admin/user 按账号状态**逐请求重估**
+    # （TTL 缓存 account_expired_lookup；续费端点清缓存，最坏滞后 60s 且方向
+    # 良性=多拦不多放）。与 JWT 签名/角色正交——偷来的有效 token 同拦。root
+    # 与机器通道不进本闸；豁免=/api/auth/me（前端靠它渲染整站续费页）。
+    # 登录本身在 _EXEMPT_PATHS 里，到不了这里（到期客户仍可登录看续费提示）。
+    if identity.role in ("admin", "user") and path not in _EXPIRY_EXEMPT_PATHS:
+        if account_expired_lookup(request, identity.account_id):
+            return _account_expired_response()
     request.state.identity = identity
     # 覆写 correlation.user_id（保留 CorrelationMiddleware 已设的其余字段）——
     # 审计 to_dict 的 actor 由此自动落成已验证身份。
