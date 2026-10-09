@@ -245,24 +245,11 @@ class InterpPipeline:
 
     # ---- 主循环 ----
     def _tempo_tick(self) -> None:
-        """播放水位→变速档决策点（每单元出队后一次；tempo 未装配=no-op 逐字节）。
+        """播放水位→变速档决策点（tempo 域实现见 auto_tempo.tempo_tick；
+        每单元出队后一次，tempo 未装配=no-op 逐字节——LOC 预算拆域）。"""
+        from .auto_tempo import tempo_tick
 
-        积压估计=FIFO 深度×近期句均时长（指数均值，TTS 侧逐流实测回灌，初值
-        2.5s，见 auto_tempo.TempoController）；档位升级一次一档、降级需保持满
-        hold_s 且积压低于进入阈值×0.7（退出滞回）。变速的音频应用在 TTS 侧
-        （frame_transform 注入），本点只做决策与档位观测。"""
-        tempo = self._tempo
-        if tempo is None:
-            return
-        depth = self.q.qsize()
-        prev_level = tempo.current.get("level", 0)
-        snap = tempo.resolve(tempo.backlog_estimate_ms(depth), depth, time.monotonic())
-        if snap["level"] != prev_level or snap["severe"]:
-            print(
-                f"[interp-lite] INTERP_TEMPO state={snap['state']} speed={snap['speed']} "
-                f"backlog_ms={snap['backlog_ms']:.0f} depth={depth}",
-                flush=True,
-            )
+        tempo_tick(self)
 
     async def run(self) -> None:
         while True:

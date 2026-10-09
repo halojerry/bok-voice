@@ -27,6 +27,7 @@ chase-controller 的稳定语义（代码自写，勿抄其标识符）：
 from __future__ import annotations
 
 import os
+import time
 from typing import Callable, Iterable
 
 import numpy as np
@@ -352,3 +353,25 @@ def build_tempo_controller() -> TempoController | None:
     speeds = parse_speeds(os.environ.get(_SPEEDS_ENV))
     hold_s = _env_float(_HOLD_ENV, DEFAULT_HOLD_S, min_v=0.0)
     return TempoController(thresholds_ms=thresholds, speeds=speeds, hold_s=hold_s)
+
+
+def tempo_tick(p) -> None:
+    """播放水位→变速档决策点（pipeline run 循环每单元出队后调用；tempo 未装配
+    =no-op 逐字节——决策体拆域进本模块保 pipeline LOC 预算）。
+
+    积压估计=FIFO 深度×近期句均时长（指数均值，TTS 侧逐流实测回灌，初值
+    2.5s）；档位升级一次一档、降级需保持满 hold_s 且积压低于进入阈值×0.7
+    （退出滞回）。变速的音频应用在 TTS 侧（frame_transform 注入），
+    本点只做决策与档位观测。"""
+    tempo = getattr(p, "_tempo", None)
+    if tempo is None:
+        return
+    depth = p.q.qsize()
+    prev_level = tempo.current.get("level", 0)
+    snap = tempo.resolve(tempo.backlog_estimate_ms(depth), depth, time.monotonic())
+    if snap["level"] != prev_level or snap["severe"]:
+        print(
+            f"[interp-lite] INTERP_TEMPO state={snap['state']} speed={snap['speed']} "
+            f"backlog_ms={snap['backlog_ms']:.0f} depth={depth}",
+            flush=True,
+        )
