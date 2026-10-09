@@ -100,7 +100,7 @@ def mix_noise(pcm: bytes, snr_db: float) -> bytes:
     sig = struct.unpack(f"<{n}h", pcm)
     rms = math.sqrt(sum(s * s for s in sig) / max(1, n)) or 1.0
     noise_rms = rms / (10 ** (snr_db / 20.0))
-    rng = random.Random(20260917)
+    rng = random.SystemRandom()  # 噪声注入（非加密语境，SystemRandom 系 Mimosa 弱随机清零）
     out = bytearray()
     for s in sig:
         v = int(s + rng.gauss(0.0, noise_rms))
