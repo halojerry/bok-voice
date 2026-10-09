@@ -19,6 +19,10 @@ extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor", "services/s2
 #     存量文件的存量行不追——G2 拆包新模块天然生在全量规则之下。
 # 2026-10-09 起 services（除 s2s fork，见 extend-exclude）纳入 ① 真 bug 类门
 # （ci.yml 路径表同款 select；存量读数零违规实证后落地）。
+#     2026-10-09 interp-lite 波(用户拍板档):新文件门扩 select
+#     +N/UP/B/C4/SIM/RUF(命名/写法现代化/bugbear/simplify/comprehension)——
+#     扩展面写在 ci.yml 新文件门一步(显式 --select 覆盖本处 select),本处
+#     select 保持 E/F/W/I 不动,存量零爆炸。
 # 改本 select 须同步 .github/workflows/ci.yml 两步与 .pre-commit-config.yaml。
 select = ["E", "F", "W", "I"]
 

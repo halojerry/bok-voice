@@ -39,13 +39,20 @@ jobs:
         # (存量不整体 reformat,治理计划定案;G2 拆包新模块天然生在全量规则下)。
         # vendored 树(tojyutping_vendor / services/s2s fork)不追风格——保持可对上游
         # diff;我们的自有码在 apps/packages/tools/scripts/services 下全量受检。
+        # 2026-10-09 interp-lite 波扩 select(+N/UP/B/C4/SIM/RUF,用户拍板档):
+        # 命名/写法现代化/真问题类(bugbear/simplify/comprehension)对新文件生效,
+        # 存量零爆炸。ignore 四类结构性误报:RUF001/002/003=中文注释仓的全角
+        # 标点(结构性,非债);RUF100=分层 select 下 noqa 卫生互斥(真 bug 层
+        # --select 子集会让另一层的 noqa 显"unused")。调 select 同步 pyproject。
         run: |
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
           ADDED=$(git diff --diff-filter=A --name-only "${BASE:-HEAD~1}...HEAD" -- '*.py' \
             | grep -v '^packages/core/bok_voice_core/tojyutping_vendor/' \
             | grep -v '^services/s2s/' || true)
           echo "new .py files: ${ADDED:-<none>}"
-          if [ -n "$ADDED" ]; then xargs ruff check --no-cache <<< "$ADDED"; fi
+          if [ -n "$ADDED" ]; then xargs ruff check --no-cache \
+            --select E,F,W,I,N,UP,B,C4,SIM,RUF \
+            --ignore RUF001,RUF002,RUF003,RUF100 <<< "$ADDED"; fi
       - name: Run pytest
         run: python -m pytest -q tests/
       - name: Scripts import smoke (G1c)
