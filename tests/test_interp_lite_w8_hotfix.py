@@ -104,22 +104,30 @@ def test_len_fuse_word_boundary_iron_gate():
 
 
 def test_dunhao_tier_needs_more_units_than_comma(monkeypatch):
-    """顿号权重低于逗号：同形状 9 单位逗号即切、顿号不切；攒满 12 单位顿号才切。"""
+    """顿号永不切（2026-10-09 call-743064ad 终版）：同形状 9 单位逗号即切；
+    顿号无论攒多少单位都不在顿号处切（列举流防饿死由长度保险丝承担），
+    顿号后的第一个真标点照常接手。"""
     monkeypatch.delenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", raising=False)
     monkeypatch.delenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", raising=False)  # 缺省 8
     now = 100.0
     # 逗号：9 内容单位 ≥ 8 → 切（prev 含标点=跨 interim 稳定姿势）。
     prev_c = "我们看一下苹果香蕉，"
     assert da._find_clause_cut("我们看一下苹果香蕉，帮我", 0, prev_c, last_commit_at=0.0, now=now) == 10
-    # 顿号：列举符不是句界，9 单位 < 12 → 不切（列举不碎切）。
+    # 顿号：9 单位 → 不切。
     prev_d = "我们看一下苹果香蕉、"
     assert da._find_clause_cut("我们看一下苹果香蕉、帮我", 0, prev_d, last_commit_at=0.0, now=now) is None
-    # 攒满 12 单位：顿号照切（防饿死仍有出口）。
+    # 攒满 12+ 单位：顿号仍不切（永不）——列举符不是句界。
     long_prev = "今天下午三点我们在大会议室开产品评审会、"
     assert da._find_clause_cut(
         "今天下午三点我们在大会议室开产品评审会、然后", 0, long_prev,
         last_commit_at=0.0, now=now,
-    ) == 20
+    ) is None
+    # 顿号列举后接逗号：真标点边界照常提交（列举整体跨过顿号；17=逗号后排他位）。
+    list_prev = "我们支持中文、英语、芬兰语、韩语，"
+    assert da._find_clause_cut(
+        "我们支持中文、英语、芬兰语、韩语，还有更多", 0, list_prev,
+        last_commit_at=0.0, now=now,
+    ) == 17
 
 
 def test_len_fuse_yields_when_punct_in_sight(monkeypatch, capsys):

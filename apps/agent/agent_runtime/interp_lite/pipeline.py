@@ -46,6 +46,12 @@ from ..interpret import (
     _mt_lang_guard_enabled,
 )
 from .providers.mt_deepseek import DeepSeekMT, build_messages
+from .turn_stream import (
+    TurnStream,
+    _turn_coalesce_enabled,
+    arm_tail_flush,
+    maybe_tail_flush,
+)
 from .voice_tags import TagGate
 
 _SENT_TIMEOUT_S = 15.0
@@ -129,8 +135,13 @@ class InterpPipeline:
         self._spec = None
         self._tail_flush = None
         self._flush_tasks: set = set()  # 在途催尾观察者任务（shutdown 收线用）
-        self._playout_watchers = {"n": 0}  # 播放观察者在途计数（run 循环催尾让位闸）
+        self._playout_watchers = {"n": 0}  # 播放观察者在途计数（belt 域见 turn_stream）
         self._active_pump: asyncio.Task | None = None  # 在途 MT 泵（收线 cancel 用）
+        # 话轮聚合开流（2026-10-09 call-743064ad 断断续续根修）：一条 say 流吃
+        # 整个话轮——逐句「flush 握手+锁交接」2-3.5s 税归零。机器件=turn_stream
+        # 模块（开流/进料/收口钟/催产/belt）；BOK_INTERP_TURN_COALESCE=0 回旧径。
+        self._turn_mode = _turn_coalesce_enabled()
+        self._turn = TurnStream(self)
         # 轮尾催尾通道（TTS 在场才装配；MiniMax bidi 专用，其他 provider 无害跳过）
         if tts_provider is not None and _tail_flush_enabled():
             from .providers.tts_minimax import tail_flush_channel
@@ -192,16 +203,25 @@ class InterpPipeline:
         self._enq.append(time.perf_counter())
 
     def shutdown(self) -> None:
-        """收线卫生：投机在途任务 + MT 泵 + 催尾观察者 cancel（绝不外抛；无=no-op）。
-
-        泵/观察者被 cancel 后由各自 finally 兜底（哨兵入 buf/关流/计数回落），
-        绝不悬挂。"""
+        """收线卫生：话轮收口 + 投机在途任务 + MT 泵 + 催尾观察者 cancel（绝不
+        外抛；无=no-op）。泵/观察者被 cancel 后由各自 finally 兜底（哨兵入 buf/
+        关流/计数回落），绝不悬挂。"""
+        self._turn.close_now()
         if self._spec is not None:
             self._spec.cancel("shutdown")
         self._cancel_active_pump()
         for t in tuple(self._flush_tasks):
             if not t.done():
                 t.cancel()
+
+    # ---- 出声单点路由（聚合开=进本话轮流；聚合关=旧径逐句 say）----
+    def _say_text(self, text: str) -> None:
+        if not self._turn_mode:
+            self._last_say = self.session.say(text)
+            arm_tail_flush(self, self._last_say)
+            return
+        self._turn.open()
+        self._turn.put(text)
 
     def _cancel_active_pump(self) -> None:
         """在途 MT 泵就地收线（run 被 cancel/流挂死超时/say 提交失败）。
@@ -230,16 +250,17 @@ class InterpPipeline:
                 int((time.perf_counter() - t_enq) * 1000) if t_enq is not None else 0
             )
             self.round += 1
+            self._turn.cancel_close()  # 新单元到达=话轮未完,撤收口钟续流
             t0 = time.perf_counter()
             try:
                 if self.lane_dead["reason"]:
-                    self.session.say(_mt_fail_line(self.target_lang))
+                    self._say_text(_mt_fail_line(self.target_lang))
                     self._done(0)
                     continue
                 # spec HIT 预计算文本（跳 MT 直走 TTS 合成保播放序——同类型 say 串行）。
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__precomputed__":
                     _, pre_text = item
-                    self.session.say(pre_text)
+                    self._say_text(pre_text)
                     self.pairs.append((pre_text, pre_text))
                     continue
                 text = item
@@ -248,7 +269,7 @@ class InterpPipeline:
                     await self._translate_say(text, t0)
                 finally:
                     self.mt_busy["flag"] = False
-                await self._maybe_tail_flush()
+                await maybe_tail_flush(self)
             except asyncio.CancelledError:
                 self._cancel_active_pump()  # 收线：在途泵就地 cancel（哨兵/关流由 finally 兜）
                 raise
@@ -265,66 +286,15 @@ class InterpPipeline:
                     )
                 await self._fallback_say(f"error {exc!r}")
             finally:
+                # 话轮收口排程（finally 位=lanedead/precomputed 的 continue 路也覆盖；
+                # 钟到点再核 FIFO/MT 闲，误排无害；新单元到达由循环顶撤钟）。
+                self._turn.schedule_close()
                 self.q.task_done()
-
-    # ---- 轮尾催尾：FIFO 空+当前 say 排干+未被取消，向 bidi 连接催一枚 task_flush ----
-    async def _maybe_tail_flush(self) -> None:
-        """催无标点短尾（P1 实测省 ~2.1s：免等 MiniMax 官方无标点兜底窗）。
-
-        四道闸缺一不发：通道在场（env/TTS 装配）、FIFO 空（有后句=下一句的
-        continue 自然催）、真 MT 不在途、当前 say 未被取消（取消流 recv 已死，
-        迟到的 task_flushed 会毒化下一流的接收循环）。发送本身由通道守卫
-        （连接不在场/死亡/异常一律静默 no-op）。"""
-        flush = self._tail_flush
-        if flush is None or not self.q.empty():
-            return
-        if self._playout_watchers["n"]:
-            return  # 播放观察者在途（真 SpeechHandle 装配）：催尾由观察者在 playout 落地点负责
-        if self.mt_busy["flag"] or self.lane_dead["reason"]:
-            return
-        if getattr(self._last_say, "interrupted", False):
-            return
-        try:
-            await flush()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - 纯增益，绝不成为新故障源
-            pass
-
-    def _arm_tail_flush(self, handle) -> None:
-        """播放落地观察者（真 SpeechHandle 装配）：``wait_for_playout`` 面在场才武装。
-
-        催尾的安全时点=playout 落地（本句文本推送已完成、recv 在 flushed 等待窗）
-        ——泵排干（run 推进点）播放才刚排队，提前催尾会毒化 bidi flushed 握手
-        （sentences=0 族）。句柄本地捕获（无 ``_last_say`` 回调竞态）+newest
-        护栏（被更新单元接棒即让位，恒至多一枚活催尾）；被打断不催（取消流
-        recv 已死，迟到 ack 毒化下一流）。fake/无该面=不武装，run 循环旧位兜底
-        （测试与直嵌姿势零漂移）。"""
-        wait = getattr(handle, "wait_for_playout", None)
-        if self._tail_flush is None or not callable(wait):
-            return
-        self._playout_watchers["n"] += 1
-
-        async def _watch() -> None:
-            try:
-                try:
-                    await wait()
-                except asyncio.CancelledError:
-                    return
-                except Exception:  # noqa: BLE001 - 观察者纯增益，绝不外抛
-                    return
-            finally:
-                self._playout_watchers["n"] -= 1  # 先落计数再判闸（自身不挡自己）
-            if handle is not self._last_say or getattr(handle, "interrupted", False):
-                return  # 已被更新单元接棒/被掐：让位（四道闸语义与 run 旧位同判）
-            await self._maybe_tail_flush()
-
-        task = asyncio.create_task(_watch())
-        self._flush_tasks.add(task)
-        task.add_done_callback(self._flush_tasks.discard)
 
     # ---- 单句：流式 say；gate/error_pre 回退整句重开流 ----
     async def _translate_say(self, text: str, t0: float) -> None:
+        if self._turn_mode:
+            return await self._translate_say_turn(text, t0)
         msgs = build_messages(self.instructions, list(self.pairs), text)
         out = {"state": "clean", "yielded": False}
         gate = TagGate()
@@ -426,7 +396,7 @@ class InterpPipeline:
             print(f"[interp-lite] MT_STREAM say submit failed {exc!r}", flush=True)
             self._cancel_active_pump()  # 旧版此处漏 cancel=泵带流悬挂
             return await self._retry_once_say(text, msgs, t0)
-        self._arm_tail_flush(self._last_say)
+        arm_tail_flush(self, self._last_say)
 
         # 等**泵排干（MT 完成）**即推进 FIFO（W8 播放解耦）——等 **Event** 而非
         # pump_task：泵被 gen 收尾/超时 cancel 时 CancelledError 只落在泵内，run
@@ -451,7 +421,7 @@ class InterpPipeline:
             if not out["yielded"]:
                 # clean 但零 yield（极端短流兜底）：整句出声，一次配对。
                 self._last_say = self.session.say(self._final_text(translated))
-                self._arm_tail_flush(self._last_say)  # 接棒观察者（gen 观察者被 newest 护栏让位）
+                arm_tail_flush(self, self._last_say)  # 接棒观察者（gen 观察者被 newest 护栏让位）
             self.pairs.append((text, translated))
             self._done(int((time.perf_counter() - t0) * 1000))
             return
@@ -462,8 +432,116 @@ class InterpPipeline:
         print(f"[interp-lite] MT_STREAM fallback state={out['state']} round={self.round}", flush=True)
         await self._retry_once_say(text, msgs, t0)
 
+    async def _translate_say_turn(self, text: str, t0: float) -> None:
+        """话轮聚合档（BOK_INTERP_TURN_COALESCE=1）：与 `_translate_say` 同状态
+        机（语言门/TagGate/超时分类/回退路径逐款同判），唯一分叉=产物不进本句
+        私有 buf+逐句 say，而是直进**本话轮开着的流**（`_turn_put`）——一条
+        bidi 流吃掉整个话轮，逐句握手税归零（call-743064ad 断断续续根修）。
+        流尽哨兵不存在（收口由 run 循环的收口钟负责）。"""
+        msgs = build_messages(self.instructions, list(self.pairs), text)
+        out = {"state": "clean", "yielded": False}
+        gate = TagGate()
+        raw: list[str] = []
+        guard_on = _mt_lang_guard_enabled()
+        lang = self.target_lang
+        head = ""
+        self._turn.open()  # 先开流再起泵：首 delta 到时流已在等
+        pump_done = asyncio.Event()
+        first = {"done": False}
+
+        def _emit(piece: str) -> str | None:
+            nonlocal head
+            if first["done"]:
+                return piece
+            head += piece
+            if len(head.strip()) < _FIRST_PIECE_MIN_CHARS:
+                return None
+            if guard_on and lang and not _looks(head, lang):
+                out["state"] = "gate"
+                raise _GateFailError(head)
+            first["done"] = True
+            self.first_ms["ms"] = int((time.perf_counter() - t0) * 1000)
+            return head
+
+        async def _pump():
+            stream = None
+            try:
+                stream = self.mt.stream(msgs)
+                deadline = time.monotonic() + _SENT_TIMEOUT_S
+                async for delta in stream:
+                    if time.monotonic() > deadline:
+                        out["state"] = "error_mid" if out["yielded"] else "error_pre"
+                        print(f"[interp-lite] MT_STREAM deadline state={out['state']}", flush=True)
+                        break
+                    if not delta:
+                        continue
+                    raw.append(delta)
+                    piece = gate.feed(delta)
+                    if not piece:
+                        continue
+                    verdict = _emit(piece)
+                    if verdict is None:
+                        continue
+                    out["yielded"] = True
+                    self._turn.put(verdict)
+                if out["state"] == "clean":
+                    tail = gate.flush()
+                    if tail:
+                        verdict = _emit(tail)
+                        if verdict is not None:
+                            out["yielded"] = True
+                            self._turn.put(verdict)
+            except _GateFailError:
+                pass  # state 已置 gate；已进流的片段照播（同旧档语义），余下走回退
+            except asyncio.CancelledError:
+                out["state"] = "error_mid" if out["yielded"] else "error_pre"
+                raise
+            except Exception as exc:  # noqa: BLE001
+                out["state"] = "error_mid" if out["yielded"] else "error_pre"
+                print(f"[interp-lite] MT_STREAM err state={out['state']} {exc!r}", flush=True)
+            finally:
+                pump_done.set()
+                if stream is not None:
+                    aclose = getattr(stream, "aclose", None)
+                    if aclose is not None:
+                        with contextlib.suppress(Exception):
+                            await aclose()
+
+        pump_task = asyncio.create_task(_pump())
+        self._active_pump = pump_task
+
+        try:
+            await asyncio.wait_for(
+                pump_done.wait(), timeout=_SENT_TIMEOUT_S + _SENT_TIMEOUT_GRACE_S
+            )
+        except asyncio.TimeoutError:
+            out["state"] = "error_mid" if out["yielded"] else "error_pre"
+            print(f"[interp-lite] MT_STREAM deadline state={out['state']}", flush=True)
+            self._cancel_active_pump()
+        self._active_pump = None
+
+        if out["state"] in ("clean", "error_mid"):
+            translated = "".join(raw).strip()
+            self._cache_log()
+            if not translated:
+                self._drop()
+                print(f"[interp-lite] mt empty for {len(text)} chars, skipped", flush=True)
+                return
+            if not out["yielded"]:
+                # clean 但零 yield（极端短流兜底）：整句进本话轮流。
+                self._say_text(self._final_text(translated))
+            self.pairs.append((text, translated))
+            self._done(int((time.perf_counter() - t0) * 1000))
+            return
+        if out["state"] == "gate":
+            print(f"[interp-lite] MT_STREAM fallback state=gate round={self.round}", flush=True)
+            return await self._retry_once_say(text, msgs, t0)
+        print(f"[interp-lite] MT_STREAM fallback state={out['state']} round={self.round}", flush=True)
+        await self._retry_once_say(text, msgs, t0)
+
     async def _retry_once_say(self, text: str, msgs: list[dict], t0: float) -> None:
-        """整句回退（新开流排干→语言复查→整句 say；至多一次，无循环重试）。"""
+        """整句回退（新开流排干→语言复查→整句出声；至多一次，无循环重试）。
+        出声走 `_say_text` 单点路由（聚合开=进本话轮流，聚合关=逐句 say）。"""
         translated = await _collect(self.mt, msgs, _SENT_TIMEOUT_S)
         if not translated:
             self._drop()
@@ -474,8 +552,7 @@ class InterpPipeline:
                 f"[interp-lite] MT_LANG_MISMATCH retry target={self.target_lang} emit-as-is",
                 flush=True,
             )
-        self._last_say = self.session.say(self._final_text(translated))
-        self._arm_tail_flush(self._last_say)  # 整句直念也接棒观察者（newest 护栏让位旧泵观察者）
+        self._say_text(self._final_text(translated))
         self.pairs.append((text, translated))
         self.first_ms["ms"] = 0
         self._done(int((time.perf_counter() - t0) * 1000))
@@ -490,10 +567,11 @@ class InterpPipeline:
         return g.feed(translated) + g.flush()
 
     async def _fallback_say(self, why: str) -> None:
-        """超时/异常兜底：目标语请示句出声+配对记账（绝不回放源文）。"""
+        """超时/异常兜底：目标语请示句出声+配对记账（绝不回放源文）。
+        出声走 `_say_text` 单点路由（聚合档进本话轮流）。"""
         print(f"[interp-lite] MT_FALLBACK {why} lang={self.target_lang}", flush=True)
         try:
-            self.session.say(_mt_fail_line(self.target_lang))
+            self._say_text(_mt_fail_line(self.target_lang))
             self._done(0)
         except Exception as say_exc:  # noqa: BLE001 - 兜底不出声也不阻后续
             self._drop()

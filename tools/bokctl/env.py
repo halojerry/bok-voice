@@ -820,9 +820,15 @@ _FORWARD_ENV = (
     #    BOK_INTERP_SPEC_RIGHT_CTX 投机开火右上下文门字数（spec_mt.py，缺省 2，
     #    0=关回旧线无右上下文档）；
     #    BOK_INTERP_TAIL_FLUSH 轮尾 task_flush 催尾总闸（pipeline.py，缺省 1，
-    #    0=旧路径逐字节——排干后零额外动作）。 ——
+    #    0=旧路径逐字节——排干后零额外动作）。
+    # —— 话轮聚合开流（2026-10-09 call-743064ad 断断续续根修）：
+    #    BOK_INTERP_TURN_COALESCE 一条 say 流吃整个话轮（缺省 0=保守旧径；
+    #    B 线 worker env 缺省 1 见 _interp_env——逐句握手税 2-3.5s/句归零）；
+    #    BOK_INTERP_TURN_HOLD_S 话轮收口保持窗秒（pipeline.py，缺省 1.8）。 ——
     "BOK_INTERP_SPEC_RIGHT_CTX",
     "BOK_INTERP_TAIL_FLUSH",
+    "BOK_INTERP_TURN_COALESCE",
+    "BOK_INTERP_TURN_HOLD_S",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
@@ -1111,4 +1117,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
         if mt_model:
             env["MT_LLM_MODEL"] = mt_model
+    # 话轮聚合开流（2026-10-09 call-743064ad 断断续续根修）：B 线缺省 1——
+    # 一条 say 流吃整个话轮（逐句握手税 2-3.5s/句归零）；缺省旧径键姿势见
+    # _FORWARD_ENV 注释。BOK_INTERP_TURN_HOLD_S 不 setdefault（pipeline 内
+    # 缺省 1.8s，显式 env 可调）。
+    env.setdefault("BOK_INTERP_TURN_COALESCE", "1")
     return env

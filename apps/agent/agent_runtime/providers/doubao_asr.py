@@ -47,8 +47,8 @@
 - **切口质量（W8-B 2026-10-09，call-fa95543a「mini Max 开」劈词）**：提交闸
   字数门改内容单位计（``_clause_content_units``：CJK 逐字、拉丁/数字 run 计 1 词
   ——拉丁逐字计权虚增让字数闸形同虚设）；``_len_fuse_cut`` 词界铁闸=ASCII run
-  原子消费（切点结构性不可能落 run 中间）；顿号（、）权重压到逗号之下
-  （攒满 ``_DUNHAO_COMMIT_MIN_UNITS`` 内容单位才切——顿号是列举符不是句界）；
+  原子消费（切点结构性不可能落 run 中间）；顿号（、）永不切（2026-10-09
+  call-743064ad 拍板：列举符不是句界，旧 ≥12 单位档仍碎切语言列表）；
   长度保险丝降级为防饿死兜底（余段有真标点在望绝不硬剁，``_remainder_has_punct``
   让位等标点档；缺省 20 单位不变）。
 
@@ -93,10 +93,11 @@ _END_WINDOW_WATCHDOG_TICK_S = 0.25
 # ~10s（final_timeout+4）≈16s——20s 恒不误伤合法收段，只兜「永不落地」的楔死。
 # 常量不设 env（互斥是结构正确性不值得运营面；单测 monkeypatch 提速）。
 _FIN_AWAIT_TIMEOUT_S = 20.0
-# 顿号档（W8-B 切口质量）：顿号=列举符不是句界——与逗号同门槛会把「A、B、C、」
-# 列举切成机关枪碎片。攒满本档内容单位才在顿号处切（任务定档 12-16 取 12；
-# 与逗号档取 max=运营抬逗号档时顿号档跟随）。
-_DUNHAO_COMMIT_MIN_UNITS = 12
+# 顿号（W8-B 切口质量 → 2026-10-09 call-743064ad 终版）：顿号=列举符不是句界，
+# **永不作为提交边界**（旧 ≥12 单位档仍把 52 字语言列表剁 4 刀切出孤儿碎片）。
+# 列举长流防饿死由长度保险丝承担（词界安全就地切，不靠顿号）。
+# 常量退役保留墓碑防复活引用。
+_DUNHAO_COMMIT_MIN_UNITS = None
 
 # 火山 SAUC 二进制帧（V3 协议族；官方 demo protocol.py 语义）
 MSG_FULL_CLIENT_REQ = 0b0001
@@ -226,7 +227,7 @@ def _find_clause_cut(
     """说话中子句级提交闸（A 线 ``_sentence_boundary`` 标点档移植——纯函数，
     实现单点 import ``livekit_plugins`` 纯函数族，**禁止第二份**）。
 
-    扫 ``[start:]`` 找第一个过全部门的标点边界（强句 。！？!? 或子句 ，、；,;），
+    扫 ``[start:]`` 找第一个过全部门的标点边界（强句 。！？!? 或子句 ，；,;），
     返回边界后坐标（排他）或 None。门（参数沿 A 线语义，缺一不可）：
     - 限速：距上次提交 < ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S``（B 线 worker
       env=1.0；A 线缺省 1.5——本闸只在 clause_commit 流生效）不提交；
@@ -234,8 +235,10 @@ def _find_clause_cut(
       run 计 1 词——拉丁逐字计权虚增让闸形同虚设，实弹切出「mini Max 开」劈词）：
       强句边界候选 ≥ ``_ASR_SENTENCE_MIN_CHARS``(6)；逗号/分号类子句边界 ≥
       ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS``（B 线 worker env=6）；**顿号（、）
-      权重低于逗号** ≥ max(逗号档, ``_DUNHAO_COMMIT_MIN_UNITS``)=12 单位起
-      （列举符不是句界，防机关枪碎片）；
+      永不切**（2026-10-09 call-743064ad Ethan 拍板：顿号=列举符不是句界，
+      语言列表「中文、英语、芬兰…」被切成孤儿碎片直译不通——旧 ≥12 单位档
+      仍把 52 字列表剁 4 刀。列举长流的防饿死由长度保险丝承担（词界安全就地
+      切，不靠顿号））；
     - 数字 run 保护：候选段含 ≥4 位连续 ASCII 字母/数字 run（单号/号码高危）
       → 该边界不切、继续往后扫同段必再败 → 整段留给 EOS 尾巴兜底；
     - 跨 interim 稳定：上一 interim 全文同坐标与当前逐字一致（首现不提交，
@@ -257,7 +260,9 @@ def _find_clause_cut(
     i = start
     while i < len(text):
         strong = text[i] in _SENTENCE_STRONG_PUNCT
-        weak = text[i] in _SENTENCE_WEAK_PUNCT
+        # 顿号（、）=列举符不是句界——永不作为提交边界（call-743064ad 拍板），
+        # 从弱标点集合里排除后继续扫后面的真边界。
+        weak = text[i] in _SENTENCE_WEAK_PUNCT and text[i] != "、"
         if strong or weak:
             punct = _SENTENCE_STRONG_PUNCT if strong else _SENTENCE_WEAK_PUNCT
             j = i + 1
@@ -265,9 +270,6 @@ def _find_clause_cut(
                 j += 1
             if strong:
                 min_chars: int = _ASR_SENTENCE_MIN_CHARS
-            elif text[i] == "、":
-                # 顿号档：列举符权重低于逗号——攒满 12 单位才切（W8-B）。
-                min_chars = max(_clause_commit_min_chars(), _DUNHAO_COMMIT_MIN_UNITS)
             else:
                 min_chars = _clause_commit_min_chars()
             sentence = text[start:j]
@@ -308,9 +310,10 @@ def _remainder_has_punct(text: str, start: int) -> bool:
     """未提交余段是否存在「够得着」的标点边界（纯函数，W8-B「有标点优先等标点」）。
 
     够得着=边界前已攒够对应档的内容单位（强句 ≥``_ASR_SENTENCE_MIN_CHARS``、
-    逗号/分号 ≥逗号档、顿号 ≥``_DUNHAO_COMMIT_MIN_UNITS``）——只对这些边界让
-    位：真标点在望时绝不在无标点处硬剁（长度保险丝降级为防饿死兜底；实弹靶形
-    「Mini Max 开放平台 API 接口能力概览，」逗号前 21 单位够格却被 10 字硬剁）。
+    逗号/分号 ≥逗号档）——只对这些边界让位：真标点在望时绝不在无标点处硬剁
+    （长度保险丝降级为防饿死兜底；实弹靶形「Mini Max 开放平台 API 接口能力
+    概览，」逗号前 21 单位够格却被 10 字硬剁）。**顿号不算在望**（永不切，
+    call-743064ad 拍板——否则保险丝被顿号永久压制=纯列举流饿死）。
     门槛之下的早标点（「好的，」2 单位）结构性永远过不了标点档、不算在望——
     否则保险丝被永久废掉=防饿死本职失守（无标点长流重新饿死）。"""
     from .livekit_plugins import (  # noqa: PLC0415 - 懒 import：保持轻导入面
@@ -321,16 +324,12 @@ def _remainder_has_punct(text: str, start: int) -> bool:
     )
 
     comma_min = _clause_commit_min_chars()
-    dunhao_min = max(comma_min, _DUNHAO_COMMIT_MIN_UNITS)
     n = 0
     for ch in text[start:]:
         if ch in _SENTENCE_STRONG_PUNCT:
             if n >= _ASR_SENTENCE_MIN_CHARS:
                 return True
-        elif ch == "、":
-            if n >= dunhao_min:
-                return True
-        elif ch in _SENTENCE_WEAK_PUNCT:
+        elif ch in _SENTENCE_WEAK_PUNCT and ch != "、":
             if n >= comma_min:
                 return True
         elif not ch.isspace() and not unicodedata.category(ch).startswith("P"):

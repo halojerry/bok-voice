@@ -654,10 +654,12 @@ def test_bidi_first_audio_timeout_env(monkeypatch):
 
 def test_bidi_stall_watchdog_reconnects_and_resends(monkeypatch, capsys):
     """首段文本发出后 1s 无首包 → MINIMAX_TTS_BIDI_STALL:弃旧连接、新连接上
-    单条合并重发已发文本、认领纪元、首包计时复位,音频恢复推送,后续文本落新连接。"""
+    单条合并重发已发文本、认领纪元、首包计时复位,音频恢复推送,后续文本落新连接。
+    （2026-10-09 话轮聚合语义版:流开着时到达的 flush ack=中途催尾不收摊——
+    收尾 ack 须在 end_input 的收尾 flush 之后注入。）"""
     monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "1")
     ws1 = _FakeWS([_CONNECTED, _STARTED])  # 僵死:握手后永远不出音频
-    ws2 = _FakeWS([_CONNECTED, _STARTED, _AUDIO, _FLUSHED])
+    ws2 = _QueueWS()
     fake_connect = _FakeConnect([ws1, ws2])
     monkeypatch.setattr("websockets.connect", fake_connect)
     tts = _make_tts()
@@ -679,10 +681,16 @@ def test_bidi_stall_watchdog_reconnects_and_resends(monkeypatch, capsys):
         ), f"新连接应单条合并重发已发文本: {_continue_texts(ws2)}"
         assert _events(ws2)[:2] == ["task_start", "task_continue"], _events(ws2)
         assert session.active_epoch == 1, "重发应认领本流纪元"
+        # 首包到达(计时复位的 PERF 由它触发)。
+        ws2.server_push(_AUDIO)
         # 重连后新文本直落新连接(闸清、闭包重绑)
         s.push_text("再见")
         assert await _wait_for(lambda: "再见" in _continue_texts(ws2), timeout=5), _continue_texts(ws2)
         s.end_input()
+        assert await _wait_for(
+            lambda: "task_flush" in _events(ws2), timeout=5
+        ), f"end_input 应发收尾 flush: {_events(ws2)}"
+        ws2.server_push(_FLUSHED)  # 收尾 ack(stream_ended=True)→收摊
         await _wait_for(lambda: s._task.done(), timeout=10)
         async for a in s:
             got["audio"] += bytes(a.frame.data)

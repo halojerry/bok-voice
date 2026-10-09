@@ -401,21 +401,21 @@ def test_tail_flush_gates_busy_and_interrupted(monkeypatch):
 
     async def scenario():
         p.enqueue_raw("占位")  # FIFO 非空
-        await p._maybe_tail_flush()
+        from agent_runtime.interp_lite.turn_stream import maybe_tail_flush as _mtf; await _mtf(p)
         assert calls == []
         p.q.get_nowait()
         p.mt_busy["flag"] = True  # 真 MT 在途
-        await p._maybe_tail_flush()
+        from agent_runtime.interp_lite.turn_stream import maybe_tail_flush as _mtf; await _mtf(p)
         assert calls == []
         p.mt_busy["flag"] = False
         p._last_say = _InterruptedHandle()  # 当前 say 被取消
-        await p._maybe_tail_flush()
+        from agent_runtime.interp_lite.turn_stream import maybe_tail_flush as _mtf; await _mtf(p)
         assert calls == []
         p._last_say = None
-        await p._maybe_tail_flush()
+        from agent_runtime.interp_lite.turn_stream import maybe_tail_flush as _mtf; await _mtf(p)
         assert calls == [1]
         p.lane_dead["reason"] = "x"
-        await p._maybe_tail_flush()
+        from agent_runtime.interp_lite.turn_stream import maybe_tail_flush as _mtf; await _mtf(p)
         assert calls == [1]
 
     asyncio.run(scenario())
@@ -899,8 +899,9 @@ def test_w8b_shutdown_cancels_pump_and_watchers(monkeypatch):
 
 
 def test_w8b_tail_flush_watcher_fires_at_playout_done(monkeypatch):
-    """真 SpeechHandle 形状：催尾只在 playout 落地后发（泵排干≠文本推送完成，
-    提前催尾毒化 bidi flushed 握手）；run 循环位被观察者在途闸压制。"""
+    """真 SpeechHandle 形状（2026-10-09 话轮聚合配套契约更新）：泵排干+FIFO 空
+    +MT 闲即催——不再等 playout（bidi 侧 stream_ended 门禁已把中途催尾 ack
+    无害化，提前催=更快出尾声）；playout 落地后观察者 belt 至多再催一枚。"""
     monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
     monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
     mt = FakeMT([iter(["第一句译文够长。"])])
@@ -923,14 +924,14 @@ def test_w8b_tail_flush_watcher_fires_at_playout_done(monkeypatch):
             if sess.gens and p.q.empty() and not p.mt_busy["flag"]:
                 break
             await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)
-        assert calls == []  # 泵已排干但 playout 未落地：不催（毒化窗口）
-        sess.handles[0].release()
-        for _ in range(100):
+        for _ in range(100):  # run 位：泵排干即催（无需 playout 落地）
             if calls:
                 break
             await asyncio.sleep(0.01)
-        assert calls == [1]  # playout 落地=恰一枚
+        assert calls == [1]
+        sess.handles[0].release()  # playout 落地：belt 至多再一枚
+        await asyncio.sleep(0.05)
+        assert 1 <= len(calls) <= 2
         task.cancel()
         with _suppress_cancel():
             await task
@@ -939,8 +940,8 @@ def test_w8b_tail_flush_watcher_fires_at_playout_done(monkeypatch):
 
 
 def test_w8b_tail_flush_newest_guard_and_interrupted(monkeypatch):
-    """旧句 playout 落地时已被新句接棒=让位不催；最新句被掐=不催；恒至多一枚
-    活催尾（前兵回调版竞态下会对错误句柄判闸=提前毒化）。"""
+    """旧句 playout 落地时已被新句接棒=让位不催；最新句被掐=不催（belt 观察者
+    语义不变）；run 位催尾只在 FIFO 空时发——有后句在队期间零催。"""
     monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
     monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
     mt = FakeMT([iter(["第一句译文够长。"]), iter(["第二句译文够长。"])])
@@ -965,14 +966,13 @@ def test_w8b_tail_flush_newest_guard_and_interrupted(monkeypatch):
                 break
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)
-        assert calls == []
-        sess.handles[0].release()  # 旧句落地：已被新句接棒 → 让位
+        assert calls == [1]  # 两句在队期间零催；第二句排干后 run 位恰一枚
+        sess.handles[0].release()  # 旧句落地：已被新句接棒 → belt 让位
         await asyncio.sleep(0.05)
-        assert calls == []
-        sess.handles[1].interrupted = True  # 最新句被掐：不催
+        sess.handles[1].interrupted = True  # 最新句被掐：belt 不催
         sess.handles[1].release()
         await asyncio.sleep(0.05)
-        assert calls == []
+        assert calls == [1]
         assert p._playout_watchers["n"] == 0  # 两观察者都已退场
         task.cancel()
         with _suppress_cancel():
@@ -983,7 +983,7 @@ def test_w8b_tail_flush_newest_guard_and_interrupted(monkeypatch):
 
 def test_w8b_tail_flush_zero_yield_text_say_takes_over(monkeypatch):
     """零 yield 整句直念接棒：text 句柄成为 newest——gen 句柄先落地让位、text
-    句柄落地才催且恰一枚（重试/整句路同样接棒观察者）。"""
+    句柄落地 belt 至多再一枚（run 位已催过；重试/整句路同样接棒观察者）。"""
     monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
     monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
     mt = FakeMT([iter(["好。"])])  # 2 字 < 软证据窗 → 零 yield → 整句直念
@@ -1006,17 +1006,17 @@ def test_w8b_tail_flush_zero_yield_text_say_takes_over(monkeypatch):
             if len(sess.handles) >= 2 and p.q.empty() and not p.mt_busy["flag"]:
                 break
             await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)
-        assert calls == [] and p._playout_watchers["n"] == 2  # gen+text 双观察者
-        sess.handles[0].release()  # gen 句柄落地：已被 text 接棒 → 让位
-        await asyncio.sleep(0.05)
-        assert calls == []
-        sess.handles[1].release()  # text 句柄落地：催一枚
         for _ in range(100):
             if calls:
                 break
             await asyncio.sleep(0.01)
+        assert calls == [1] and p._playout_watchers["n"] == 2  # gen+text 双观察者
+        sess.handles[0].release()  # gen 句柄落地：已被 text 接棒 → belt 让位
+        await asyncio.sleep(0.05)
         assert calls == [1]
+        sess.handles[1].release()  # text 句柄落地：belt 至多再一枚
+        await asyncio.sleep(0.05)
+        assert 1 <= len(calls) <= 2
         task.cancel()
         with _suppress_cancel():
             await task

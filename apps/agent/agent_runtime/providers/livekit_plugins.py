@@ -5850,15 +5850,16 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                         f"owner={_owner} (ignored)",
                                         flush=True,
                                     )
-                            elif state.get("head_flush_pending"):
-                                # 头段催产 flush 的 ack(非收尾):唔收摊,recv 继续
-                                # 30s 等待窗照常吃余句音频。流已收尾(头段=整条
-                                # 回复)时,这次 ack 同时兼任收尾 ack。
+                            else:
+                                # 头段催产旗:ack 已到即消费(后续文本不再按头段等)。
                                 state["head_flush_pending"] = False
                                 if state.get("stream_ended"):
+                                    # 输入已尽:本 ack 兼任/就是收尾 ack → 收摊。
                                     self._flushed_evt.set()
-                            else:
-                                self._flushed_evt.set()
+                                # else:中途催尾 ack(话轮聚合流仍开着,2026-10-09
+                                # call-743064ad 断断续续根修配套)——服务器已被催出
+                                # 尾句,但本流还要接后续文本;绝不置 _flushed_evt
+                                #(0.5s 空闲早退会杀掉开着的流=逐句握手税回来了)。
                         elif event == "task_canceled":
                             session.flush_epoch = 0  # cancel 压过在途 flush 握手
                             self._canceled_evt.set()
