@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import time
 import uuid
 import wave
 from collections import defaultdict, deque
@@ -280,6 +281,16 @@ def _unsafe_open_bind(host: str, *, auth_on: bool, cp_token: str) -> bool:
     return (not auth_on) and (not (cp_token or "").strip()) and not _is_loopback_host(host)
 
 
+def _public_bind_user_auth_missing(host: str, *, auth_on: bool, insecure_ack: str = "") -> bool:
+    """W⑥-3 纯判定（离线可测，红队加固）：非回环 bind × 用户认证未开 × 未显式认账。
+
+    覆盖 _unsafe_open_bind 拦不住的形态：公网 bind + 仅设 BOK_CP_TOKEN——机器
+    通道活但 identity_gate 不开=全部用户端点匿名可达（唯一能真正绕过一切的
+    配置事故口）。BOK_INSECURE_PUBLIC_BIND=1 = 实验室档显式认账放行。
+    """
+    return (not auth_on) and not _is_loopback_host(host) and (insecure_ack or "").strip() != "1"
+
+
 def _cors_allow_origins(configured: list[str], host: str, *, auth_on: bool, cp_token: str) -> list[str]:
     """CORS 白名单（纯判定，同启动闸判据）：显式 BOK_CORS_ORIGINS 恒照用；否则
     裸放行 × 非回环不回落到 "*"（该形态 startup 会拒绝启动，这里是纵深防御——
@@ -516,6 +527,24 @@ def _startup() -> None:
     # 启动锚（Item 1）：非回环 bind × 双关 = 全 API 裸放行对外，拒绝启动。
     # 放在最前——先于 DB 迁移/种子，配置事故不落任何副作用。
     _bind_host = _resolved_bind_host()
+    # W⑥-3（2026-10-09 红队加固）收紧：非回环 bind × BOK_AUTH_REQUIRED 未开 →
+    # 拒启。原闸只拦「双关全空」——公网 bind + 仅设 BOK_CP_TOKEN 的 CP-token-only
+    # 形态会裸启（机器通道活但 identity_gate 不开=全部用户端点匿名可达），这是
+    # 唯一能真正绕过一切的配置事故口。显式 BOK_INSECURE_PUBLIC_BIND=1 放行
+    # （实验室档认账用）；BOK_INSECURE_PUBLIC_BIND 仅 CP 侧运营 env，不入
+    # _FORWARD_ENV（worker 不消费）。
+    if _public_bind_user_auth_missing(
+        _bind_host,
+        auth_on=auth_required(),
+        insecure_ack=os.environ.get("BOK_INSECURE_PUBLIC_BIND", ""),
+    ):
+        raise RuntimeError(
+            f"拒绝以用户面无认证形态对外监听：bind={_bind_host!r}（非回环）且 "
+            "BOK_AUTH_REQUIRED 未开——/api/* 用户端点将对所有网络可达者匿名开放"
+            "（BOK_CP_TOKEN 只覆盖机器通道，不开用户门禁）。云端/局域网部署必须 "
+            "BOK_AUTH_REQUIRED=1（+BOK_JWT_SECRET）；实验室刻意裸跑请显式设置 "
+            "BOK_INSECURE_PUBLIC_BIND=1 认账，或改回回环 bind（BOK_BIND_HOST=127.0.0.1）。"
+        )
     if _unsafe_open_bind(
         _bind_host, auth_on=auth_required(),
         cp_token=os.environ.get("BOK_CP_TOKEN", ""),
@@ -1540,6 +1569,8 @@ async def tts_preview(payload: dict, request: Request) -> Response:
     # 话务员的「输出设备指认」放行(RC-5 权限错配);minimax 族烧云端真金——维持
     # settings 管理面闸(与旧 auto_gate_management 同强度,interpret 话务员不可烧)。
     _gate_page_any(request, ("interpret",) if provider.startswith("qwen3") else ("settings",))
+    # W⑥-4：合成类烧钱面按账号限速（合法凭证重放烧配额的闸）。
+    _cost_rate_limit(request)
     sample_rate = int(payload.get("sample_rate") or 24000)
     text = str(payload.get("text") or "")
     voice = str(payload.get("voice") or "")
@@ -1893,6 +1924,42 @@ def _login_rate_limit(username: str) -> None:
     if len(dq) >= _LOGIN_RATE_LIMIT:
         raise HTTPException(status_code=429, detail="login rate limited (30/min per username)")
     dq.append(now)
+
+
+# ---- W⑥-4（2026-10-09 红队加固）：模型烧钱面按账号限速 ----
+# 合法凭证重放烧云配额的闸（/api/tts/preview、/api/qa/pregen、/api/tts/
+# branch-pregen 三家都触发云端合成/预合成）。与 _login_rate_limit 同族 deque
+# 滑窗，单进程 CP 形态够用；键=账号（anon=无身份 auth-off 开发形态）。
+# BOK_COST_RATE_LIMIT=0 关闭（缺省开）。
+_COST_RATE_WINDOW_S = 60.0
+_COST_RATE_LIMIT = 30
+_COST_RATE_MAX_KEYS = 4096
+_cost_rate_times: dict[str, deque] = defaultdict(deque)
+
+
+def _cost_rate_account_key(request: Request) -> str:
+    ident = current_identity(request)
+    return (ident.account_id if ident else "") or "anon"
+
+
+def _cost_rate_limit(request: Request) -> None:
+    if os.environ.get("BOK_COST_RATE_LIMIT", "1").strip() == "0":
+        return
+    now = time.monotonic()
+    key = _cost_rate_account_key(request)
+    dq = _cost_rate_times[key]
+    while dq and now - dq[0] >= _COST_RATE_WINDOW_S:
+        dq.popleft()
+    if len(dq) >= _COST_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁（合成类操作限 30 次/分钟/账号），请稍后再试",
+        )
+    dq.append(now)
+    if len(_cost_rate_times) > _COST_RATE_MAX_KEYS:
+        for k in [k for k, d in _cost_rate_times.items()
+                  if not d or now - d[-1] >= _COST_RATE_WINDOW_S]:
+            _cost_rate_times.pop(k, None)
 
 
 def _require_user_admin(identity: Identity | None, target_role: str, target_account: str) -> None:
@@ -5500,6 +5567,8 @@ def qa_canned_audio(entry_id: str, request: Request) -> Response:
 def qa_pregen_ep(payload: dict, request: Request) -> dict:
     """手动触发 --qa 物化(可限 ids);烧云配额操作,与 /api/tts/preview 同闸同审计。"""
     auto_gate_management(request)
+    # W⑥-4：合成类烧钱面按账号限速。
+    _cost_rate_limit(request)
     ids = [str(x) for x in (payload.get("ids") or [])]
     out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), ids)
     _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
@@ -5539,6 +5608,8 @@ def branch_pregen_ep(payload: dict, request: Request) -> dict:
     标记,即 branch-canned-status 的键)。"""
     require_role(request, "admin", "root")
     account_id = scoped_account(request, str(payload.get("account_id") or ""))
+    # W⑥-4：合成类烧钱面按账号限速（scoped_account 之后=已收窄到本人账号）。
+    _cost_rate_limit(request)
     texts = [str(x) for x in (payload.get("texts") or []) if str(x or "").strip()]
     out = pregen_mod.branch_pregen_spawn(
         str(request.base_url).rstrip("/"), account_id, texts or None
