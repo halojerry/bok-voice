@@ -245,10 +245,15 @@ async def entrypoint(ctx) -> None:
 
     def _on_user_input(ev) -> None:
         text = str(getattr(ev, "transcript", "") or "").strip()
-        if not text or not getattr(ev, "is_final", False):
-            return  # interim 不喂（投机/抢跑=本地档补偿，lite 不带）
-        _spawn_pooled_task(_add_turn(f"原文：{text}", source_lang), _ledger_tasks, "LEDGER_TASK_ERR")
-        pipeline.enqueue(text)
+        if not text:
+            return
+        if getattr(ev, "is_final", False):
+            _spawn_pooled_task(_add_turn(f"原文：{text}", source_lang), _ledger_tasks, "LEDGER_TASK_ERR")
+            pipeline.feed_final(text)  # 已提交子句=精确文本（话段视图的 committed 段）
+        else:
+            # interim（未提交余段）进管线 v2：稳定前缀切块提前翻译=首声 ≤1.5s 的唯一
+            # 结构路径（call-e376e7a9 定调）；切块全在管线侧，不在此处过滤。
+            pipeline.feed_interim(text)
 
     session.on("user_input_transcribed", _on_user_input)
 

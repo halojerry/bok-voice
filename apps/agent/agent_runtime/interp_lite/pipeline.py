@@ -1,19 +1,29 @@
-"""interp_lite 翻译管线：单消费 FIFO + 流式 say（全流式直通管的最薄形态）。
+"""interp_lite 翻译管线 v2：话段连续流式（utterance-continuous SIMT）。
 
-链路（计划档 §2 官方替代表的落地）：
-ASR definite（VAD 段会话+负 seq 定稿，provider 层）→ FIFO → DeepSeek 流式 MT
-（thinking 显式关、静态系统前缀吃官方上下文缓存）→ **delta 逐字喂 session.say**
-（TagGate 校验后下发）→ MiniMax bidi 服务端攒句立即合成（句末标点即起合成；
-插件内 head-flush 催产无标点头段）。客户端零攒句、零提交闸、零语气词转换。
+call-e376e7a9 翻案（2026-10-09，Ethan 实弹定调「句间隙可以不要、首声 ≤1.5s」）：
+v1 逐子句 say 有两处结构病——①每个提交=一条独立 TTS 流，各自尾窗结算+锁串行+
+播放队列 → 「半句 … 4-5s 洞 … 半句」（听感=被截断半句）；②首声=等提交闸
+（说话 1.6-2s 才提交）+MT+TTS ≈ 3.2s。
 
-带（证据支持的 correctness 件，判据/台词/分类器全部单源复用旧线）：
-- 首段语言门（``bok_voice_core.mt_lang_check`` 脚本级；闸键=既有
-  ``BOK_INTERP_MT_LANGGUARD``）：违约在首 yield 前抛出=零播报 → 整句回退路径。
-- 402/鉴权黑洞短路（``interpret._mt_fatal_provider_error``；call-0bdf1392 实证
-  重试永不好）：首次命中标死道，后续句秒走目标语请示句兜底，零 provider 调用。
-- MT 超时/异常兜底台词（``interpret._mt_fail_line``）：绝不回放源文。
+v2 模型（一条话段一条流，链路口径不变：ASR 流式 → DeepSeek 流式 → bidi 攒句）：
+- worker 把 FINAL（已提交子句=精确文本）与 INTERIM（未提交余段=不稳定显示）都喂
+  进来（feed_final/feed_interim）；管线维护 ``committed+display`` 视图与单调水位
+  ``src_sent``（永不回撤；修订分歧认账重锚=MT_CHUNK_DRIFT 观测，不重喂不双播）；
+- 切块器在视图增量上切块（chunker.pick_cut）：首块 ≥3 字即出（抢首声）、常规块
+  标点优先/12 字保险丝、interim 余段尾 2 字回扣（防重解修订）；每块带「本话段
+  前文」进消息（上下文对追加，翻译衔接）；
+- 块翻译单飞（逐块顺序消费）→ MT delta 直灌话段 ``tts_q`` → **单条
+  ``session.say(generator)``** 逐片产出；服务端 bidi 攒句连续合成=块间零天窗；
+- 话段收尾=静默钟（无事件 ``_UTT_QUIET_S``）→ 末块全出 → 关流（哨兵）。
+  MT 全失败/零译文 → 收尾后目标语兜底句（绝不回放源文）；车道死=后续话段秒走
+  兜底（fail-fast）。配对账本 RC-8：每话段恰好一次 done_mt（真译）或 drop_src。
 
-不带（计划档 §8 审计表）：spec-mt/碎片闸/背压/摘译/回声去重/润色——本地档补偿。
+带（证据支持的 correctness 件，单源复用旧线）：
+- 首段语言门（``bok_voice_core.mt_lang_check``；闸键 ``BOK_INTERP_MT_LANGGUARD``）
+- 402/鉴权黑洞短路（``interpret._mt_fatal_provider_error``，call-0bdf1392 实证）
+- MT 超时/异常兜底台词（``interpret._mt_fail_line``）
+
+不带（计划档 §8 审计表）：spec-mt 持有音频/碎片闸/背压/摘译/回声去重/润色。
 """
 
 from __future__ import annotations
@@ -28,16 +38,19 @@ from ..interpret import (
     _mt_fatal_provider_error,
     _mt_lang_guard_enabled,
 )
+from .chunker import common_prefix_len, content_len, pick_cut
 from .providers.mt_deepseek import DeepSeekMT, build_messages
 from .voice_tags import TagGate
 
-_SENT_TIMEOUT_S = 15.0
-_QUEUE_MAX = 48
-_FIRST_PIECE_MIN_CHARS = 4  # 首段语言门的软证据窗
+_UTT_QUIET_S = 1.2  # 话段边界：无新 ASR 事件的静默时长（VAD 段会话间隙内不会触发）
+_STREAM_DEADLINE_S = 12.0  # 单块 MT 流排干上限（超时保已收 delta，不阻后续块）
+_HOLD_INTERIM = 2  # interim 余段尾部回扣字数（服务端重解多发生在尾）
+_CTX_MAX_CHARS = 400  # 「本话段前文」上下文对的源文上限（防消息无限膨胀）
+_FIRST_PIECE_MIN_CHARS = 2  # 首段语言门软证据窗（v2 块更小，窗跟着小）
 
 
 class _GateFailError(Exception):
-    """首段语言门违约（首 yield 前抛出=零播报，调用方走整句回退）。"""
+    """首段语言门违约（首 yield 前抛出=零播报，话段走整段回退）。"""
 
 
 def _looks(text: str, lang: str) -> bool:
@@ -47,7 +60,7 @@ def _looks(text: str, lang: str) -> bool:
 
 
 async def _collect(mt: DeepSeekMT, msgs: list[dict], timeout_s: float) -> str:
-    """整句排干（超时也关流，不留僵尸解码——旧线 _mt_collect 同纪律）。"""
+    """整段排干（超时也关流，不留僵尸解码——旧线 _mt_collect 同纪律）。"""
     parts: list[str] = []
     stream = mt.stream(msgs)
 
@@ -60,17 +73,44 @@ async def _collect(mt: DeepSeekMT, msgs: list[dict], timeout_s: float) -> str:
     finally:
         aclose = getattr(stream, "aclose", None)
         if aclose is not None:
-            with contextlib.suppress(Exception):  # 关流尽力而为
+            with contextlib.suppress(Exception):
                 await aclose()
     return "".join(parts).strip()
 
 
-class InterpPipeline:
-    """每方向一个实例；``run()`` 由 worker 作为长任务拉起，shutdown 时 cancel。
+class _Utterance:
+    """单话段（VAD 段内一组子句）的连续流状态。"""
 
-    配对账本纪律（旧线 RC-8 同款）：每句**恰好一次** ``done_mt``（真译/兜底句）或
-    ``drop_src``（空译文/回退失败），否则 _on_item 会错弹下一句的 pending。
-    """
+    __slots__ = (
+        "t0", "committed", "display", "src_sent", "chunks_started", "chunks",
+        "tts_q", "mt_parts", "chunk_task", "quiet_task", "quiet_seq", "closed",
+        "yielded", "any_delta", "gate_failed", "src_final",
+    )
+
+    def __init__(self, t0: float):
+        self.t0 = t0
+        self.committed = ""  # 已提交子句拼接（精确文本）
+        self.display = ""    # 未提交余段（服务端显示，可能重解）
+        self.src_sent = ""   # 已切块喂出的源文本（单调水位，永不回撤）
+        self.chunks_started = False
+        self.chunks: asyncio.Queue = asyncio.Queue()
+        self.tts_q: asyncio.Queue = asyncio.Queue()
+        self.mt_parts: list[str] = []
+        self.chunk_task: asyncio.Task | None = None
+        self.quiet_task: asyncio.Task | None = None
+        self.quiet_seq = 0
+        self.closed = False
+        self.yielded = False
+        self.any_delta = False
+        self.gate_failed = False
+        self.src_final = ""
+
+    def view(self) -> str:
+        return self.committed + self.display
+
+
+class InterpPipeline:
+    """话段连续流管线；``run()`` 由 worker 作为长任务拉起，shutdown 时 cancel。"""
 
     def __init__(
         self,
@@ -89,25 +129,248 @@ class InterpPipeline:
         self.target_lang = target_lang
         self.voice_tags = voice_tags
         self.lag = lag
-        self.first_ms = first_ms  # {"ms": int} 逐句覆写（观测口径同旧线）
-        self.last_ms = {"ms": 0}  # 逐句 MT 总时长（worker 落库 latency_ms 消费）
-        self.q: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
-        self._enq: deque = deque()  # 入队时刻（FIFO 与 q 同序；queue_wait_ms 观测）
-        self.queue_wait_ms = {"ms": 0}  # 逐句 FIFO 等待（W6 刀3-lite 四段账）
-        self.pairs: deque = deque(maxlen=8)  # (源,译) 滚动对
+        self.first_ms = first_ms  # {"ms": int} 逐话段覆写（t0=话段起→首个译 delta）
+        self.last_ms = {"ms": 0}  # 逐话段 MT 总时长（worker 落库 latency_ms 消费）
+        self.queue_wait_ms = {"ms": 0}  # v2 无 FIFO 等待（观测行兼容字段，恒 0）
+        self.pairs: deque = deque(maxlen=8)  # (源,译) 滚动对（跨话段上下文）
         self.lane_dead = {"reason": ""}
         self.round = 0
+        self.utt: _Utterance | None = None
 
     # ---- 入口（worker 的 user_input_transcribed 回调调用；原文落库在 worker 侧）----
-    def enqueue(self, text: str) -> None:
-        """源句入队（满=摘最新句防雪崩，旧线同语义）；入队成功才记账（RC-8）。"""
-        try:
-            self.q.put_nowait(text)
-        except asyncio.QueueFull:
-            print("[interp-lite] source queue overflow, sentence dropped(摘译)", flush=True)
+    def feed_final(self, text: str) -> None:
+        """已提交子句（精确文本）：committed 追加；display 清空（其后 interim 重建）。"""
+        utt = self._ensure_utt()
+        if utt is None:
             return
-        self._enq.append(time.perf_counter())
-        self.lag.note_src(text)
+        utt.committed += text
+        utt.display = ""
+        self._maybe_cut(utt)
+        self._arm_quiet(utt)
+
+    def feed_interim(self, text: str) -> None:
+        """未提交余段（服务端显示）：覆盖 display；视图增量切块（尾 2 字回扣）。"""
+        utt = self._ensure_utt()
+        if utt is None:
+            return
+        utt.display = text
+        self._maybe_cut(utt)
+        self._arm_quiet(utt)
+
+    def _ensure_utt(self) -> _Utterance | None:
+        if self.utt is not None and not self.utt.closed:
+            return self.utt
+        self.round += 1
+        utt = _Utterance(time.perf_counter())
+        utt.chunk_task = asyncio.create_task(self._chunk_runner(utt))
+        try:
+            self.session.say(self._gen(utt))
+        except Exception as exc:  # noqa: BLE001 - say 提交失败=本话段放弃（罕见）
+            print(f"[interp-lite] MT_STREAM say submit failed {exc!r}", flush=True)
+            utt.closed = True
+            self.lag.note_src(utt.view())
+            self._drop()
+            utt.chunks.put_nowait(None)  # 让块协程收工
+            return None
+        self.utt = utt
+        print(f"[interp-lite] UTT_STREAM start round={self.round}", flush=True)
+        return utt
+
+    # ---- 切块 ----
+    def _maybe_cut(self, utt: _Utterance) -> None:
+        if utt.closed:
+            return
+        view = utt.view()
+        sent = utt.src_sent
+        if len(view) < len(sent):
+            return  # 视图暂缩（final 清 display 的空窗）：等增长
+        if not view.startswith(sent):
+            cp = common_prefix_len(view, sent)
+            print(
+                f"[interp-lite] MT_CHUNK_DRIFT cp={cp} sent={len(sent)} view={len(view)}",
+                flush=True,
+            )
+            utt.src_sent = view[: len(sent)]  # 认账重锚：已喂文本不回撤（罕见修订）
+            sent = utt.src_sent
+            if len(view) <= len(sent):
+                return
+        avail = view[len(sent):]
+        first = not utt.chunks_started
+        # 首块 hold=1（抢首声：只回扣 1 字）；常规块 hold=2（标点边界前的重解防抖）
+        hold = 1 if first else _HOLD_INTERIM
+        usable = avail[: len(avail) - hold] if len(avail) > hold else ""
+        cut = pick_cut(usable, first=first)
+        if cut <= 0:
+            return
+        chunk = usable[:cut]
+        utt.chunks_started = True
+        utt.chunks.put_nowait((chunk, sent))
+        utt.src_sent = sent + chunk
+        print(f"[interp-lite] MT_CHUNK chars={len(chunk)} first={int(first)}", flush=True)
+
+    # ---- 静默钟（话段收尾） ----
+    def _arm_quiet(self, utt: _Utterance) -> None:
+        utt.quiet_seq += 1
+        if utt.quiet_task is not None and not utt.quiet_task.done():
+            utt.quiet_task.cancel()
+        utt.quiet_task = asyncio.create_task(self._quiet_wait(utt, utt.quiet_seq))
+
+    async def _quiet_wait(self, utt: _Utterance, seq: int) -> None:
+        try:
+            await asyncio.sleep(_UTT_QUIET_S)
+        except asyncio.CancelledError:
+            return  # 新事件重置：静默钟重挂
+        if utt.quiet_seq == seq and not utt.closed:
+            self._close(utt)
+
+    def _close(self, utt: _Utterance) -> None:
+        """末块全出 + 关流哨兵；记账（note_src）在收尾配对前挂上（RC-8 同序）。"""
+        if utt.closed:
+            return
+        utt.closed = True
+        src_final = utt.src_final = utt.view()
+        view, sent = utt.view(), utt.src_sent
+        if len(view) > len(sent) and view.startswith(sent):
+            rest = view[len(sent):].strip()
+            if rest and content_len(rest) > 0:  # 纯标点尾巴无内容可译：丢
+                utt.chunks.put_nowait((rest, sent))
+                utt.src_sent = view
+        self.lag.note_src(src_final)
+        utt.chunks.put_nowait(None)
+        print(
+            f"[interp-lite] UTT_STREAM close src_chars={len(src_final)} "
+            f"chunks={int(utt.chunks_started)}",
+            flush=True,
+        )
+
+    # ---- say 生成器（框架消费端；一条话段一个） ----
+    async def _gen(self, utt: _Utterance):
+        gate = TagGate()
+        head = ""
+        first_done = False
+        guard_on = _mt_lang_guard_enabled()
+        lang = self.target_lang
+
+        def _emit(piece: str):
+            """首段过语言门后放行；None=证据不足继续攒；违约抛 _GateFailError。"""
+            nonlocal head, first_done
+            if first_done:
+                return piece
+            head += piece
+            if len(head.strip()) < _FIRST_PIECE_MIN_CHARS:
+                return None
+            if guard_on and lang and not _looks(head, lang):
+                raise _GateFailError(head)
+            first_done = True
+            return head
+
+        try:
+            while True:
+                item = await utt.tts_q.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    print(f"[interp-lite] MT_STREAM err {item!r}", flush=True)
+                    break
+                piece = gate.feed(item)
+                if not piece:
+                    continue
+                verdict = _emit(piece)
+                if verdict is None:
+                    continue
+                utt.yielded = True
+                yield verdict
+            tail = gate.flush()
+            if tail:
+                verdict = _emit(tail)
+                if verdict is not None:
+                    utt.yielded = True
+                    yield verdict
+        except _GateFailError:
+            utt.gate_failed = True
+            print("[interp-lite] MT_STREAM fallback state=gate", flush=True)
+
+    # ---- 块翻译单飞（逐块顺序） ----
+    async def _chunk_runner(self, utt: _Utterance) -> None:
+        try:
+            while True:
+                item = await utt.chunks.get()
+                if item is None:
+                    break
+                if self.lane_dead["reason"]:
+                    continue  # 死道：不翻（收尾走兜底句）
+                chunk, prior_src = item
+                await self._translate_chunk(utt, chunk, prior_src)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._finish_utt(utt)
+            utt.tts_q.put_nowait(None)
+        if utt.gate_failed:
+            await self._retry_once_say(utt)
+        elif self.lane_dead["reason"] and not utt.mt_parts:
+            await self._fallback_say("lane_dead")
+
+    def _ctx_pairs(self, utt: _Utterance, prior_src: str) -> list[tuple[str, str]]:
+        pairs = list(self.pairs)
+        mt_so_far = "".join(utt.mt_parts).strip()
+        if prior_src and mt_so_far and len(prior_src) <= _CTX_MAX_CHARS:
+            # 本话段前文进上下文对（时间序在跨话段对之后）：块间翻译衔接单点。
+            pairs.append((prior_src, mt_so_far))
+        return pairs
+
+    async def _translate_chunk(self, utt: _Utterance, chunk: str, prior_src: str) -> None:
+        msgs = build_messages(self.instructions, self._ctx_pairs(utt, prior_src), chunk)
+        produced = False
+        try:
+            async with asyncio.timeout(_STREAM_DEADLINE_S):
+                async for delta in self.mt.stream(msgs):
+                    if not delta:
+                        continue
+                    if not utt.any_delta:
+                        utt.any_delta = True
+                        self.first_ms["ms"] = int((time.perf_counter() - utt.t0) * 1000)
+                    produced = True
+                    utt.mt_parts.append(delta)
+                    utt.tts_q.put_nowait(delta)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:  # asyncio.timeout 超时（py3.11+ = 内建 TimeoutError）
+            print(f"[interp-lite] MT_CHUNK_TIMEOUT chars={len(chunk)}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 单块失败不阻后续
+            fatal = _mt_fatal_provider_error(exc)
+            if fatal and not self.lane_dead["reason"]:
+                self.lane_dead["reason"] = fatal
+                print(f"[interp-lite] MT_LANE_DEAD reason={fatal} round={self.round}", flush=True)
+            if not produced and not fatal:
+                # 零 delta 的瞬时失败：整块回退一次（同 v1 单次重试纪律）
+                try:
+                    translated = await _collect(self.mt, msgs, _STREAM_DEADLINE_S)
+                except Exception as retry_exc:  # noqa: BLE001
+                    print(f"[interp-lite] MT_CHUNK_RETRY_FAIL {retry_exc!r}", flush=True)
+                    translated = ""
+                if translated:
+                    if not utt.any_delta:
+                        utt.any_delta = True
+                        self.first_ms["ms"] = int((time.perf_counter() - utt.t0) * 1000)
+                    utt.mt_parts.append(translated)
+                    utt.tts_q.put_nowait(translated)
+        finally:
+            self._cache_log()
+
+    # ---- 收尾配对（RC-8：每话段恰一次 done/drop；回退路径自结对） ----
+    def _finish_utt(self, utt: _Utterance) -> None:
+        if utt.gate_failed or (self.lane_dead["reason"] and not utt.mt_parts):
+            return
+        mt_ms = int((time.perf_counter() - utt.t0) * 1000)
+        translated = "".join(utt.mt_parts).strip()
+        if not translated:
+            self._drop()
+            print(f"[interp-lite] mt empty for {len(utt.src_final)} chars, skipped", flush=True)
+            return
+        src = utt.src_final or utt.view()
+        self.pairs.append((src, translated))
+        self._done(mt_ms)
 
     def _done(self, mt_ms: int) -> None:
         """配对记账单点（同时覆写 last_ms 供 worker 落库 latency_ms）。"""
@@ -118,169 +381,14 @@ class InterpPipeline:
         self.last_ms["ms"] = 0
         self.lag.drop_src()
 
-    # ---- 主循环 ----
-    async def run(self) -> None:
-        while True:
-            text = await self.q.get()
-            t_enq = self._enq.popleft() if self._enq else None
-            self.queue_wait_ms["ms"] = (
-                int((time.perf_counter() - t_enq) * 1000) if t_enq is not None else 0
-            )
-            self.round += 1
-            t0 = time.perf_counter()
-            try:
-                if self.lane_dead["reason"]:
-                    self.session.say(_mt_fail_line(self.target_lang))
-                    self._done(0)
-                    continue
-                await self._translate_say(text, t0)
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                await self._fallback_say("timeout")
-            except Exception as exc:  # noqa: BLE001 - 单句失败不阻后续
-                fatal = _mt_fatal_provider_error(exc)
-                if fatal and not self.lane_dead["reason"]:
-                    self.lane_dead["reason"] = fatal
-                    print(
-                        f"[interp-lite] MT_LANE_DEAD reason={fatal} round={self.round} "
-                        f"(fast-fail till call end — 充值/切道后下一通恢复)",
-                        flush=True,
-                    )
-                await self._fallback_say(f"error {exc!r}")
-            finally:
-                self.q.task_done()
-
-    # ---- 单句：流式 say；gate/error_pre 回退整句重开流 ----
-    async def _translate_say(self, text: str, t0: float) -> None:
-        msgs = build_messages(self.instructions, list(self.pairs), text)
-        out = {"state": "clean", "yielded": False}
-        done = asyncio.Event()
-        gate = TagGate()
-        raw: list[str] = []
-        guard_on = _mt_lang_guard_enabled()
-        lang = self.target_lang
-        head = ""  # 首段语言门的软证据累积（不碰 gate 内部状态）
-
-        # MT 与 say 解耦（2026-10-09 流畅度收口）：框架 speech 队列串行拉生成器
-        # ——上一段播完前下一个 say 的 gen 无人拉取=MT 流根本没起跑（实弹：尾巴
-        # 单元 first_ms 6-7.8s = 上一段播报时长 + 真实 MT 0.6s，缓存全健康）。
-        # pump 独立任务先把 DeepSeek 流拉进缓冲，gen 只消费：MT 全程并发，框架
-        # 到点即有货可播。None=流尽哨兵；异常对象=流错误透传。
-        buf: asyncio.Queue = asyncio.Queue()
-
-        async def _pump():
-            try:
-                stream = self.mt.stream(msgs)
-                async for delta in stream:
-                    await buf.put(delta)
-                await buf.put(None)
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:  # noqa: BLE001 - 错误透传给 gen 分类
-                await buf.put(exc)
-
-        pump_task = asyncio.create_task(_pump())
-
-        async def _gen():
-            nonlocal head
-            deadline = time.monotonic() + _SENT_TIMEOUT_S
-            first = {"done": False}
-
-            def _emit(piece: str) -> str | None:
-                """首段过语言门后放行；返回 None=证据不足继续攒；违约直接抛 _GateFailError。"""
-                nonlocal head
-                if first["done"]:
-                    return piece
-                head += piece
-                if len(head.strip()) < _FIRST_PIECE_MIN_CHARS:
-                    return None
-                if guard_on and lang and not _looks(head, lang):
-                    out["state"] = "gate"
-                    raise _GateFailError(head)
-                first["done"] = True
-                self.first_ms["ms"] = int((time.perf_counter() - t0) * 1000)
-                return head
-
-            try:
-                while True:
-                    item = await buf.get()
-                    if item is None:
-                        break
-                    if isinstance(item, BaseException):
-                        raise item
-                    if time.monotonic() > deadline:
-                        out["state"] = "error_mid" if out["yielded"] else "error_pre"
-                        print(f"[interp-lite] MT_STREAM deadline state={out['state']}", flush=True)
-                        break
-                    if not item:
-                        continue
-                    raw.append(item)
-                    piece = gate.feed(item)
-                    if not piece:
-                        continue
-                    verdict = _emit(piece)
-                    if verdict is None:
-                        continue
-                    out["yielded"] = True
-                    yield verdict
-                tail = gate.flush()
-                if tail:
-                    verdict = _emit(tail)
-                    if verdict is not None:
-                        out["yielded"] = True
-                        yield verdict
-            except _GateFailError:
-                pass  # state 已置 gate；零播报，调用方回退
-            except asyncio.CancelledError:
-                out["state"] = "error_mid" if out["yielded"] else "error_pre"
-                raise
-            except Exception as exc:  # noqa: BLE001 - 流错误按 yield 前后分类
-                out["state"] = "error_mid" if out["yielded"] else "error_pre"
-                print(f"[interp-lite] MT_STREAM err state={out['state']} {exc!r}", flush=True)
-            finally:
-                pump_task.cancel()
-                done.set()
-
-        try:
-            self.session.say(_gen())
-        except Exception as exc:  # noqa: BLE001 - say 提交失败=error_pre 回退
-            out["state"] = "error_pre"
-            print(f"[interp-lite] MT_STREAM say submit failed {exc!r}", flush=True)
-            return await self._retry_once_say(text, msgs, t0)
-
-        # 等 gen 排干（say 消费端停拉时 finally 也会 set；外层兜 3s）。
-        try:
-            await asyncio.wait_for(done.wait(), timeout=_SENT_TIMEOUT_S + 3.0)
-        except asyncio.TimeoutError:
-            print("[interp-lite] MT_STREAM gen not drained in time", flush=True)
-
-        if out["state"] in ("clean", "error_mid"):
-            translated = "".join(raw).strip()
-            self._cache_log()
-            if not translated:
-                self._drop()
-                print(f"[interp-lite] mt empty for {len(text)} chars, skipped", flush=True)
-                return
-            if not out["yielded"]:
-                # clean 但零 yield（极端短流兜底）：整句出声，一次配对。
-                self.session.say(self._final_text(translated))
-            self.pairs.append((text, translated))
-            self._done(int((time.perf_counter() - t0) * 1000))
-            return
-        if out["state"] == "gate":
-            print(f"[interp-lite] MT_STREAM fallback state=gate round={self.round}", flush=True)
-            return await self._retry_once_say(text, msgs, t0)
-        # error_pre：零播报 → 整句回退（error_mid 不会到这里）。
-        print(f"[interp-lite] MT_STREAM fallback state={out['state']} round={self.round}", flush=True)
-        await self._retry_once_say(text, msgs, t0)
-
-    async def _retry_once_say(self, text: str, msgs: list[dict], t0: float) -> None:
-        """整句回退（新开流排干→语言复查→整句 say；至多一次，无循环重试）。"""
-        translated = await _collect(self.mt, msgs, _SENT_TIMEOUT_S)
+    async def _retry_once_say(self, utt: _Utterance) -> None:
+        """整段回退（语言门违约）：新开流排干→整段 say；至多一次，无循环重试。"""
+        src = utt.src_final or utt.view()
+        msgs = build_messages(self.instructions, list(self.pairs), src)
+        translated = await _collect(self.mt, msgs, _STREAM_DEADLINE_S)
         if not translated:
             self._drop()
-            print(f"[interp-lite] mt retry empty for {len(text)} chars", flush=True)
+            print(f"[interp-lite] mt retry empty for {len(src)} chars", flush=True)
             return
         if _mt_lang_guard_enabled() and self.target_lang and not _looks(translated, self.target_lang):
             print(
@@ -288,12 +396,12 @@ class InterpPipeline:
                 flush=True,
             )
         self.session.say(self._final_text(translated))
-        self.pairs.append((text, translated))
+        self.pairs.append((src, translated))
         self.first_ms["ms"] = 0
-        self._done(int((time.perf_counter() - t0) * 1000))
+        self._done(int((time.perf_counter() - utt.t0) * 1000))
 
     def _final_text(self, translated: str) -> str:
-        """整句出声口径：门开=TagGate 全文过一遍（校验/归一）；门关=剥标记单源。"""
+        """整段出声口径：门开=TagGate 全文过一遍（校验/归一）；门关=剥标记单源。"""
         if not self.voice_tags:
             from ..interpret import _speech_text
 
@@ -320,3 +428,24 @@ class InterpPipeline:
                 f"[interp-lite] MT_CACHE hit={hit} tok={total} pct={m.get('cached_pct', 0.0)}",
                 flush=True,
             )
+
+    # ---- supervisor ----
+    async def run(self) -> None:
+        """worker 持 task；取消=收线：尽力冲尾（有界）后退出。"""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait_for(self._shutdown_flush(), timeout=2.0)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+            raise
+
+    async def _shutdown_flush(self) -> None:
+        utt = self.utt
+        if utt is None or utt.closed:
+            return
+        self._close(utt)
+        if utt.chunk_task is not None:
+            with contextlib.suppress(Exception):
+                await utt.chunk_task  # 末块排干（外层 wait_for 有界）

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-import os
 
 import pytest
 from agent_runtime.interp_lite.config import build_instructions
@@ -465,13 +464,15 @@ class FakeLag:
 
 
 class FakeMT:
-    """脚本化 MT：calls[i] = 异步迭代器工厂或异常。"""
+    """脚本化 MT：calls[i] = 异步迭代器工厂或异常；msgs 记录逐次消息序列。"""
 
     def __init__(self, calls):
         self._calls = list(calls)
+        self.msgs: list[list[dict]] = []
         self.last_metrics = {"prompt_cache_hit_tokens": 1, "prompt_tokens": 2, "cached_pct": 0.5}
 
     async def stream(self, msgs):
+        self.msgs.append(msgs)
         item = self._calls.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -492,33 +493,63 @@ async def _consume(gen):
     return [x async for x in gen]
 
 
-def test_pipeline_stream_happy_path():
+def _fast_quiet(s: float = 0.05):
+    """话段静默钟临时压短（测试免等 1.2s）。"""
+    import contextlib
+
+    import agent_runtime.interp_lite.pipeline as pl
+
+    @contextlib.contextmanager
+    def _cm():
+        old = pl._UTT_QUIET_S
+        pl._UTT_QUIET_S = s
+        try:
+            yield
+        finally:
+            pl._UTT_QUIET_S = old
+
+    return _cm()
+
+
+def test_pipeline_stream_one_say_across_chunks():
     asyncio.run(_pipeline_stream_happy())
 
 
 async def _pipeline_stream_happy():
-    p = _pipeline(FakeMT([iter(["你好，", "世界。"])]))
-    await p._translate_say("hello world", p and 0.0)
+    """v2 连续流：两块一条 say（块间零天窗的结构保证）；上下文对衔接；末块全出。"""
+    mt = FakeMT([iter(["你好，", "世界。"]), iter(["我们去", "玩吧？"])])
+    p = _pipeline(mt)
+    with _fast_quiet():
+        p.feed_interim("你好世界")                    # 3 字（hold 1）→ 未到量
+        p.feed_interim("你好世界我们")                 # 首块 ≥4 字即出（抢首声，唯一非标点切点）
+        p.feed_interim("你好世界我们去玩吧？")          # 余段（标点被 hold 回扣）→ 不切
+        p.feed_final("你好世界我们去玩吧？")            # 提交：视图=全文（display 重清）
+        await asyncio.sleep(0.25)                     # 静默钟触发收尾末块
     session = p.session
-    # 逐 delta say：两片各自成为 generator 消费单元；gen 排干后 say 收到 async 生成器。
-    assert len(session.said) == 1  # 一个 say(生成器)
-    await asyncio.sleep(0.05)  # 等后台排干
-    assert "".join(session.spoken[0]) == "你好，世界。"
-    assert p.lag.dones and p.pairs[-1][1] == "你好，世界。"
+    assert len(session.said) == 1  # 一条话段=一个 say(generator)——v1 的逐子句多流废除
+    assert "".join(session.spoken[0]) == "你好，世界。我们去玩吧？"
+    # 第二块消息带「本话段前文」上下文对（源=首块、译=已产）——块间衔接单点
+    assert len(mt.msgs) == 2
+    assert mt.msgs[1][-3] == {"role": "user", "content": "你好世界我"}
+    assert mt.msgs[1][-2] == {"role": "assistant", "content": "你好，世界。"}
+    assert mt.msgs[1][-1] == {"role": "user", "content": "们去玩吧？"}
+    assert p.lag.notes and p.lag.dones and p.pairs[-1][1] == "你好，世界。我们去玩吧？"
 
 
-def test_pipeline_gate_falls_back_to_whole_sentence():
+def test_pipeline_gate_falls_back_to_whole_utterance():
     asyncio.run(_pipeline_gate_fallback())
 
 
 async def _pipeline_gate_fallback():
-    # 首段英文（目标 zh）→ 语言门违约零播报 → 整句回退（第二次调用返回中文）。
+    # 首块英文（目标 zh）→ 语言门违约零播报 → 收尾整段回退（第二次调用中文）。
+    # 尾标点单独成块会被丢（纯标点无内容），故脚本只剩 chunk1 + 回退两次调用。
     p = _pipeline(FakeMT([iter(["Hello ", "world"]), iter(["你好，世界。"])]), target="zh")
-    await p._translate_say("hello", 0.0)
-    await asyncio.sleep(0.05)
-    assert "".join(p.session.spoken[0]) == ""  # gate 版生成器零产出
-    assert p.session.said[1] == "你好，世界。"  # 回退整句出声
-    assert len(p.lag.dones) == 1  # gate 零播报不记账；回退整句记一次（RC-8：每句恰一次）
+    with _fast_quiet():
+        p.feed_interim("hello world，")
+        await asyncio.sleep(0.2)
+    assert p.session.spoken[0] == []  # gate 版生成器零产出
+    assert p.session.said[1] == "你好，世界。"  # 回退整段出声
+    assert len(p.lag.dones) == 1  # gate 零播报不记账；回退整段记一次（RC-8：每话段恰一次）
 
 
 def test_pipeline_empty_translation_drops():
@@ -527,8 +558,9 @@ def test_pipeline_empty_translation_drops():
 
 async def _pipeline_empty_drops():
     p = _pipeline(FakeMT([iter([])]))
-    await p._translate_say("x", 0.0)
-    await asyncio.sleep(0.05)
+    with _fast_quiet():
+        p.feed_interim("你好呀")
+        await asyncio.sleep(0.2)
     assert p.lag.drops == [1]
 
 
@@ -539,21 +571,47 @@ def test_pipeline_fatal_marks_lane_dead_and_falls_back():
 async def _pipeline_fatal():
     from agent_runtime.interp_lite.providers.mt_deepseek import MTHTTPError
 
-    mt = FakeMT([
-        MTHTTPError(402, "insufficient balance"),
-        MTHTTPError(402, "insufficient balance"),
-        MTHTTPError(402, "insufficient balance"),
-    ])
+    mt = FakeMT([MTHTTPError(402, "insufficient balance")])
     p = _pipeline(mt, target="zh", voice_tags=False)
-    p.enqueue("句一")
-    task = asyncio.create_task(p.run())
-    await asyncio.sleep(0.2)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    with _fast_quiet():
+        p.feed_interim("你好世界")
+        await asyncio.sleep(0.25)
     assert p.lane_dead["reason"]
     strs = [s for s in p.session.said if isinstance(s, str)]
     assert any("听不清" in s or "再說一遍" in s or "再说一遍" in s for s in strs)
+    assert p.lag.dones  # 兜底句配对记账（note_src 在收尾时挂上）
+
+
+# ---- 切块器纯函数（v2 首声/衔接的结构单点） ----
+
+
+def test_chunker_first_chunk_fires_early():
+    from agent_runtime.interp_lite.chunker import pick_cut
+
+    assert pick_cut("你好世界", first=True) == 4  # 首块 ≥4 字即出（抢首声，唯一的非标点切点）
+    assert pick_cut("你好", first=True) == 0  # 不足 4 字继续攒
+    # 逗号在门槛下（内容 2<4）不单独成切点 → 整段出（首块仍最先出）
+    assert pick_cut("你好，世界", first=True) == 5
+
+
+def test_chunker_regular_cuts_by_punctuation_only():
+    from agent_runtime.interp_lite.chunker import pick_cut
+
+    assert pick_cut("你好世界", first=False) == 0  # 无标点：不切（严格标点界，防乱切）
+    assert pick_cut("你好世界，后面还有", first=False) == 5  # 逗号即切（含标点）
+    assert pick_cut("你好世界，后面还有内容哦。", first=False) == 13  # 句末标点一行出
+    # 保险丝只对病态无标点长跑生效（正常语速碰不到）
+    assert pick_cut("你好世界" * 6, first=False) == 24
+
+
+def test_chunker_run_safe_and_flush():
+    from agent_runtime.interp_lite.chunker import pick_cut
+
+    # 保险丝切点落在 ASCII run 内→回退到 run 起点（整 run 留给下一块）
+    s = "你好" * 10 + "abcdef"
+    assert pick_cut(s, first=False) == 20
+    assert pick_cut("还剩一点尾巴", flush=True) == 6  # flush=全出
+    assert pick_cut("", first=True) == 0
 
 
 # ---- 模块导入烟测（相对导入面/循环依赖） ----

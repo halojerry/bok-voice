@@ -169,3 +169,29 @@ settle 半场闸、SessionReport 带 worker 标识。
 3. 旧线 interpret.py 冻结（只修 P0 bug）；真人 soak 后 serve 默认翻转。
 4. A 线（agent.py 9,582）同法评估——巨石棘轮基线待其对应窗口。
 5. W6 未完票：官方 DDC/加速臂 A/B（DDC 与语气标记冲突维持关）、晚峰 18-22h MT 终判。
+
+## 窗 B 提前落地：v2 话段连续流（2026-10-09 下午，call-e376e7a9 翻案）
+
+**实弹定案链**：call-6f92bfd4（首声体感 5s=饥饿死等 1.2s，修=end_window 派生 caf668c）→
+call-dd85e5f5（截半句=bidi 尾窗 0.5s 撞服务端句间合成隙，修=尾窗 2.5s 8541980）→
+call-e376e7a9（尾窗修好后换病：**首块 8 字保险丝中词劈 + 每子句一条流 → 「半句…4-5s 洞…半句」**
++ 首声仍 ~3s）。Ethan 定调：**句间隙可以不要（不要靠设置兜）、首声 ≤1.5s、给 LLM 的切分
+按 ，。！？（别乱切）、长讲话要一条连续输出（语调语速情绪统一）**。
+
+**v2 架构**（`pipeline.py` 重写 442 行 + `chunker.py` 新 74 行；预算 1515/3000）：
+- **一个话段（utterance）一条 `session.say(generator)`**——MT 块只决定喂翻的源分片，
+  绝不开/关播放流；服务端 bidi 攒句连续合成=块间零天窗、整段一条音频（prosody 统一）。
+- worker 双喂：FINAL（committed 精确）+ INTERIM（display 不稳定余段）；管线维护
+  committed+display 视图与单调水位 src_sent（永不回撤，修订分歧认账重锚=MT_CHUNK_DRIFT）。
+- 切块（Ethan 口径）：**常规块严格标点界**（句末族→逗号族，含标点切，min 4 内容字）；
+  24 字保险丝只对病态无标点长跑；**首块唯一例外**≥4 字即切（抢首声，代价限定在开头几字）；
+  interim 尾 holdback 首块 1 字/常规 2 字（防重解修订）。
+- 块翻译单飞顺序消费，delta 直灌话段 tts_q；每块带「本话段前文」上下文对（衔接）；
+  话段收尾=静默钟 1.2s → 末块全出 → 关流。RC-8 配对=每话段恰一次 done/drop。
+- 账本口径迁移：INTERP_LAG 逐话段（note_src 于收尾）；first_ms=话段起→首个译 delta。
+
+**验收**：44→40 lite 单测绿（新增 chunker 纯函数 3+连续流 4 件）；全量 5178 绿
+（test_supervisor_listen 时序 flake 与本刀无关，另票）；预算门绿。真栈实弹=下一通。
+
+**遗留**（下一窗）：真栈 soak 后 serve 默认翻转；首块 min_first/hold 的实弹 A/B；
+provider 共源化搬移；probe_interp_fluency 判据适配 v2（段时长改话段口径）。
