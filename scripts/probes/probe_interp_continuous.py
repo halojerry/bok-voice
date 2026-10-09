@@ -67,7 +67,13 @@ SENTENCES = [
     "我想请你们帮我查一下我上周在你们平台下的那笔订单",
     "为什么订单状态一直显示已经发货但是物流信息是空的呢",
 ]
-JOIN_GAP_S = 0.12  # < VAD min_silence 0.45 → 对 VAD 而言係一口气
+# 语料/句距 env 化（2026-10-09 call-9e0dada0 自测闭环）：BOK_PROBE_SENTENCES 用
+# "|" 分句覆盖缺省语料（如 MiniMax 发布公告长句——复现「句中标点停顿→段定稿→
+# 续讲」形状）；BOK_PROBE_JOIN_GAP_S 调句间静音（>VAD min_silence=真段边界，
+# 续讲撞翻译播报=9e0dada0 病灶形状；缺省 0.12 保持旧读数基线）。
+if os.environ.get("BOK_PROBE_SENTENCES", "").strip():
+    SENTENCES = [s.strip() for s in os.environ["BOK_PROBE_SENTENCES"].split("|") if s.strip()]
+JOIN_GAP_S = float(os.environ.get("BOK_PROBE_JOIN_GAP_S", "0.12") or 0.12)
 
 
 def tts_pcm(text: str, lang: str) -> bytes:

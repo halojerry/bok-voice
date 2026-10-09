@@ -5228,6 +5228,21 @@ def _bidi_guard_enabled() -> bool:
     return os.environ.get("BOK_MINIMAX_BIDI_GUARD", "1") == "1"
 
 
+def _bidi_tail_idle_s() -> float:
+    """flush 后 recv 收摊空闲窗（call-dd85e5f5 翻案）。
+
+    服务端按句合成：task_flushed ack≠音频发完，句间合成隙可 >0.5s（同传实弹：
+    s1 译文完整音频 ~3.3s，收 1.6s 后 0.5s 空闲判收摊 → 余 1.74s 孤儿音频
+    落到下一流纪元门禁被丢=客户听到译文截半——「死掉的语音」）。缺省 2.5s
+    跨句隙；task_finished 事件仍即时收摊不受此窗影响。env 可调，钳 [0.3,10]。
+    """
+    try:
+        v = float(os.environ.get("MINIMAX_BIDI_TAIL_IDLE_S", "2.5"))
+    except ValueError:
+        v = 2.5
+    return max(0.3, min(10.0, v))
+
+
 class _MiniMaxBidiSession:
     """每 TTS 实例(=每 job)一条 bidi 连接的生命周期管理。
 
@@ -5698,6 +5713,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 "stale_bytes": 0,
                 "sentences": 0,
                 "stall_heals": 0,
+                # flush 后到达的音频账（call-dd85e5f5 截尾取证）：idle 收摊时
+                # flush_audio_bytes 应为 0 或等于末句实收（有值仍收摊=高风险），
+                # RECV_EXIT 行三字段=下一通判「0.5s 误收摊」是否复发的仪器。
+                "flush_audio_bytes": 0,
+                "flush_is_final": 0,
             }
 
             def _note_conn_died(reason: str, exc: BaseException | None = None) -> None:
@@ -5742,13 +5762,22 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 async def _recv_loop():
                     nonlocal init_done
                     # flush 前给足窗口(等 LLM 流式期间服务端句子音频);
-                    # task_flushed 后转 0.5s 空闲判收——尾巴吐完即收摊。
+                    # task_flushed 后转尾窗空闲判收（缺省 2.5s，跨服务端句间
+                    # 合成隙；0.5s 会误收摊致截尾——见 _bidi_tail_idle_s）。
+                    tail_idle = _bidi_tail_idle_s()
                     while True:
-                        timeout = 0.5 if self._flushed_evt.is_set() else 30.0
+                        timeout = tail_idle if self._flushed_evt.is_set() else 30.0
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                         except asyncio.TimeoutError:
                             if self._flushed_evt.is_set():
+                                print(
+                                    f"MINIMAX_BIDI_RECV_EXIT reason=idle "
+                                    f"idle_ms={int(tail_idle * 1000)} "
+                                    f"flush_audio_bytes={state['flush_audio_bytes']} "
+                                    f"flush_is_final={state['flush_is_final']}",
+                                    flush=True,
+                                )
                                 return  # 尾巴排干净了
                             continue  # 还在等句子音频,继续等
                         except Exception as exc:
@@ -5766,6 +5795,10 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         event = msg.get("event")
                         data = msg.get("data") or {}
                         audio_hex = data.get("audio") or ""
+                        if audio_hex:
+                            if self._flushed_evt.is_set():
+                                # flush 后仍有音频=服务端还在吐尾巴（截尾取证计数）
+                                state["flush_audio_bytes"] += len(audio_hex) // 2
                         if audio_hex and session.active_epoch != my_epoch:
                             # 纪元门禁:本流尚未发过 task_continue(active_epoch 还是
                             # 上一流的)→ 连接上此刻冒出的音频全是上一流打断(cancel
@@ -5820,11 +5853,14 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                 del buf[:frame_bytes]
                         # is_final = 当前句/当前请求音频完(bidi 喺 data 喺顶层都有得给,
                         # 兼容两种位置)。只推清尾巴,唔退出——会话继续。
-                        if (msg.get("is_final") or data.get("is_final")) and buf:
-                            output_emitter.push(bytes(buf))
-                            output_emitter.flush()
-                            buf.clear()
-                            state["audio_ever"] = True  # orch2-C:尾块推清也算已出声
+                        if msg.get("is_final") or data.get("is_final"):
+                            if self._flushed_evt.is_set():
+                                state["flush_is_final"] += 1  # flush 后末句信号计数（取证）
+                            if buf:
+                                output_emitter.push(bytes(buf))
+                                output_emitter.flush()
+                                buf.clear()
+                                state["audio_ever"] = True  # orch2-C:尾块推清也算已出声
                         if event == "task_flushed":
                             if state.get("head_flush_pending"):
                                 # 头段催产 flush 的 ack(非收尾):唔收摊,recv 继续
@@ -5838,6 +5874,12 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         elif event == "task_canceled":
                             self._canceled_evt.set()
                         elif event == "task_finished":
+                            print(
+                                f"MINIMAX_BIDI_RECV_EXIT reason=finished "
+                                f"flush_audio_bytes={state['flush_audio_bytes']} "
+                                f"flush_is_final={state['flush_is_final']}",
+                                flush=True,
+                            )
                             return
                         elif event == "sentence_end":
                             # 服务端实际切句数(连贯性观测:整轮回复应≈句数,
@@ -6160,8 +6202,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             self._rate_limited = False
                             self._first_audio_evt.clear()
                             # I-1(2026-09-23):守卫分支已置 flushed/canceled——
-                            # 唔清掉,新连接 recv 窗按「flushed 后 0.5s 排干」跑,
-                            # 首包/句隙 >0.5s 即误判收摊(重试恒失败落 HTTP,
+                            # 唔清掉,新连接 recv 窗按「flushed 后尾窗空闲排干」跑,
+                            # 首包/句隙 >尾窗即误判收摊(重试恒失败落 HTTP,
                             # flush 等待也立即返回截尾)。全新会话=全新收摊语义。
                             self._flushed_evt.clear()
                             self._canceled_evt.clear()
@@ -6231,7 +6273,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         await asyncio.wait_for(self._flushed_evt.wait(), timeout=15)
                     except asyncio.TimeoutError:
                         print("MINIMAX_TTS_BIDI_FLUSH_TIMEOUT", flush=True)
-                    # 等 recv_loop 把尾巴音频排完(0.5s 空闲自动收,给 20s 上限兜底)
+                    # 等 recv_loop 把尾巴音频排完(尾窗空闲自动收,给 20s 上限兜底)
                     if recv_task:
                         try:
                             await asyncio.wait_for(asyncio.shield(recv_task), timeout=20)

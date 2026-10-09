@@ -857,16 +857,20 @@ def test_clause_commit_align_reset_on_prefix_rewrite(monkeypatch, capsys):
 
     events = asyncio.run(_drive_clause(stt, vad, packets=4))
     finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
-    assert finals == ["你好呀我想问一下，", "谢谢。"]
+    # 2026-10-09 契约翻案（call-ed6326a5 吞字定案）：双失配的差量**发 FINAL**
+    # （旧版只在 INTERIM 显示/静默吞，MT 吃不到）——「请问一下，帮我查下订单」
+    # 是 ASR 把「问」改「请问」后公共前缀之外的新内容。
+    assert finals == ["你好呀我想问一下，", "请问一下，帮我查下订单", "谢谢。"]
     assert [t for n, t in events if n == "INTERIM_TRANSCRIPT"] == [
         "你好呀我想问一下，", "帮我查下订单", "谢谢", "谢谢。",
     ]
-    assert "DOUBAO_CLAUSE_ALIGN_RESET" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "DOUBAO_CLAUSE_ALIGN_RESET" in out and "DOUBAO_CLAUSE_ALIGN_DELTA" in out
 
 
-def test_clause_tail_alignment_ladder():
+def test_clause_tail_alignment_ladder(capsys):
     """对齐台阶直喂：①exact 前缀 ②归一化前缀（标点改写）③双失配→日志+重置
-    （committed=已见全文=已主张领地，尾巴空）。"""
+    +差量发 FINAL（2026-10-09 契约：display 空，差量走事件道；吞字作废）。"""
     async def scenario():
         stt = DoubaoSTT(api_key="k", clause_commit=True)
         stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
@@ -882,9 +886,10 @@ def test_clause_tail_alignment_ladder():
     r1, r2, r3, snap_text, snap_len = asyncio.run(scenario())
     assert r1 == "帮我查下"
     assert r2 == "帮我查下"
-    assert r3 == ""
+    assert r3 == ""  # 差量（「请问一下，帮我查下」）以 FINAL 发出，display 空
     assert snap_text == "你好呀我想请问一下，帮我查下"
     assert snap_len == 14
+    assert "DOUBAO_CLAUSE_ALIGN_DELTA" in capsys.readouterr().out
 
 
 def test_clause_commit_gates_negative(monkeypatch):

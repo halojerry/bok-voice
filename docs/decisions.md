@@ -50,6 +50,7 @@
 - [2026-10-08 bline-parity](superpowers/plans/2026-10-08-bline-parity.md) — B 线对齐波
 - [2026-10-09 bline-fluency](superpowers/plans/2026-10-09-bline-fluency.md) — B 线流畅度
 - [2026-10-09 w7probe-results](superpowers/plans/2026-10-09-w7probe-results.md) — W7 探针结果
+- [2026-10-09 interp-lite](superpowers/plans/2026-10-09-interp-lite.md) — 薄 B 线重建（官方替代表/LOC 预算/窗 A+ 流畅度收口：吞字修复/长度保险丝/pump 解耦/句档 30）
 
 ## ② 常设决策文档
 

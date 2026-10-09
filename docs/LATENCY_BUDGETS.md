@@ -105,7 +105,22 @@ probe_latency_soak 基线）。
 - **ASR 流式 finish 无重试（P2 备忘）**：`QWEN3_ASR_FINISH_ERROR` 直接丢转写，
   客户该轮白说。待补：finish 失败一次性重试 + 垫话位补「您再讲一次」。
 
-## 5. 测量工具
+## 5. B 线延迟预算按姿势分档（2026-10-09 interp-lite 波定档）
+
+同一条 `probe_interpret_latency`（逐句「说完→出声」口径，`BOK_PROBE_LAG_BUDGET_MS`）
+按 **MT 车道姿势**分两档——预算是 MT 腿的函数，不是常数：
+
+| 姿势 | MT 腿 | 预算 | 定档依据（实弹） |
+|---|---|---|---|
+| 本地 MT2（:1236） | p50 ~260ms（15 字句） | **3500ms**（缺省不变） | 2026-10-05 真栈 avg 2223 |
+| 全云 DeepSeek（mt 车道 openai） | 首 token p50 ~600ms、尾 2-6s | **4200ms**（`BOK_PROBE_LAG_BUDGET_MS=4200`） | 2026-10-09 三臂：interp-lite 3572/3786 vs 旧线 3835（同姿势 A/B 持平）；3500 档下两线同超=姿势成本非线损 |
+
+注意（口径边界）：边说边译模式（B 线句档/子句提交开启）下该探针的 onset 锚在
+「src_end 之后」而译声常已在播——量边说边译用 `probe_interp_continuous`（硬定义
+onset）与 `probe_interp_fluency`（天窗/段时长/提交单元），不用本表预算判死活。
+perceived 含整段播完时长，与「单段 ≥4s」目标内部矛盾（W6 §5 口径修正），只报告不设门。
+
+## 6. 测量工具
 
 - `scripts/probes/probe_latency_soak.py`：多轮多样话术延迟测试台（逐轮墙钟首声 + eou/llm/tts
   三段 + 拆轮/打断/哑轮异常旗 + p50/p95 汇总 + JSON 报告）。改延迟相关代码后必跑。

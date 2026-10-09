@@ -235,6 +235,73 @@ def _find_clause_cut(
     return None
 
 
+def _len_fuse_cut(text: str, start: int, min_chars: int) -> int | None:
+    """长度保险丝切点（纯函数，2026-10-09 W6×interp-lite 合流；单测直喂）。
+
+    标点档（``_find_clause_cut``）只在标点边界提交——无标点连续语流（长句/
+    地址/一气呵成形）结构性等句号/EOS，句档下两句并成一单=译文轨饿出巨型
+    天窗（实弹 call-d6704474：26.3s 窗，根因 119 字单 commit）。本函数在
+    ``[start:]`` 攒够 ``min_chars`` **内容字**（非空白/标点）后找安全切点：
+    切位后一个字符不得是 ASCII 字母数字（防劈单号/号码 run——``_find_clause_cut``
+    的数字 run 纪律同源）；攒不够/只在 run 内= None（等下轮 interim）。
+    稳定性与限速由调用方门控（与标点档同判据）。
+    """
+    n = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P"):
+            n += 1
+            if n >= min_chars:
+                j = i + 1
+                if (
+                    j < len(text)
+                    and ch.isascii() and ch.isalnum()
+                    and text[j].isascii() and text[j].isalnum()
+                ):
+                    pass  # 切点两侧都在 ASCII 字母数字 run 内：后移到 run 尾（防劈单号）
+                else:
+                    return j
+        i += 1
+    return None
+
+
+def _first_block_cut(text: str, prev_full: str) -> int | None:
+    """快启动层首块切点（纯函数，2026-10-09 EVS 目标；单测直喂）。
+
+    离散提交的内在矛盾：首块要小（快出声）↔ 后续块要大（不断流）——固定门槛
+    两头不可兼得（call-b3e4e391 实弹：30 字档首声 ~6s=「大块迟到」；6 字档=天窗）。
+    本函数只管 **utterance 首块**（`_cc_committed_len==0`）：小门槛（任意标点边界
+    ≥5 字 / 无标点保险丝 8 字）抢首声（≈语流 1.2s+管线 1.1s≈**2.3s 出声**）；
+    后续块回意群档（12/15）保连续。判据复用：数字 run 保护 + 跨 interim 稳定
+    （prev_full 同坐标一致）。仅 interp_lite 装配（len_fuse 旗控）——旧线零变化。"""
+    from .livekit_plugins import (  # noqa: PLC0415
+        _SENTENCE_STRONG_PUNCT,
+        _SENTENCE_WEAK_PUNCT,
+        _has_latin_or_digit_run,
+    )
+
+    i = 0
+    while i < len(text):
+        if text[i] in _SENTENCE_STRONG_PUNCT or text[i] in _SENTENCE_WEAK_PUNCT:
+            puncts = _SENTENCE_STRONG_PUNCT + _SENTENCE_WEAK_PUNCT
+            j = i + 1
+            while j < len(text) and text[j] in puncts:
+                j += 1
+            seg = text[:j]
+            if (
+                len(seg) >= 5
+                and not _has_latin_or_digit_run(seg, min_len=4)
+                and prev_full[:j] == seg
+            ):
+                return j
+        i += 1
+    fuse = _len_fuse_cut(text, 0, 8)
+    if fuse is not None and prev_full[:fuse] == text[:fuse]:
+        return fuse
+    return None
+
+
 class DoubaoSTT(stt.STT):
     """豆包 SAUC 流式 ASR（LiveKit STT；A/B 线共用）。
 
@@ -277,6 +344,8 @@ class DoubaoSTT(stt.STT):
         utt_merge: bool = False,
         utt_wait_s: float = 0.45,
         clause_commit: bool = False,
+        len_fuse: bool = False,
+        server_utterances: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -315,6 +384,16 @@ class DoubaoSTT(stt.STT):
         # 说话中成句（B 线 W1 clause-commit，2026-10-08）：interim 子句级闸命中
         # 即发 FINAL（说话中 MT 起跑）；False（A 线缺省不传）=逐字节旧路。
         self._clause_commit = bool(clause_commit)
+        # 长度保险丝（2026-10-09 W6×interp-lite 合流）：无标点连续语流攒够
+        # ``QWEN3_ASR_CLAUSE_LEN_CHARS`` 内容字就地切（``_len_fuse_cut``）——句档
+        # （逗号档关）下没有它=长句结构性等句号/EOS，两句并一单饿出巨型天窗
+        # （call-d6704474 实弹 26.3s 窗根因）。**默认 False=旧线逐字节**；仅
+        # interp_lite 装配开（LiteDoubaoSTT）。限速/跨窗稳定与标点档同判据。
+        self._len_fuse = bool(len_fuse)
+        # 服务端分句消费（2026-10-09 官方优先翻案，Ethan 拍板）：True=消费
+        # show_utterances 的 definite 分句（见新即发 FINAL），本地三层闸不跑；
+        # False（缺省）=本地闸档=旧线逐字节零变化。仅 interp_lite 装配传 True。
+        self._server_utterances = bool(server_utterances)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
         # 回复在途旗、收线窗旗、本轮 partial 末稿。云档语义见各方法 docstring。
         self._partial_ms_override: int | None = None
@@ -530,9 +609,28 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._cc_last_commit_at = 0.0
         self._cc_seg_t0 = 0.0
         self._cc_commits = 0
+        # 服务端分句消费（2026-10-09 官方优先翻案，Ethan 拍板「让 ASR 自己切分
+        # 然后给 LLM」）：show_utterances 的 definite 分句=厂商卖的语义分段，
+        # 见新 definite 即发 FINAL——本地标点/保险丝/快启动三层闸全部让位
+        # （它们是今天一天在手工重建厂商已有的能力，碎片/大块/吞字三病全由此生）。
+        # stt_._server_utterances=False（缺省）=本地闸档=旧线逐字节零变化。
+        self._server_utt = bool(getattr(stt_, "_server_utterances", False))
+        self._su_emitted = 0  # 已发 FINAL 的 definite 分句计数（按序单调）
+        # 饥饿接管阈值=end_window 派生（call-6f92bfd4）：definite 只在停顿后
+        # end_window 内到达，连续语流中途恒零——等过窗仍无 definite 即本地闸
+        # 接管，多等无增益只顶高首声。env 同键 BOK_DOUBAO_END_WINDOW_MS，
+        # 钳 [0.4,2.0]s（300ms 窗也至少等 0.4s，防 definite/本地闸贴脸双发）。
+        try:
+            _ew_ms = int(os.environ.get("BOK_DOUBAO_END_WINDOW_MS", "500") or 500)
+        except ValueError:
+            _ew_ms = 500
+        self._cc_starve_s = max(0.4, min(2.0, _ew_ms / 1000.0))
+        self._su_concat = ""  # 服务端 definite 累积文本（与本地闸前缀坐标合并用）
+        self._cc_starve_t0 = 0.0  # 饥饿钟（server_utt 档：definite 未到的连续语流计时）
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
+        _t_conn = time.monotonic()
         if not _ws_host_ok(self._stt_._ws_url):
             self._session_error = "ws_url_rejected"
             print(f"DOUBAO_ASR_URL_REJECTED {self._stt_._ws_url!r}", flush=True)
@@ -567,7 +665,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 持引用任务（禁裸 create_task：异常回收 + 关闭时 cancel 需要句柄）。
         self._sender_task = asyncio.create_task(self._sender(ws))
         self._receiver_task = asyncio.create_task(self._receiver(ws))
-        print("DOUBAO_ASR_CONNECT ok", flush=True)
+        print(f"DOUBAO_ASR_CONNECT ok connect_ms={int((time.monotonic() - _t_conn) * 1000)}", flush=True)
 
     async def _close_session(self) -> None:
         self._session_alive = False
@@ -628,17 +726,75 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             raise
         except Exception as exc:  # noqa: BLE001
             self._session_error = self._session_error or f"recv:{exc!r}"
+            # call-9e0dada0 取证插桩：服务端/网络先行关流=会话文本冻结的候选根因
+            print(f"DOUBAO_ASR_SESSION_CLOSED_BY_PEER {exc!r}", flush=True)
         finally:
             if self._final_evt is not None:
                 self._final_evt.set()
 
     def _on_payload(self, j: dict) -> None:
         res = j.get("result") or {}
+        if self._server_utt:
+            self._server_definite_commits(res)
         text = str(res.get("text") or "")
         if text and len(text) >= len(self._last_server_text):
             # 单调累积（实弹取证）；防御性取最长，防服务端变体重置。
             self._last_server_text = text
             self._maybe_interim(text)
+
+    def _server_definite_commits(self, res: dict) -> None:
+        """服务端 definite 分句消费 + 本地闸混合档（2026-10-09 call-72cf9f49 翻案二折）。
+
+        第一折（官方优先）：``utterances[].definite`` 即服务端定稿分句——准（二遍
+        识别、语义边界）。**但 call-72cf9f49 实弹定案：definite 需要 ≥end_window_size
+        连续静音——连续长讲无静音窗=零 definite=LLM 空等到说完**（49 字三句攒一坨）。
+        官方这个参数解决的是"准"不是"快"；跟人类译员相反（译员恰在连续语流跟读）。
+
+        第二折（混合）：interim 路上并行跑本地意群闸（标点+稳定性判据，不吃静音
+        窗）——服务端 definite 管停顿边界，本地闸管连续语流，共享 ``_cc_committed_*``
+        前缀坐标。定稿到达时按前缀合并：definite 累积文本与已提交前缀都是全文单调
+        前缀，只发增量（`SU_MERGE delta=` 观测行），不重发。"""
+        utts = res.get("utterances") or []
+        definite = [u for u in utts if u.get("definite") and str(u.get("text") or "").strip()]
+        new = definite[self._su_emitted:]
+        if not new:
+            return
+        self._su_emitted = len(definite)
+        for u in new:
+            utext = str(u.get("text") or "").strip()
+            if not utext:
+                continue
+            new_concat = self._su_concat + utext
+            committed = self._cc_committed_text or ""
+            # 前缀合并：两者都是全文单调前缀——只发已提交前缀之外的增量。
+            if new_concat.startswith(committed) and len(new_concat) > len(committed):
+                delta = new_concat[len(committed):]
+                self._su_concat = new_concat
+                self._cc_committed_text = new_concat
+                self._cc_committed_len = len(new_concat)
+                self._cc_commits += 1
+                self._cc_starve_t0 = 0.0  # definite 到达：饥饿钟清零
+                try:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(language=self._stt_._lang(), text=delta)],
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
+                    continue
+                tag = "UTTERANCE definite" if delta == utext else "SU_MERGE delta"
+                print(
+                    f"[doubao] {tag} chars={len(delta)} "
+                    f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
+                    flush=True,
+                )
+            elif committed.startswith(new_concat):
+                self._su_concat = new_concat  # 本地闸已越过：记账对齐、零增量
+            else:
+                # 坐标失配（罕见：ASR 改写跨 definite 边界）——保守跳过，EOS 对齐梯兜底。
+                self._su_concat = new_concat
+                print(f"DOUBAO_SU_MISMATCH committed={committed[:30]!r} concat={new_concat[:30]!r}", flush=True)
 
     def _maybe_interim(self, text: str) -> None:
         if not text or text == self._last_interim_emitted:
@@ -669,7 +825,26 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 那个 interim 可见(会话级 display 已剥走),而后续 interim 的 spec 视角
         # 自动回到「下一 FINAL 同坐标系」(余段视角),不会对已提交子句重复开火。
         _spec_feed = text
-        if self._clause_commit:
+        if self._server_utt:
+            # 混合档（call-72cf9f49 翻案二折）：服务端 definite 管停顿边界（准），
+            # 本地意群闸管连续语流（快——definite 需要 ≥end_window 静音窗，连续
+            # 长讲零 definite=LLM 空等，49 字三句攒一坨实弹定案）。
+            # 前缀坐标共享：definite 到达时按前缀合并只发增量（_server_definite_commits）。
+            now = time.monotonic()
+            uncommitted = text[self._cc_committed_len:] if text.startswith(self._cc_committed_text or "\x00") else text
+            if self._cc_starve_t0 <= 0.0 and len(uncommitted.strip()) >= 4:
+                self._cc_starve_t0 = now  # 未提交文本开始积了：饥饿钟起跑
+            if self._cc_starve_t0 > 0.0 and now - self._cc_starve_t0 >= self._cc_starve_s:
+                # 连续语流无 definite → 本地闸接管（意群档 12/15/1.2 env）。
+                # 阈值=end_window（call-6f92bfd4 翻案：实弹 definite 只在停顿后
+                # 到达=每 utterance 1 次，连续语流中途恒零——1.2s 死等纯浪费且
+                # 直接顶高首声；若 definite 要来，end_window 内必到，等过窗即接管）。
+                self._maybe_clause_commit(text, _prev)
+            if self._cc_committed_text and text.startswith(self._cc_committed_text):
+                display = text[self._cc_committed_len:]
+            else:
+                display = text
+        elif self._clause_commit:
             _spec_base = self._cc_committed_len
             self._maybe_clause_commit(text, _prev)
             display = self._clause_tail(text)
@@ -707,6 +882,33 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             last_commit_at=self._cc_last_commit_at,
             now=now,
         )
+        if cut is None and self._stt_._len_fuse and self._cc_committed_len == 0 and self._cc_commits == 0:
+            # 快启动层（EVS 目标，2026-10-09）：utterance 首块小门槛抢首声
+            # （~2.3s vs 意群档 ~3s）；后续块回意群档。len_fuse 旗控=旧线零变化。
+            fast = _first_block_cut(text, prev_full)
+            if fast is not None:
+                cut = fast
+        if cut is None and self._stt_._len_fuse:
+            # 长度保险丝（标点档未命中才问；限速/跨窗稳定与标点档同判据；稳定
+            # 判据=**归一化**比较——ASR 回溯改标点不再废稳定性，call-ed6326a5
+            # 实弹：raw 比较下保险丝在首火后即被标点改写持续打哑）。
+            from .livekit_plugins import (  # noqa: PLC0415
+                _sentence_commit_min_interval_s,
+                _strip_punct_space,
+            )
+
+            try:
+                min_chars = int(os.environ.get("QWEN3_ASR_CLAUSE_LEN_CHARS", "20") or 20)
+            except ValueError:
+                min_chars = 20
+            fuse = _len_fuse_cut(text, self._cc_committed_len, max(1, min_chars))
+            if (
+                fuse is not None
+                and now - self._cc_last_commit_at >= _sentence_commit_min_interval_s()
+                and _strip_punct_space(prev_full[self._cc_committed_len:fuse])
+                == _strip_punct_space(text[self._cc_committed_len:fuse])
+            ):
+                cut = fuse
         if cut is None:
             return
         clause = text[self._cc_committed_len:cut]
@@ -739,9 +941,11 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         ——partial 修订**绝不回滚已发出的 FINAL**）：
         ① 严格前缀 startswith（主路径：单调累积极少改写已稳定头）；
         ② 归一化前缀（去标点/空白逐字对齐——服务端标点改写不算新内容）；
-        ③ 双失配 → 记 ``DOUBAO_CLAUSE_ALIGN_RESET`` + 重置对齐：把已见全文认作
-           已主张领地（committed=全文）。宁可漏掉修订 delta，绝不重发已交内容
-           （重发=下游 MT 重复烧一整句，比漏一两个字更糟）。
+        ③ 双失配 → **交差量再重置**（2026-10-09 修订，call-ed6326a5 实弹：旧版
+           静默吞字——句档/保险丝下 ASR 回溯改字使双失配必现，每句吞 20-35 字）：
+           找最长公共归一前缀 p，把 p 之后的新内容当尾巴交出去（发 FINAL 落账），
+           然后重置领地 committed=全文。旧取舍「宁漏勿重」作废——同传漏句不可
+           接受；修订重叠处的极小重复可接受且有观测行。
         """
         if not self._cc_committed_text:
             return text
@@ -769,8 +973,39 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             f"text={text[:40]!r}",
             flush=True,
         )
+        # 交差量：p=最长公共归一前缀；norm_t[p:] 是未交过的新内容 → **直接发
+        # FINAL**（差量只在 INTERIM 显示=MT 仍吃不到，吞字没修透）；然后重置
+        # 领地 committed=全文、display 空。旧取舍「宁漏勿重」作废——同传漏句
+        # 不可接受；修订重叠处的极小重复可接受且有 DELTA 观测行。
+        p = 0
+        while p < min(len(norm_c), len(norm_t)) and norm_c[p] == norm_t[p]:
+            p += 1
+        delta = ""
+        if p < len(norm_t):
+            need = p
+            raw_p = None
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                if need == 0:
+                    raw_p = i
+                    break
+                need -= 1
+            if raw_p is not None and raw_p < len(text):
+                delta = text[raw_p:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
         self._cc_committed_text = text
         self._cc_committed_len = len(text)
+        if delta:
+            print(f"DOUBAO_CLAUSE_ALIGN_DELTA chars={len(delta)}", flush=True)
+            try:
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        alternatives=[stt.SpeechData(language=self._stt_._lang(), text=delta)],
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 流已关：差量丢弃（下轮 EOS 兜底整段）
+                pass
         return ""
 
     def _feed(self, pcm: bytes) -> None:
@@ -822,6 +1057,9 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._cc_committed_text = ""
         self._cc_seg_t0 = 0.0
         self._cc_commits = 0
+        self._su_emitted = 0  # 服务端分句计数随段清（新 utterance 从头数）
+        self._su_concat = ""  # definite 累积文本随段清（前缀合并坐标）
+        self._cc_starve_t0 = 0.0  # 饥饿钟随段清
         # 暴露位随段清零；FINAL 发出点按 pre-reset 快照重贴（与 Qwen3 版契约一致）。
         self._stt_._turn_partial_text = ""
 
@@ -891,6 +1129,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
     # ---- 主循环（VAD 双任务骨架，与 _Qwen3ASRLiveStream 同构）----
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
+        started = False  # 取证插桩可见位（_recognize 经 nonlocal 维护）
 
         async def _forward_input() -> None:
             async for input in self._input_ch:
@@ -901,6 +1140,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             vad_stream.end_input()
 
         async def _recognize() -> None:
+            nonlocal started
             started = False
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
@@ -978,6 +1218,12 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     speech_end_time = (
                         time.time() - event.silence_duration - event.inference_duration
                     )
+                    # call-9e0dada0 取证插桩：VAD END 的静音时长（判「真停顿」vs 误 END）
+                    print(
+                        f"DOUBAO_SEG_EOS silence={event.silence_duration:.2f}s "
+                        f"inference={event.inference_duration:.2f}s",
+                        flush=True,
+                    )
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.END_OF_SPEECH,
@@ -999,6 +1245,14 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         try:
             await asyncio.gather(_forward_input(), _recognize())
         finally:
+            # call-9e0dada0 取证插桩：STT 流寿命终点（vad 流尽/框架关流）——
+            # 若在 started=1 时到这里=流被上游提前关（段截断的根因位）。
+            print(
+                f"DOUBAO_SEG_STREAM_END started={int(started)} "
+                f"finishing={int(self._finishing)} tailing={int(self._tailing)} "
+                f"alive={int(self._session_alive)}",
+                flush=True,
+            )
             self._cancel_tail()
             await self._close_session()
 

@@ -560,7 +560,7 @@ def _start_llm(
     a_reply+judge+settle 全 openai）时整条本地链（mlx/queue proxy）不拉起。"""
     p = posture if posture is not None else _cloud_posture()
     if p["llm_cloud"]:
-        print(f"[bok] llm :1235 skipped (cloud: {p['llm_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        print(f"[bok] llm :1235 skipped (cloud: {p['llm_why']}; 要本地档才设 BOK_LOCAL_LLM=1)")
         return
     # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
@@ -691,7 +691,7 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path, posture
     """
     p = posture if posture is not None else _cloud_posture()
     if not p["mt_local"]:
-        print(f"[bok] mt :1236 skipped (cloud: {p['mt_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        print(f"[bok] mt :1236 skipped (cloud: {p['mt_why']}; 要本地档才设 BOK_LOCAL_LLM=1)")
         return False
     if core.healthy(1236):
         return True
@@ -761,7 +761,7 @@ def _start_settle_llm(
     p = posture if posture is not None else _cloud_posture()
     if p["settle_cloud"]:
         print(
-            f"[bok] settle lane :1237 skipped (cloud: {p['settle_why']}; BOK_LOCAL_LLM=1 强制拉起)",
+            f"[bok] settle lane :1237 skipped (cloud: {p['settle_why']}; 要本地档才设 BOK_LOCAL_LLM=1)",
             file=sys.stderr,
         )
         return False
@@ -1004,7 +1004,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
             # sidecar 不拉起（1.9GB+ 权重零消费）；BOK_LOCAL_ASR=1 是显式回拉口。
             print(
                 f"[bok] asr sidecar :8787 skipped (cloud: {posture['asr_why']};"
-                " BOK_LOCAL_ASR=1 强制拉起)"
+                " 要本地档才设 BOK_LOCAL_ASR=1)"
             )
         else:
             _start_proc(
@@ -1033,7 +1033,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
                 "QWEN3_TTS_WARMUP": "0" if paths.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
         )
     elif not tts_needed:
-        print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
+        print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; 要本地档才设 BOK_LOCAL_TTS=1)")
 
     _start_llm(current, run_dir, log_dir, posture)
     want_mt = _start_mt_llm(current, run_dir, log_dir, posture)
@@ -1163,6 +1163,58 @@ def _realtime_demo_enabled() -> bool:
     return os.environ.get("BOK_QWEN_REALTIME", "") == "1"
 
 
+def _interp_lite_enabled() -> bool:
+    """B 线薄线随栈开关（opt-in，2026-10-09 interp-lite 试点）：BOK_INTERP_LITE="1"
+    时 interp-fwd/rev 两 worker 改拉 ``agent_runtime.interp_lite.worker``。
+
+    serve 侧开关（BOK_LOCAL_TTS 先例，不进 _FORWARD_ENV——worker 不读它，bokctl
+    读）；端口/agent_name/健康面与旧线同槽位（8082/8083、bok-interp-fwd/rev），CP/
+    前端零感知。切换=重启栈（试点期例外，蓝图 docs/superpowers/plans/
+    2026-10-09-interp-lite.md §7）；默认 0=旧线逐字节。"""
+    return os.environ.get("BOK_INTERP_LITE", "") == "1"
+
+
+def _interp_worker_module() -> str:
+    return (
+        "agent_runtime.interp_lite.worker"
+        if _interp_lite_enabled()
+        else "agent_runtime.interpret"
+    )
+
+
+def interp_lite_commit_env(base: dict) -> dict:
+    """薄线意群档提交缺省（W6×interp-lite 合流刀1，2026-10-09 两轮实弹定档；纯函数，单测直喂）。
+
+    W6 立项档（docs/superpowers/plans/2026-10-09-bline-fluency.md）60 条 INTERP_LAG
+    分布定案：病=碎片化串行（src_chars p50=10 字、段间天窗复利），不是 MT 腿——
+    旧线 B 档「逗号 6 字/限速 1.0s」把语流切成 2 秒碎片。本函数给**薄线 worker**
+    注入意群档缺省（翻译单元=意群 10-15 字，W6 参照系「意群边界」原话）：
+
+    - ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=12``：逗号（次级标点）档门槛 12 字
+      ——**真人实测两轮定档**（call-b3e4e391）：999 句档单元 30+ 字=7-8 秒大段
+      音频，尾部排队滞后 7-10 秒（「大块迟到」非跟读）；6 字碎片档=2 秒天窗。
+      12 字=意群级，每段 2.5-4 秒音频，语流中每 2-3 秒一段；
+    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=15``：无标点语流 15 内容字保险丝（同轮定档；
+      拉丁 2× 语义在 provider 内）；
+    - ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S=1.2``：意群档限速。
+
+    三键语义=**覆盖 B 档碎片缺省**（``_interp_env`` 已 setdefault 6/8/1.0 进 base，
+    故本函数必须硬覆盖而非 setdefault），优先序=运营显式 env > 薄线意群档 > B 档
+    碎片缺省。键集全部既有（_FORWARD_ENV 已登记，零新键）；worker 进程 env 各自
+    独立，旧线（开关关）零感知。回退=serve env 显式设旧值或 BOK_INTERP_LITE=0。"""
+    profile = {
+        "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS": "12",
+        "QWEN3_ASR_CLAUSE_LEN_CHARS": "15",
+        "QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "1.2",
+    }
+    out = dict(base)
+    out.update(profile)
+    for key in profile:
+        if key in os.environ:  # 运营显式值最高优先
+            out[key] = os.environ[key]
+    return out
+
+
 def _worker_specs(py) -> list[dict]:
     """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
     + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
@@ -1187,13 +1239,18 @@ def _worker_specs(py) -> list[dict]:
         interp_env["BOK_SERVICE"] = f"interp-{_dir}"
         interp_env["INTERP_DIRECTION"] = _dir
         env._apply_interp_direction_env(interp_env, _dir)
+        # 薄线句档提交缺省（W6×interp-lite 合流刀1）：翻译单元=句末标点。
+        if _interp_lite_enabled():
+            interp_env = interp_lite_commit_env(interp_env)
         specs.append(
             {
                 "name": f"interp-{_dir}",
                 "port": _port,
                 "pidfile": run_dir / f"interp-{_dir}.pid",
                 "logfile": log_dir / f"interp-{_dir}.log",
-                "argv": [str(py), "-m", "agent_runtime.interpret"],
+                # interp-lite 试点开关：BOK_INTERP_LITE=1 换薄线入口（同端口/同
+                # agent_name/同健康面；蓝图 2026-10-09-interp-lite.md）。
+                "argv": [str(py), "-m", _interp_worker_module()],
                 "env": interp_env,
             }
         )
