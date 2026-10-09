@@ -232,8 +232,11 @@ def test_pipeline_final_hit_skips_queue(monkeypatch):
         assert ctl.hold.text == "好的，马上帮您处理，"  # 投机 MT 已落地（held 文本=MT 译文）
         assert ctl.hold.pcm  # TTS 排干 PCM 在槽
         p.enqueue("好的，马上帮您处理，好的")  # final：span+余段
-        assert p.q.qsize() == 1 and list(p.q._queue) == ["好的"]  # 余段入队
-        assert p.session.audio_said[0] is not None  # HIT=audio 直播（零合成）
+        # W8 乱序修复：HIT 走 enqueue_precomputed 入 FIFO（二元组），余段照旧入队
+        assert p.q.qsize() == 2  # HIT 预合成 + 余段
+        qitems = list(p.q._queue)
+        assert isinstance(qitems[0], tuple)  # HIT=（text, frames）二元组（FIFO 保序）
+        assert qitems[1] == "好的"  # 余段
         assert p.lag.dones == [0]  # 投机轮 mt_ms=0（旧线同口径）
 
     asyncio.run(scenario())

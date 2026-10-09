@@ -128,14 +128,13 @@ def build(pipeline, *, tts_provider, run_mt, stats: dict | None = None, log=prin
         return busy
 
     def _say_cached(final_src: str, text: str, pcm: bytes) -> None:
-        """HIT 直播：held PCM 走 say(audio=frames) 零合成（qa_gate 罐头车同构）。
-        先 say 后记账：say 失败不留 pending 孤儿；投机轮 mt_ms=0（旧线同口径）。"""
-        from ..tts_cache import frames_aiter, pcm_to_frames
+        """HIT 入队（不跳队——FIFO 保序）：held PCM 包装为预合成单元入 FIFO，
+        播放顺序由队列保证（2026-10-09 乱序修复：call-452f135e 实弹 HIT 跳队
+        在前序单元之前播出）。零合成优势保留（mt_ms=0），只是排队等播。"""
+        from ..tts_cache import pcm_to_frames
 
-        pipeline.session.say(
-            pipeline._final_text(text),
-            audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate)),
-        )
+        frames = pcm_to_frames(pcm, tts_provider.sample_rate)
+        pipeline.enqueue_precomputed(final_src, pipeline._final_text(text), frames)
         pipeline.last_ms["ms"] = 0
         pipeline.lag.note_src(final_src)
         pipeline.lag.done_mt(0)

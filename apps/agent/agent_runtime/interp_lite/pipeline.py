@@ -176,6 +176,20 @@ class InterpPipeline:
         self._enq.append(time.perf_counter())
         self.lag.note_src(text)
 
+    def enqueue_precomputed(self, src: str, text: str, frames) -> None:
+        """spec HIT 预合成单元入队（FIFO 保序——2026-10-09 乱序修复）。
+
+        held PCM 已合成、不需要再跑 MT——但**必须排队等播**（不跳队），
+        否则前序单元还在播时 HIT 单元突然插到前面=乱序（call-452f135e 实弹）。
+        内部形状=队列里放 (text, frames) 二元组而非裸 str；run 循环识别
+        二元组时跳过 MT 直播 frames。"""
+        try:
+            self.q.put_nowait((text, frames))
+        except asyncio.QueueFull:
+            print("[interp-lite] precomputed queue overflow, dropped(摘译)", flush=True)
+            return
+        self._enq.append(time.perf_counter())
+
     def shutdown(self) -> None:
         """收线卫生：投机在途任务 + MT 泵 + 催尾观察者 cancel（绝不外抛；无=no-op）。
 
@@ -209,7 +223,7 @@ class InterpPipeline:
     # ---- 主循环 ----
     async def run(self) -> None:
         while True:
-            text = await self.q.get()
+            item = await self.q.get()
             t_enq = self._enq.popleft() if self._enq else None
             self.queue_wait_ms["ms"] = (
                 int((time.perf_counter() - t_enq) * 1000) if t_enq is not None else 0
@@ -221,6 +235,15 @@ class InterpPipeline:
                     self.session.say(_mt_fail_line(self.target_lang))
                     self._done(0)
                     continue
+                # spec HIT 预合成单元（二元组）：跳过 MT 直播 frames（FIFO 保序到达）。
+                if isinstance(item, tuple):
+                    text, frames = item
+                    from ..tts_cache import frames_aiter
+
+                    self.session.say(text, audio=frames_aiter(frames))
+                    self.pairs.append((text, text))
+                    continue
+                text = item
                 self.mt_busy["flag"] = True
                 try:
                     await self._translate_say(text, t0)
