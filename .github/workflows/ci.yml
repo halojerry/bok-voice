@@ -91,6 +91,15 @@ jobs:
         run: npm test
       - name: Thin-client static probe (out/ 注入链形状 + 无烤死 localhost; runner python 即可,纯 stdlib)
         run: python scripts/probes/probe_thin_client_static.py
+      # W⑧-8 供应链审计（advisory：存量有 high 级发现，清零后翻 blocking——
+      # 见 docs/SECURITY-SAAS.md §6）。
+      - name: pip-audit (advisory, W⑧)
+        run: pip install pip-audit >/dev/null 2>&1 && pip-audit --skip-editable || echo "::warning::pip-audit 有发现（advisory 档）"
+        continue-on-error: true
+      - name: npm audit (advisory, W⑧)
+        working-directory: apps/web
+        run: npm audit --audit-level=high || echo "::warning::npm audit 有 high 级发现（advisory 档）"
+        continue-on-error: true
 
   bok:
     name: Launcher smoke

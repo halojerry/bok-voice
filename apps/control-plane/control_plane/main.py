@@ -321,6 +321,17 @@ init_sentry("control-plane")
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
 app.middleware("http")(identity_gate)
+
+
+# W⑧-7（2026-10-09）响应头加固：防点击劫持（DENY）+ MIME 嗅探关（nosniff）。
+# 对 /api JSON 与静态托管一视同仁；CSP 全策略（connect-src 收口）见
+# docs/SECURITY-SAAS.md——不盲配 script-src 以免误杀静态台内联 runtime-config。
+@app.middleware("http")
+async def security_headers_gate(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
 # 未设 env 时 `[]`（交由 _cors_allow_origins 按启动闸判据决定缺省，别再喂 "*"——
 # 那会把「显式配置」与「缺省」混同，令裸放行档的 `*` 收窄永不生效）。
 _cors_origins = [
@@ -2745,6 +2756,22 @@ def _require_template_env() -> bool:
 _LIVE_CALL_STATUSES = (CallStatus.RINGING.value, CallStatus.ACTIVE.value, CallStatus.PAUSED.value)
 
 
+# ---- W⑧-4（2026-10-09）外呼日拨配额：按账号按日计数（进程内，UTC 日界）。 ----
+_DIAL_QUOTA_DAY: dict[str, tuple[str, int]] = {}  # account_id → (YYYY-MM-DD, count)
+
+
+def _dial_quota_take(account_id: str, quota: int) -> bool:
+    """计数+1；返回 True=已超限（拒）。日界翻转自动清零；脏键惰性回收。"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if len(_DIAL_QUOTA_DAY) > 65536:  # 防键图无界（滥用账号也造不出 DoS）
+        _DIAL_QUOTA_DAY.clear()
+    day, count = _DIAL_QUOTA_DAY.get(account_id, ("", 0))
+    if day != today:
+        count = 0
+    _DIAL_QUOTA_DAY[account_id] = (today, count + 1)
+    return count + 1 > quota
+
+
 def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     """建通话（会话清单装配 + 审计）；repo 由调用方给出（端点= `_repo()`）。
 
@@ -2764,6 +2791,19 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
                            "reason": _famine_block["reason"],
                            "famine": _famine_block["famine"]})
             raise PipelineConflictError("节点饥荒降档中，暂停新建单", stage="call.create.famine")
+        # W⑧-4（2026-10-09 红队加固）外呼日拨配额：合法客户烧电话费/骚扰真实
+        # 号码的滥用闸——按账号按日计数（进程内，与 login/cost 限速同族单进程
+        # 形态），超限 403 + 审计。BOK_DIAL_DAILY_QUOTA=0（缺省）=不限；
+        # campaign/dial-now/人工建单全走本汇聚点=全覆盖。
+        _quota = int(os.environ.get("BOK_DIAL_DAILY_QUOTA", "0") or 0)
+        if _quota > 0 and _dial_quota_take(str(req.account_id or ""), _quota):
+            _audit("call.reject_dial_quota", subject_type="call", account_id=req.account_id,
+                   outcome="denied",
+                   detail={"mode": req.mode, "quota": _quota})
+            raise HTTPException(
+                status_code=403,
+                detail=f"今日外呼已达平台上限（{_quota} 通/天），请联系平台管理员",
+            )
     # 并发准入 + 重复建单防重（2026-09-27）：建单前拒，绝不先建后杀。
     # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
     # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限

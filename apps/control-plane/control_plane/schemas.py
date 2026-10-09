@@ -44,7 +44,9 @@ class LoginRequest(BaseModel):
     # username 上限 128（评审 I-2，fix round 1）：登录是预认证端点，超长串原样
     # 进 strip/查库/频控键=无谓成本；pydantic 层 422 拒收。
     username: str = Field(max_length=128)
-    password: str
+    # W⑧-6（2026-10-09）巨包钳制：password 同款上限（scrypt 对兆级串做 KDF
+    # =纯 DoS 放大器）。
+    password: str = Field(max_length=256)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -78,10 +80,10 @@ class UpdateUserRequest(BaseModel):
 
 
 class CreateAccountRequest(BaseModel):
-    display_name: str = ""
+    display_name: str = Field(default="", max_length=255)
     # 客户管理员登录名/初始密码（密码 ≥12 位强门槛——客户侧唯一登录入口）。
-    admin_username: str
-    admin_password: str
+    admin_username: str = Field(max_length=128)
+    admin_password: str = Field(max_length=256)
     # 有效期天数（1~3650）；0/缺省=永久（NULL）。
     duration_days: int = 0
 
