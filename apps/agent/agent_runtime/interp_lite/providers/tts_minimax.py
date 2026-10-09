@@ -112,8 +112,13 @@ def tail_flush_channel(tts_provider):
     return _flush
 
 
-def build(tts_cfg: dict, target_lang: str, session_voices=None):
-    """组装 MiniMaxTTS（2.8-turbo 档=语气标记支持；prewarm 后台跑，失败零影响）。"""
+def build(tts_cfg: dict, target_lang: str, session_voices=None, frame_transform=None):
+    """组装 MiniMaxTTS（2.8-turbo 档=语气标记支持；prewarm 后台跑，失败零影响）。
+
+    ``frame_transform``（W8-B auto_tempo，可选）：「逐流变换工厂」``factory() ->
+    变换对象|None``，由 interp_lite 侧 TempoController 产出（播放水位变速追播）；
+    经 MiniMaxTTS 到 bidi 流 emitter push 处应用。缺省 None=A 线与旧行为逐字节
+    零变化（决策留在 interp_lite，A 线装配根本不经过本参数）。"""
     tts_ls = _lp.LanguageState()
     tts_ls.lang = target_lang
     tts = _lp.MiniMaxTTS(
@@ -123,6 +128,7 @@ def build(tts_cfg: dict, target_lang: str, session_voices=None):
         api_key=str(tts_cfg.get("api_key") or ""),
         model_override=_resolve_minimax_model(),  # B 线缺省 speech-2.8-turbo
         language_boost=BOOST_MAP.get(target_lang) or None,
+        frame_transform=frame_transform,
     )
     try:
         pw = tts.prewarm()

@@ -15,6 +15,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -3831,6 +3832,7 @@ class MiniMaxTTS(tts.TTS):
         model_override: str = "",
         language_boost: str | None = None,
         pronunciation: list[str] | None = None,
+        frame_transform: Callable[[], Any] | None = None,
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -3855,6 +3857,11 @@ class MiniMaxTTS(tts.TTS):
         # 纯文本替换)。粤语拼法由调用方给(本层不做 g2p);空/None=完全不下发键,
         # 现行为零变化(2026-09-27)。
         self._pronunciation = [str(e) for e in (pronunciation or []) if str(e).strip()]
+        # 播放背压变速注入(W8-B auto_tempo,interp_lite 专属装配):「逐流变换工厂」
+        # factory() -> 变换对象|None,工厂返回的变换对象=可调用(bytes)->bytes 且可选
+        # finalize()->bytes(bidi 流收尾时调,残尾+时长观测)。None/缺省=A 线与旧行为
+        # 逐字节零变化;决策(水位/档位)全部留在 interp_lite 侧(auto_tempo)。
+        self._frame_transform = frame_transform
 
     def _resolve_emotion(self) -> str | None:
         """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
@@ -5539,6 +5546,31 @@ class _MiniMaxBidiSession:
                 self.prewarm()
 
 
+class _TempoPushProxy:
+    """emitter 薄代理（W8-B auto_tempo 变速注入，interp_lite 专属装配）。
+
+    只拦 ``push``：字节先经逐流变换（OLA 追播，变换对象由 ``MiniMaxTTS._frame_transform``
+    工厂产出）再推真 emitter；变换抛错=该块原样直推（变速纯增益，绝不成为新
+    故障源）。initialize/start_segment/flush/end_segment 等经 ``__getattr__``
+    绑定到真 emitter——框架侧段计数/pushed_duration 口径不破。变换缺席=
+    本代理根本不挂（``_run`` 处短路），A 线/旧行为逐字节零变化。"""
+
+    def __init__(self, inner, stretch):
+        self._inner = inner
+        self._stretch = stretch
+
+    def push(self, data: bytes) -> None:
+        try:
+            out = self._stretch(bytes(data))
+        except Exception:  # noqa: BLE001 - 变换失败退原样
+            out = bytes(data)
+        if out:
+            self._inner.push(out)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class _MiniMaxBidiStream(tts.SynthesizeStream):
     """MiniMax bidi 持久连接流：LLM 增量逐字 task_continue,服务端负责切句合成。
 
@@ -5657,6 +5689,18 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
 
     async def _run(self, output_emitter):
         t0 = time.monotonic()
+        # W8-B 播放背压变速注入（interp_lite auto_tempo）：「逐流变换工厂」在位时
+        # 挂 emitter 代理（push 字节经 OLA 追播）；工厂缺席/返回 None/抛错=原速
+        # 直通（A 线与旧行为逐字节零变化）。决策全部在 interp_lite 侧，本层只应用。
+        stretch = None
+        _ft_factory = getattr(self._tts_, "_frame_transform", None)
+        if _ft_factory is not None:
+            try:
+                stretch = _ft_factory()
+            except Exception:  # noqa: BLE001 - 变换装配失败=原速直通
+                stretch = None
+        if stretch is not None:
+            output_emitter = _TempoPushProxy(output_emitter, stretch)
         try:
             key = self._tts_._api_key()
             if not key:
@@ -6356,6 +6400,18 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         f"bytes={state['stale_bytes']}",
                         flush=True,
                     )
+                if stretch is not None:
+                    # 变换流收尾（W8-B）：排干残余输入+吐出窗口余量+输入时长观测
+                    # （句均时长 EMA 回灌 interp_lite TempoController）。尽力而为。
+                    fin = getattr(stretch, "finalize", None)
+                    if callable(fin):
+                        try:
+                            tail = fin()
+                            if tail:
+                                output_emitter.push(tail)
+                                output_emitter.flush()
+                        except Exception:  # noqa: BLE001
+                            pass
                 session.lock.release()
         except asyncio.CancelledError:
             raise

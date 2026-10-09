@@ -115,6 +115,7 @@ class InterpPipeline:
         tts_provider=None,
         stt_provider=None,
         stats: dict | None = None,
+        tempo=None,
     ):
         self.session = session
         self.mt = mt
@@ -131,6 +132,7 @@ class InterpPipeline:
         self.lane_dead = {"reason": ""}
         self.mt_busy = {"flag": False}  # 真 MT 在途旗（spec busy 闸消费，旧线同构）
         self.round = 0
+        self._tempo = tempo  # 播放背压 auto_tempo（W8-B；None=未装配=零开销）
         self._last_say = None  # 最近一次 say 的 SpeechHandle（轮尾催尾的取消门）
         self._spec = None
         self._tail_flush = None
@@ -242,6 +244,26 @@ class InterpPipeline:
         self.lag.drop_src()
 
     # ---- 主循环 ----
+    def _tempo_tick(self) -> None:
+        """播放水位→变速档决策点（每单元出队后一次；tempo 未装配=no-op 逐字节）。
+
+        积压估计=FIFO 深度×近期句均时长（指数均值，TTS 侧逐流实测回灌，初值
+        2.5s，见 auto_tempo.TempoController）；档位升级一次一档、降级需保持满
+        hold_s 且积压低于进入阈值×0.7（退出滞回）。变速的音频应用在 TTS 侧
+        （frame_transform 注入），本点只做决策与档位观测。"""
+        tempo = self._tempo
+        if tempo is None:
+            return
+        depth = self.q.qsize()
+        prev_level = tempo.current.get("level", 0)
+        snap = tempo.resolve(tempo.backlog_estimate_ms(depth), depth, time.monotonic())
+        if snap["level"] != prev_level or snap["severe"]:
+            print(
+                f"[interp-lite] INTERP_TEMPO state={snap['state']} speed={snap['speed']} "
+                f"backlog_ms={snap['backlog_ms']:.0f} depth={depth}",
+                flush=True,
+            )
+
     async def run(self) -> None:
         while True:
             item = await self.q.get()
@@ -251,6 +273,7 @@ class InterpPipeline:
             )
             self.round += 1
             self._turn.cancel_close()  # 新单元到达=话轮未完,撤收口钟续流
+            self._tempo_tick()  # 变速背压:出队即按积压水位调档(armed 才动)
             t0 = time.perf_counter()
             try:
                 if self.lane_dead["reason"]:
