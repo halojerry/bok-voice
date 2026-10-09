@@ -5,7 +5,7 @@
 
 ## ① 执行波次（`docs/superpowers/plans/`）
 
-历史计划档（含过程叙事与验收读数；本仓波次结论已折叠进根目录 `../AGENTS.md`「波次纪要」）：
+历史计划档（含过程叙事与验收读数；2026-10-09 前的波次纪要/LiveKit 决策/生产姿态全量在 [archive/AGENTS-2026-10-09.md](archive/AGENTS-2026-10-09.md)）：
 
 - [2026-09-07 asr-hotword-context](superpowers/plans/2026-09-07-asr-hotword-context.md) — ASR 热词/context 软偏置
 - [2026-09-07 full-link-regression](superpowers/plans/2026-09-07-full-link-regression.md) — 全链路回归
@@ -46,6 +46,10 @@
 - [2026-10-02 b-line-wave1](superpowers/plans/2026-10-02-b-line-wave1.md) — B 线第一波（web UX 三刀同期）
 - [2026-10-04 repo-governance-plan](superpowers/plans/2026-10-04-repo-governance-plan.md) — 仓库治理计划（本索引与 `docs/RUNBOOK.md` 的出处，§3.3）
 - [2026-10-04 s2s-vs-cascade-report](superpowers/plans/2026-10-04-s2s-vs-cascade-report.md) — S2S vs 级联对照报告
+- [2026-10-06 demo-quality-wave](superpowers/plans/2026-10-06-demo-quality-wave.md) — 演示质量波
+- [2026-10-08 bline-parity](superpowers/plans/2026-10-08-bline-parity.md) — B 线对齐波
+- [2026-10-09 bline-fluency](superpowers/plans/2026-10-09-bline-fluency.md) — B 线流畅度
+- [2026-10-09 w7probe-results](superpowers/plans/2026-10-09-w7probe-results.md) — W7 探针结果
 
 ## ② 常设决策文档
 
@@ -56,15 +60,16 @@
 - [LATENCY_BUDGETS](LATENCY_BUDGETS.md) — 延迟预算与超时政策**单一事实源**（改默认值必同步）
 - [RUNTIME_TOPOLOGY](RUNTIME_TOPOLOGY.md) — 运行时拓扑（改端口/数据流前先读）
 - [QWEN-TTS-VOICE-WRITING](QWEN-TTS-VOICE-WRITING.md) — Qwen3-TTS 无标记系统正稿写法手册
-- [SECURITY-SCAN-TRIAGE-2026-10-01](SECURITY-SCAN-TRIAGE-2026-10-01.md) — 安全扫描分诊（文件名带日期）
+- [SECURITY-SCAN-TRIAGE-2026-10-09](SECURITY-SCAN-TRIAGE-2026-10-09.md) — 安全扫描分诊（文件名带日期；10-01 版已归档 archive/）
 - [ORCH-CLEANUP-CONTRACT](ORCH-CLEANUP-CONTRACT.md) — 编排梳理波冻结契约（17 波已落项与所有权）
 - [SCENE_CANVAS](SCENE_CANVAS.md) — 场景画布定稿（一步 = 一场景 = 一张画布）
 - [SECURITY_REDTEAM](SECURITY_REDTEAM.md) — CP 认证/节点面攻击面清点（防御性红队交付）
+- [AGENTS 历史全量（2026-10-09 前）](archive/AGENTS-2026-10-09.md) — 根 AGENTS.md 重初始化为第一性原理版之前的全文（波次纪要/LiveKit 决策/生产姿态/全部模块深度规则）
 
-## ③ 速查口径（跨层铁律，细则见 ../AGENTS.md 对应节）
+## ③ 速查口径（跨层铁律；现行条目见 ../AGENTS.md 对应节，深度细则在 [archive/AGENTS-2026-10-09.md](archive/AGENTS-2026-10-09.md) 对应节）
 
-- **粤语规范值 = 小写 `cantonese`，全时空唯一拼写**；门禁 `tests/test_cantonese_terminology.py` → ../AGENTS.md「Language / Terminology Rules」节。
-- **env 开关立法**：新增 env 必须在 `tools/bokctl/env.py` `_FORWARD_ENV` 表加一行，否则 prod 静默死门；门禁 `tests/test_forward_env.py` → ../AGENTS.md「`_FORWARD_ENV` 立法」条。
-- **LiveKit 官方优先三档判据**（①官方有先查官方 ②授权自定义层不算造轮子 ③实证分叉必须有档案）→ ../AGENTS.md「LiveKit 决策（官方优先 & 接入契约）」节。
-- **多会话并行纪律**：专属 worktree + 分支、幂等提交（`[SESSION_ID]` 标记）、不碰 main、不碰他 会话工作区 → ../AGENTS.md「Multi-Session Git Discipline」节。
-- **原文单轨铁律**：ASR 润色副本只喂 LLM 上下文，FlowController/WA 收号/QA 快路/意图判定全吃 raw → ../AGENTS.md「ASR 栈」节。
+- **粤语规范值 = 小写 `cantonese`，全时空唯一拼写**；门禁 `tests/test_cantonese_terminology.py` → ../AGENTS.md「代码风格」节。
+- **env 开关立法**：新增 env 必须在 `tools/bokctl/env.py` `_FORWARD_ENV` 表加一行，否则 prod 静默死门；门禁 `tests/test_forward_env.py` → ../AGENTS.md「代码风格」节。
+- **LiveKit 官方优先三档判据**（①官方有先查官方 ②授权自定义层不算造轮子 ③实证分叉必须有档案）→ archive/AGENTS-2026-10-09.md「LiveKit 决策（官方优先 & 接入契约）」节。
+- **多会话并行纪律**：专属 worktree + 分支、幂等提交（`[SESSION_ID]` 标记）、不碰 main、不碰其他会话工作区 → archive/AGENTS-2026-10-09.md「Multi-Session Git Discipline」节。
+- **原文单轨铁律**：ASR 润色副本只喂 LLM 上下文，FlowController/WA 收号/QA 快路/意图判定全吃 raw → archive/AGENTS-2026-10-09.md「ASR 栈」节。
