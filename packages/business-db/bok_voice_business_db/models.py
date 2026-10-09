@@ -24,6 +24,10 @@ class Account(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     org_id: Mapped[str] = mapped_column(String(64), default="", index=True)  # 租户缝（B1 身份）
     display_name: Mapped[str] = mapped_column(String(255), default="")
+    # SaaS 客户订阅有效期（W① 2026-10-09）：NULL=永久（存量/开发形态不执法）。
+    # 到期执法在 CP auth.identity_gate 的 account_expired 闸（W②）——按账号状态
+    # 逐请求重估，与 JWT 签名/角色正交（偷来的有效 token 同拦）。
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

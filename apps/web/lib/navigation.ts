@@ -88,6 +88,9 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     items: [
       { href: "/supervisor", label: "主管台", admin: true, mkey: "supervisor", icon: Headphones },
       { href: "/users", label: "员工", admin: true, mkey: "users", icon: Users },
+      // SaaS 客户生命周期（W① 2026-10-09）：root 专属——建客户/有效期/续费。
+      // 到期执法在 CP identity_gate；本面只管生命周期，引擎配置恒在 /settings。
+      { href: "/customers", label: "客户", rootOnly: true, icon: BookUser },
       { href: "/nodes", label: "节点", rootOnly: true, icon: Server },
       // 容灾处置面板（DR 波 §6）：rootOnly 入口 + 独立页——改动最小的一档
       // （本行 + app/(app)/disaster/page.tsx；RouteGuard 的 root 门、侧栏过滤、

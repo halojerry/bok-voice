@@ -173,6 +173,14 @@ def build_engine() -> Engine | None:
                     "org_id",
                     "org_id VARCHAR(64) DEFAULT ''",
                 )
+                # W①（2026-10-09）SaaS 订阅有效期：TIMESTAMP 两方言可移植
+                # （SQLite 宽松接受/PG=WITHOUT TIME ZONE），NULL=永久（存量不执法）。
+                _ensure_column(
+                    conn,
+                    "accounts",
+                    "expires_at",
+                    "expires_at TIMESTAMP",
+                )
                 _ensure_column(
                     conn,
                     "call_sessions",
@@ -465,6 +473,49 @@ def build_engine() -> Engine | None:
                     conn.exec_driver_sql(ddl)
         except Exception as exc:  # pragma: no cover - 建表失败不阻断启动
             print(f"[deps] qa digest tables skipped: {exc}")
+
+        # ---- 数据迁移（W① 2026-10-09）：users 在用的账号补建 Account 行。
+        # accounts 表此前是空壳（B1 只立缝）——SaaS 客户生命周期激活后，存量
+        # account_id（如 acc-001）需有对应 Account 行才可被 /api/accounts 管理。
+        # expires_at 留 NULL=永久（存量客户零行为变化，root 可后续设期限）。
+        # display_name 取该账号首个 admin 的用户名（无 admin 则空）。
+        try:
+            with engine.begin() as conn:
+                _have = {
+                    str(r[0])
+                    for r in _exec_bound(
+                        conn, text("SELECT id FROM accounts")
+                    ).fetchall()
+                }
+                _urows = _exec_bound(
+                    conn,
+                    text(
+                        "SELECT account_id, username FROM users "
+                        "WHERE role='admin' AND account_id <> '' "
+                        "ORDER BY created_at"
+                    ),
+                ).fetchall()
+                _names: dict[str, str] = {}
+                for _acc, _uname in _urows:
+                    _names.setdefault(str(_acc), str(_uname or ""))
+                _all = _exec_bound(
+                    conn,
+                    text("SELECT DISTINCT account_id FROM users WHERE account_id <> ''"),
+                ).fetchall()
+                for (_acc,) in _all:
+                    _acc = str(_acc)
+                    if _acc in _have:
+                        continue
+                    _exec_bound(
+                        conn,
+                        text(
+                            "INSERT INTO accounts (id, org_id, display_name, expires_at, created_at) "
+                            "VALUES (:id, '', :dn, NULL, CURRENT_TIMESTAMP)"
+                        ),
+                        {"id": _acc, "dn": _names.get(_acc, "")},
+                    )
+        except Exception as exc:  # pragma: no cover - 回填失败不阻断启动（列已补齐）
+            print(f"[deps] account backfill skipped: {exc}")
 
         # ---- 数据迁移：语言值 yue → cantonese 全栈统一（幂等，SQLite/Postgres 通用）。
         # 这是全仓唯一的旧值兼容点：旧库在 CP 启动时一次性落成规范值 cantonese，

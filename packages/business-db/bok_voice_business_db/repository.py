@@ -1447,6 +1447,51 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return self._user_to_dict(row)
 
+    # ---- accounts（SaaS 客户生命周期，W① 2026-10-09；expires_at NULL=永久）----
+
+    @staticmethod
+    def _account_to_dict(row: models.Account) -> dict:
+        exp = row.expires_at
+        if exp is not None and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return {
+            "id": row.id, "org_id": row.org_id or "",
+            "display_name": row.display_name or "",
+            "expires_at": exp.isoformat() if exp else "",
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def get_account(self, account_id: str) -> dict | None:
+        row = self.session.get(models.Account, account_id)
+        return self._account_to_dict(row) if row else None
+
+    def list_accounts(self) -> list[dict]:
+        rows = self.session.query(models.Account).order_by(models.Account.created_at.asc()).all()
+        return [self._account_to_dict(r) for r in rows]
+
+    def create_account(self, *, account_id: str, display_name: str = "",
+                       org_id: str = "", expires_at=None) -> dict:
+        row = models.Account(
+            id=account_id, org_id=org_id, display_name=display_name,
+            expires_at=expires_at,
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._account_to_dict(row)
+
+    def update_account(self, account_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.Account, account_id)
+        if not row:
+            return None
+        # 白名单与 users 同纪律：未知键/不可变键（id/created_at）忽略。
+        # 注意 expires_at 允许显式 None（「设永久」清期限）——按键在场判定，
+        # 不做 None 过滤（与 update_user 的非 None 语义刻意不同）。
+        for key in ("display_name", "org_id", "expires_at"):
+            if key in fields:
+                setattr(row, key, fields[key])
+        self.session.commit()
+        return self._account_to_dict(row)
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -1556,6 +1601,8 @@ class InMemoryBusinessRepository:
         self.hotword_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
         self.users: dict[str, dict] = {}
+        # SaaS 客户生命周期（W①）：与 SQL 侧同契约；expires_at 存 ISO 串或 ''（=永久）。
+        self.accounts: dict[str, dict] = {}
 
     def create_call(self, manifest: SessionManifest) -> dict:
         call_id = manifest.session_id or _uuid()
@@ -2201,6 +2248,38 @@ class InMemoryBusinessRepository:
         for key in ("password_hash", "display_name", "role", "status", "permissions_json"):
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
+        return dict(row)
+
+    # ---- accounts（SaaS 客户生命周期，W①；与 SQL 侧同契约）----
+
+    def get_account(self, account_id: str) -> dict | None:
+        row = self.accounts.get(account_id)
+        return dict(row) if row else None
+
+    def list_accounts(self) -> list[dict]:
+        rows = [dict(r) for r in self.accounts.values()]
+        return sorted(rows, key=lambda r: r.get("created_at") or "")
+
+    def create_account(self, *, account_id: str, display_name: str = "",
+                       org_id: str = "", expires_at=None) -> dict:
+        exp = expires_at
+        row = {
+            "id": account_id, "org_id": org_id, "display_name": display_name,
+            "expires_at": exp.isoformat() if exp else "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.accounts[account_id] = row
+        return dict(row)
+
+    def update_account(self, account_id: str, **fields: Any) -> dict | None:
+        row = self.accounts.get(account_id)
+        if not row:
+            return None
+        # expires_at 允许显式 None（清期限=永久）；datetime → ISO 串。
+        for key in ("display_name", "org_id", "expires_at"):
+            if key in fields:
+                v = fields[key]
+                row[key] = v.isoformat() if hasattr(v, "isoformat") else (v or "" if key == "expires_at" else v)
         return dict(row)
 
     # ---- roster（名册认领池）----

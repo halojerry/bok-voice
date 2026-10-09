@@ -23,6 +23,7 @@ import hmac
 import os
 import secrets
 import datetime
+import time
 from dataclasses import dataclass
 
 import jwt as pyjwt
@@ -33,6 +34,61 @@ from bok_voice_obs.context import Correlation, get_correlation, set_correlation
 _JWT_ALGO = "HS256"
 JWT_TTL_S = 8 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
+
+# ---- SaaS 账号订阅到期（W①/W② 2026-10-09）----
+# 判定=TTL 缓存逐请求重估（缓存只省 DB 查询，不缓存「放行结论」跨 renew——
+# 续费端点清缓存，最坏滞后 60s，方向良性：多拦 60s 而非多放 60s）。
+_ACCOUNT_EXPIRY_TTL_S = 60.0
+_ACCOUNT_EXPIRY_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def clear_account_expiry_cache(account_id: str = "") -> None:
+    """续费/改期/建号后清缓存（account_id 空=全清；单进程 CP，代价可忽略）。"""
+    if account_id:
+        _ACCOUNT_EXPIRY_CACHE.pop(account_id, None)
+    else:
+        _ACCOUNT_EXPIRY_CACHE.clear()
+
+
+def parse_expires_at(value) -> datetime.datetime | None:
+    """expires_at 出仓形态（ISO 串/datetime/None）→ aware datetime；坏值=None（=永久）。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def account_expired_lookup(request: Request, account_id: str) -> bool:
+    """账号订阅是否已到期（W② identity_gate 消费）。
+
+    语义：account 行缺失或 expires_at NULL → False（存量/开发形态零执法）；
+    查询经 ``app.state.account_lookup`` 注入（与 user_lookup 同模式，deps 建库
+    后接线）——auth 层不直接 import 仓库，保持分层。
+    """
+    if not account_id:
+        return False
+    now = time.monotonic()
+    hit = _ACCOUNT_EXPIRY_CACHE.get(account_id)
+    if hit is not None and now - hit[0] < _ACCOUNT_EXPIRY_TTL_S:
+        return hit[1]
+    state = getattr(getattr(request, "app", None), "state", None)
+    lookup = getattr(state, "account_lookup", None) if state is not None else None
+    expired = False
+    if lookup is not None:
+        row = lookup(account_id) or {}
+        exp = parse_expires_at(row.get("expires_at"))
+        if exp is not None:
+            expired = datetime.datetime.now(datetime.timezone.utc) >= exp
+    _ACCOUNT_EXPIRY_CACHE[account_id] = (now, expired)
+    return expired
 
 # 豁免路径：健康检查 / 登录本身 / 节点心跳与注册自鉴权 / 节点日志上报自鉴权 /
 # LiveKit 服务端 webhook

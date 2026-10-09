@@ -16,7 +16,7 @@ import time
 import uuid
 import wave
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -114,6 +114,7 @@ from .auth import (
     Identity,
     JWT_TTL_S,
     auth_required,
+    clear_account_expiry_cache,
     create_token,
     current_identity,
     deny_cross_account,
@@ -121,12 +122,14 @@ from .auth import (
     hash_password,
     identity_gate,
     owner_scope_filter,
+    parse_expires_at,
     require_role,
     scoped_account,
     verify_password,
 )
 from .schemas import (
     AssistRequest,
+    CreateAccountRequest,
     CreateCallRequest,
     CreateObjectRequest,
     DialNowRequest,
@@ -138,6 +141,8 @@ from .schemas import (
     LoginRequest,
     ChangePasswordRequest,
     CreateUserRequest,
+    RenewAccountRequest,
+    UpdateAccountRequest,
     UpdateUserRequest,
     PersonaRequest,
     QaClusterRequest,
@@ -532,6 +537,9 @@ def _startup() -> None:
     # token 生命周期（2026-09-16 深测 P2）：identity_gate 解码后按 sub 查库——
     # 禁用/删号立即 401、role 以库为准（降权即时生效），不再吃满 8h TTL。
     app.state.user_lookup = lambda user_id: _repo().get_user(user_id)
+    # SaaS 账号到期判定（W①/W② 2026-10-09）：auth.account_expired_lookup 经此
+    # 查库（分层同 user_lookup——auth 层不 import 仓库）。
+    app.state.account_lookup = lambda account_id: _repo().get_account(account_id)
     app.state.session_factory = build_session_factory(engine)
     # 模型路由存储（2026-09-25）：与 repo 同 engine 的 session factory；None
     # （单机内存形态）时 deps 侧自动回落模块级内存。
@@ -2093,6 +2101,156 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
     return _user_public(updated or target)
 
 
+# ---- SaaS 客户生命周期（W① 2026-10-09）：root 专属面 ----
+# 语义：一个 Account=一个客户（admin=客户管理员，user=其员工）。到期执法在
+# identity_gate（W②），本段只管生命周期 CRUD；密码/凭据绝不入审计 detail。
+
+
+def _account_public(row: dict, admin_username: str = "", user_count: int = 0) -> dict:
+    expires_at = str(row.get("expires_at") or "")
+    return {
+        "id": row.get("id") or "",
+        "display_name": row.get("display_name") or "",
+        "admin_username": admin_username,
+        "user_count": user_count,
+        "expires_at": expires_at,
+        "expired": _account_is_expired(expires_at),
+        "created_at": row.get("created_at") or "",
+    }
+
+
+def _account_is_expired(expires_at_iso: str) -> bool:
+    exp = parse_expires_at(expires_at_iso)
+    return exp is not None and datetime.now(timezone.utc) >= exp
+
+
+def _account_expiry_from_days(duration_days: int):
+    """duration_days → expires_at（0/负=永久 None）。"""
+    if duration_days <= 0:
+        return None
+    return datetime.now(timezone.utc) + timedelta(days=duration_days)
+
+
+@app.get("/api/accounts")
+def list_accounts_ep(request: Request) -> list[dict]:
+    require_role(request, "root")
+    users = _repo().list_users("")
+    by_account: dict[str, dict[str, int | str]] = {}
+    for u in users:
+        acc = str(u.get("account_id") or "")
+        if not acc:
+            continue
+        info = by_account.setdefault(acc, {"count": 0, "admin": ""})
+        info["count"] = int(info["count"]) + 1  # type: ignore[assignment]
+        if u.get("role") == "admin" and not info["admin"]:
+            info["admin"] = str(u.get("username") or "")
+    out = []
+    for row in _repo().list_accounts():
+        info = by_account.get(str(row.get("id") or ""), {})
+        out.append(_account_public(
+            row,
+            admin_username=str(info.get("admin") or ""),
+            user_count=int(info.get("count") or 0),
+        ))
+    return out
+
+
+@app.post("/api/accounts", status_code=201)
+def create_account_ep(req: CreateAccountRequest, request: Request) -> dict:
+    require_role(request, "root")
+    name = req.admin_username.strip()
+    if not name:
+        raise HTTPException(400, "admin_username 不能为空")
+    if len(req.admin_password) < 12:
+        # 客户侧唯一登录入口：强门槛 12 位（严于内部 8 位）。
+        raise HTTPException(400, "客户管理员密码至少 12 位")
+    if not 0 <= req.duration_days <= 3650:
+        raise HTTPException(400, "duration_days 取值 0（永久）~3650")
+    if _repo().get_user_by_username(name):
+        raise HTTPException(409, "用户名已存在")
+    account_id = f"acc-{uuid.uuid4().hex[:8]}"
+    # display_name 缺省=管理员用户名（web 可后改）。
+    account = _repo().create_account(
+        account_id=account_id,
+        display_name=(req.display_name or name).strip(),
+        expires_at=_account_expiry_from_days(req.duration_days),
+    )
+    # 客户管理员默认章：页键默认集 + 管理键「员工管理」（开箱即可自建员工，
+    # 其余管理键全关——引擎/模型面恒 root 专属）。与 POST /api/users 新建 admin
+    # 的缺省章同源（DEFAULT_ADMIN_PERMISSIONS）+ users 键。
+    perm_json = json.dumps(sorted(set(DEFAULT_ADMIN_PERMISSIONS) | {"users"}), ensure_ascii=False)
+    user = _repo().create_user(
+        username=name,
+        password_hash=hash_password(req.admin_password),
+        role="admin",
+        org_id="",
+        account_id=account_id,
+        display_name=(req.display_name or "").strip(),
+        permissions_json=perm_json,
+    )
+    clear_account_expiry_cache(account_id)
+    _audit("account.create", subject_type="account", subject_id=account_id,
+           detail={"duration_days": req.duration_days,
+                   "admin_user_id": str(user.get("id") or "")})
+    return _account_public(account, admin_username=name, user_count=1)
+
+
+@app.post("/api/accounts/{account_id}/renew")
+def renew_account_ep(account_id: str, req: RenewAccountRequest, request: Request) -> dict:
+    require_role(request, "root")
+    row = _repo().get_account(account_id)
+    if not row:
+        raise HTTPException(404, "account not found")
+    if req.days <= 0 or req.days > 3650:
+        raise HTTPException(400, "days 取值 1~3650")
+    now = datetime.now(timezone.utc)
+    current = parse_expires_at(row.get("expires_at"))
+    # 已过期/永久→从当下起算；未到期→顺延（客户不因早续费吃亏）。
+    base = current if (current is not None and current > now) else now
+    new_exp = base + timedelta(days=req.days)
+    updated = _repo().update_account(account_id, expires_at=new_exp)
+    clear_account_expiry_cache(account_id)
+    _audit("account.renew", subject_type="account", subject_id=account_id,
+           detail={"days": req.days, "expires_at": new_exp.isoformat()})
+    info = {"count": 0, "admin": ""}
+    for u in _repo().list_users(account_id):
+        info["count"] = int(info["count"]) + 1
+        if u.get("role") == "admin" and not info["admin"]:
+            info["admin"] = str(u.get("username") or "")
+    return _account_public(updated or row, admin_username=str(info["admin"]),
+                           user_count=int(info["count"]))
+
+
+@app.patch("/api/accounts/{account_id}")
+def update_account_ep(account_id: str, req: UpdateAccountRequest, request: Request) -> dict:
+    require_role(request, "root")
+    row = _repo().get_account(account_id)
+    if not row:
+        raise HTTPException(404, "account not found")
+    fields: dict = {}
+    if req.display_name:
+        fields["display_name"] = req.display_name.strip()
+    if req.expires_at == "permanent":
+        fields["expires_at"] = None  # type: ignore[assignment]  # 显式清期限=永久
+    elif req.expires_at:
+        parsed = parse_expires_at(req.expires_at)
+        if parsed is None:
+            raise HTTPException(400, "expires_at 需为 ISO 时间串或 permanent")
+        fields["expires_at"] = parsed
+    updated = _repo().update_account(account_id, **fields) if fields else row
+    clear_account_expiry_cache(account_id)
+    if fields:
+        _audit("account.update", subject_type="account", subject_id=account_id,
+               detail={"fields": sorted(fields.keys())})
+    info = {"count": 0, "admin": ""}
+    for u in _repo().list_users(account_id):
+        info["count"] = int(info["count"]) + 1
+        if u.get("role") == "admin" and not info["admin"]:
+            info["admin"] = str(u.get("username") or "")
+    return _account_public(updated or row, admin_username=str(info["admin"]),
+                           user_count=int(info["count"]))
+
+
 @app.post("/api/token", response_model=TokenResponse, status_code=201)
 def token(req: TokenRequest, request: Request) -> TokenResponse:
     """签发参与者 token——LiveKit 官方 TokenSource endpoint 契约。
@@ -2209,7 +2367,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         .with_identity(identity)
         .with_name(req.participant_name or name)
         .with_grants(_grants)
-        .with_ttl(datetime.timedelta(seconds=3600))
+        .with_ttl(timedelta(seconds=3600))
     )
     if req.participant_metadata:
         at = at.with_metadata(req.participant_metadata)

@@ -178,6 +178,14 @@ export const api = {
     request<UserRow>("/api/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser: (id: string, body: { password?: string; status?: string; display_name?: string; permissions?: string[] }) =>
     request<UserRow>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  // ---- SaaS 客户生命周期（W① 2026-10-09；端点恒 root 专属）----
+  listAccounts: () => request<AccountRow[]>("/api/accounts"),
+  createAccount: (body: { display_name?: string; admin_username: string; admin_password: string; duration_days?: number }) =>
+    request<AccountRow>("/api/accounts", { method: "POST", body: JSON.stringify(body) }),
+  renewAccount: (id: string, days: number) =>
+    request<AccountRow>(`/api/accounts/${encodeURIComponent(id)}/renew`, { method: "POST", body: JSON.stringify({ days }) }),
+  patchAccount: (id: string, body: { display_name?: string; expires_at?: string }) =>
+    request<AccountRow>(`/api/accounts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   // 快答库管理 CRUD（B3 owner 语义：user 只改自己的，共享=admin/root；hit 走 agent 通道不在此）。
   listQaAll: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/qa-entries?account_id=${encodeURIComponent(accountId)}`),
@@ -810,6 +818,18 @@ export type UserRow = {
   /** 出仓有效集（user=admin 勾选；admin=下发集含管理键） */
   permissions?: string[];
   created_at?: string;
+};
+
+// ---- SaaS 客户生命周期（W① 2026-10-09；与 CP _account_public 对齐） ----
+export type AccountRow = {
+  id: string;
+  display_name: string;
+  admin_username: string;
+  user_count: number;
+  /** ISO 串；空=永久 */
+  expires_at: string;
+  expired: boolean;
+  created_at: string;
 };
 
 // ---- 节点注册表（P1，root 平台面；与 CP nodes_store.list_nodes 输出对齐） ----

@@ -74,6 +74,29 @@ class UpdateUserRequest(BaseModel):
     permissions: list[str] | None = None
 
 
+# ---- SaaS 客户生命周期（W① 2026-10-09；端点恒 root 专属）----
+
+
+class CreateAccountRequest(BaseModel):
+    display_name: str = ""
+    # 客户管理员登录名/初始密码（密码 ≥12 位强门槛——客户侧唯一登录入口）。
+    admin_username: str
+    admin_password: str
+    # 有效期天数（1~3650）；0/缺省=永久（NULL）。
+    duration_days: int = 0
+
+
+class RenewAccountRequest(BaseModel):
+    # 续费天数：expires_at = max(now, 现值) + days（已过期则从当下起算）。
+    days: int
+
+
+class UpdateAccountRequest(BaseModel):
+    display_name: str = ""
+    # ISO 串；空串=不改；"permanent"=清期限（回永久档）。
+    expires_at: str = ""
+
+
 class CreateCallRequest(BaseModel):
     account_id: str
     # 同传会话(kind=interpret)没有客服对象,允许空。
