@@ -33,18 +33,15 @@ class LiteDoubaoSTT(DoubaoSTT):
     model = "doubao-asr-lite"
 
     def __init__(self, **kwargs):
-        # 说话中出译（2026-10-09 用户拍板「必须边讲边出声」，审计表触发条件命中）：
-        # clause_commit=豆包 interim 上子句边界稳定即提前交 FINAL（说话中 MT 起跑，
-        # 子句粒度流水线，对方全程滞后 1-2s 跟读）；utt_merge=句尾续说观察窗（减少
-        # 尾巴碎片 FINAL）。两旗与旧线 B 档同默认、同一份 provider 代码（单源），
-        # 闸门参数（字数/限速）走既有 QWEN3_ASR_CLAUSE_* env（bokctl _interp_env
-        # 对 lite worker 同样下发）。窗 B 评估官方 `fixed_prefix_result`/end_window_size
-        # 替代自家闸（蓝图 §8 该行已更新为「已开」）。
+        # 官方优先翻案（2026-10-09，Ethan 拍板「让 ASR 自己切分然后给 LLM」）：
+        # **服务端分句消费为主档**——show_utterances 的 definite 分句即厂商卖的
+        # 语义分段，见新 definite 即发 FINAL；本地三层闸（标点/保险丝/快启动，
+        # 今天一天手工重建厂商能力的补丁，碎片/大块/吞字三病全由此生）全部让位，
+        # 仅作 kill-switch 回退档（BOK_INTERP_SERVER_UTT=0 回本地闸）。
+        kwargs.setdefault("server_utterances", os.environ.get("BOK_INTERP_SERVER_UTT", "1") != "0")
+        # 本地闸旗保留（server_utterances=0 时生效=回退档）。
         kwargs.setdefault("clause_commit", True)
         kwargs.setdefault("utt_merge", True)
-        # 长度保险丝（同日合流补件）：句档（逗号档关）下无标点长句的防饿死闸
-        # ——QWEN3_ASR_CLAUSE_LEN_CHARS 在豆包路径此前无实现（键空转，W6 立项档
-        # 未察），call-d6704474 实弹 26.3s 巨窗根因。见 _len_fuse_cut docstring。
         kwargs.setdefault("len_fuse", True)
         super().__init__(**kwargs)
 
@@ -53,6 +50,14 @@ class LiteDoubaoSTT(DoubaoSTT):
         req = cfg.setdefault("request", {})
         req["enable_nonstream"] = True
         req.setdefault("force_to_speech_time", 1000)
+        # 服务端分句灵敏度（官方 end_window_size，[300,5000]ms）：静音达该窗即
+        # 定稿分句——缺省 500=同传节奏（官方缺省 800 偏保守）；env 可调。
+        if self._server_utterances:
+            try:
+                ew = int(os.environ.get("BOK_DOUBAO_END_WINDOW_MS", "500") or 500)
+            except ValueError:
+                ew = 500
+            req["end_window_size"] = min(5000, max(300, ew))
         # 首字加速官方臂沿用既有键（缺省关；旧线同键，跨线零新键）。
         if os.environ.get("BOK_DOUBAO_FIRST_TOKEN_BOOST", "") == "1":
             req["enable_accelerate_text"] = True

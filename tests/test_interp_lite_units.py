@@ -172,6 +172,120 @@ def test_lite_doubao_config_official_arms():
     assert _Old(api_key="k")._len_fuse is False  # 旧线逐字节（旗不传=零行为）
 
 
+def test_first_block_cut_pure():
+    """快启动层首块切点：标点 ≥5 字/保险丝 8 字/稳定性/数字 run 保护。"""
+    from agent_runtime.providers.doubao_asr import _first_block_cut
+
+    # 弱标点边界 ≥5 字（含标点计数），且上一 interim 同坐标稳定。
+    assert _first_block_cut("我想请问，", "我想请问，") == 5
+    # <5 字不切。
+    assert _first_block_cut("我想，", "我想，") is None
+    # 无标点 → 保险丝 8 字。
+    assert _first_block_cut("我想请你们帮我看", "我想请你们帮我看") == 8
+    # 首次目击（prev_full 空=未稳定）不切。
+    assert _first_block_cut("我想请问，你们", "") is None
+    # 数字 run 不被劈开（切点推到 run 结束后的边界，绝不落在 run 中间）。
+    assert _first_block_cut("单号AB12345，好的", "单号AB12345，好的") == 9
+
+
+def test_first_block_wiring_lite_only(monkeypatch):
+    """快启动层接线：lite 旗（len_fuse）+意群档 12 下，7 字弱标点首块即提交；
+    旧线旗关同语料不提前提交（首块快启动=薄线专属）。"""
+    import tests.test_doubao_asr as da
+
+    for k in ("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "12")  # 意群档
+    replies = ["我想请问，", "我想请问，你们那边", "我想请问，你们那边几点开门"]
+    da._fake_merge(monkeypatch)
+    da._make_connect_replies(
+        monkeypatch, replies=replies, final_text="我想请问，你们那边几点开门。"
+    )
+    vad = da._FakeVad()
+    stt_lite = da.DoubaoSTT(api_key="k", vad_=vad, clause_commit=True, len_fuse=True)
+    events = asyncio.run(da._drive_clause(stt_lite, vad, packets=3))
+    finals_lite = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals_lite and finals_lite[0] == "我想请问，"  # 7 字弱标点快启动
+
+    da._fake_merge(monkeypatch)
+    da._make_connect_replies(
+        monkeypatch, replies=replies, final_text="我想请问，你们那边几点开门。"
+    )
+    vad2 = da._FakeVad()
+    stt_old = da.DoubaoSTT(api_key="k", vad_=vad2, clause_commit=True)  # len_fuse 默认关
+    events2 = asyncio.run(da._drive_clause(stt_old, vad2, packets=3))
+    finals_old = [t for n, t in events2 if n == "FINAL_TRANSCRIPT"]
+    assert not any(t == "我想请问，" for t in finals_old)  # 旧线不受快启动层影响
+
+
+def test_server_utterances_config(monkeypatch):
+    """lite 装配：服务端分句缺省开+end_window_size 500；总闸/灵敏度 env 可调；旧线默认关。"""
+    from agent_runtime.interp_lite.providers.asr_doubao import LiteDoubaoSTT
+    from agent_runtime.providers.doubao_asr import DoubaoSTT as _Old
+
+    for k in ("BOK_INTERP_SERVER_UTT", "BOK_DOUBAO_END_WINDOW_MS"):
+        monkeypatch.delenv(k, raising=False)
+    lite = LiteDoubaoSTT(api_key="k")
+    assert lite._server_utterances is True
+    req = lite._config()["request"]
+    assert req["end_window_size"] == 500
+    assert _Old(api_key="k")._server_utterances is False  # 旧线零变化
+
+    monkeypatch.setenv("BOK_INTERP_SERVER_UTT", "0")
+    off = LiteDoubaoSTT(api_key="k")
+    assert off._server_utterances is False
+    assert "end_window_size" not in off._config()["request"]  # 闸关不发该键
+
+    monkeypatch.setenv("BOK_INTERP_SERVER_UTT", "1")
+    monkeypatch.setenv("BOK_DOUBAO_END_WINDOW_MS", "320")
+    assert LiteDoubaoSTT(api_key="k")._config()["request"]["end_window_size"] == 320
+
+
+def test_server_definite_commits_stream():
+    """流层 definite 消费：见新 definite 即 FINAL（去重、不重发）；display 剥已发前缀。"""
+    import asyncio
+
+    from agent_runtime.providers import doubao_asr as da
+    from agent_runtime.providers.doubao_asr import DoubaoSTT, _DoubaoLiveStream
+
+    async def scenario():
+        stt = DoubaoSTT(api_key="k", clause_commit=True, server_utterances=True)
+        stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+        events: list[tuple[str, str]] = []
+
+        class _FakeCh:
+            def send_nowait(self, ev):
+                t = ev.alternatives[0].text if ev.alternatives else ""
+                events.append((str(ev.type).split(".")[-1], t))
+
+        stream._event_ch = _FakeCh()
+        # 帧1：一个 definite 分句 + 全文累积到「你好，今天」
+        stream._on_payload({
+            "result": {
+                "text": "你好，今天天气怎么样",
+                "utterances": [{"text": "你好，", "definite": True},
+                               {"text": "今天天气怎么样", "definite": False}],
+            }
+        })
+        # 帧2：第二个分句转 definite（首个重发——计数去重，只发新）
+        stream._on_payload({
+            "result": {
+                "text": "你好，今天天气怎么样？",
+                "utterances": [{"text": "你好，", "definite": True},
+                               {"text": "今天天气怎么样？", "definite": True}],
+            }
+        })
+        await stream.aclose()
+        return events
+
+    events = asyncio.run(scenario())
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["你好，", "今天天气怎么样？"]  # 按序、无重复
+    interims = [t for n, t in events if n == "INTERIM_TRANSCRIPT"]
+    assert all("你好" not in i or i.endswith("怎么样") or i == "你好，今天天气怎么样" for i in interims)
+
+
 def test_len_fuse_cut_pure():
     """长度保险丝切点纯函数：内容字计数/ASCII run 防劈/门槛不足 None。"""
     from agent_runtime.providers.doubao_asr import _len_fuse_cut

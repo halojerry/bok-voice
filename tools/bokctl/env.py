@@ -807,6 +807,13 @@ _FORWARD_ENV = (
     #    元组（env.py _agent_worker_env 内）同键，此处入表=显式设值即 bok 转发
     #    （立法姿势归位；此前仅走元组 passthrough 同效） ——
     "BOK_INTERP_REV_AUDIO",
+    # —— B 线薄线服务端分句总闸（2026-10-09 官方优先翻案，Ethan 拍板「让 ASR
+    #    自己切分然后给 LLM」）：1（缺省）=消费豆包 show_utterances 的 definite
+    #    分句即发 FINAL，本地三层闸（标点/保险丝/快启动）让位；0=回本地闸回退档 ——
+    "BOK_INTERP_SERVER_UTT",
+    # —— 豆包服务端分句灵敏度（end_window_size，[300,5000]ms，缺省 500=同传节奏；
+    #    仅 interp_lite 装配下发；BOK_INTERP_SERVER_UTT=0 时无效） ——
+    "BOK_DOUBAO_END_WINDOW_MS",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
