@@ -179,3 +179,56 @@ W0（今天）→ W1（主刀）→ W2（收尾）。每步独立 PR+全量 pyte
   心跳→1.05-1.35x 变速追帧替代弃音,FFT 相位声码器）与**专用翻译端点**
   （厂商 qwen-mt-flash 首字 265-448ms;火山 doubao-seed-translation 候选,
   凭据已在手）——两票待拍板。
+
+## W1 纪要·MT 端点矩阵第一轮（2026-10-08 23:16 轻载档）
+
+- **探针入仓**：`scripts/probes/probe_mt_matrix.py`（四臂逐 delta 计时+译文
+  质量+术语落地;SSRF 五域白名单 chokepoint;opencode 需 UA+x-opencode-session
+  双头,方舟 key 与豆包 ASR key 不通用）。
+- **轻载读数**：DeepSeek 官方最快（first 425-1230ms,方差但恒最佳）;
+  **qwen-mt-flash 术语原生落地**（顺丰→SF Express ✓,译文地道）但 first
+  1231-6107ms+通用域一次 63s 尖刺（RPM 60 排队面）——轻载档不配当主车道;
+  opencode zen=订阅扣款失效（"Go subscription ended"）阻塞;方舟=缺
+  ARK_API_KEY（豆包 key 401 实证不通用）。
+- **判定悬念留给晚峰复测**（18:00-22:00）：DeepSeek 晚峰整包缓冲是否被
+  qwen-mt/方舟反超——那才是换车道的唯一理由。轻载档结论=DeepSeek 留任。
+
+## W3 纪要（2026-10-08 深夜，subagent 额度阵亡主会话接管）
+
+- **刀1 spec busy 闸放宽**（subagent 完成+主会话收尾）：FIFO「非空即封」→深度门
+  （BOK_INTERP_SPEC_BUSY_DEPTH 默认 2；1=旧档回退）；frag hold 期 _mt_busy 不
+  再置位（hold=等合并非真忙，spec 可开火）；fired/blocked 累计+封锁 episode
+  首拍 busy 行。目标命中率 4/108→≥30%（真人通验证）。
+- **刀2 本向回声/重复去重**：`_InterpEchoDedup`——同归一文本 8s 窗重复 final
+  （账本 26 次）+ self-heard（final≈本向近期译文 ≥0.85，一体台双麦串音）。
+  命中整轮丢弃。**真·跨向并发去重需 CP 中转两 worker 状态=票据留档**。
+- **刀3 结巴清理**：`_fold_stutter` 确定性折叠（单字 run≥3→1；**2/3 字组**重复
+  ≥3→1 组——3 字组覆盖 A-not-A 型「要不要/是不是」中文高频口吃单元；拉丁/
+  数字 run 不动）只进 MT 输入副本；官方臂 enable_ddc 入 doubao 请求体
+  （BOK_DOUBAO_DDC 默认关——剥语气词与语气标记 v2 冲突）。
+- **官方三臂**：BOK_DOUBAO_NONSTREAM（二遍识别）/BOK_DOUBAO_DDC/
+  BOK_DOUBAO_FIRST_TOKEN_BOOST（首字加速 score=3）——默认全关，耳测 A/B 定档。
+  env 立法 278→284。
+- **刀4 carry buffer 缓期（口径修正）**：原规格把「短残句前插」放 FIFO 层，
+  但体检残留「快 TTS 档子句 B 被吞」根因是 **doubao VAD START 迟到吃句头**
+  （阈值无关，音频层）——FIFO 层 carry 治不了它。正确落点=provider VAD
+  边界处理，独立票。
+- 验收：test_interp_w3bfix 11 绿 + 全量 **5049 passed/4 skipped**。
+
+## W1-② 收官（2026-10-08 深夜）
+
+- **402 黑洞短路**：`_mt_fatal_provider_error` 分类器（余额/鉴权=致命；429/超时/
+  insufficient_system_resource=瞬态不命中）+ `_mt_say_worker` 死道快败（后续句
+  零 provider 走兜底）+ spec busy 闸并门。观测 `[interp] MT_LANE_DEAD reason=`
+  （告警 grep 键）。
+- **Sentry 扩捕获（用户疑问定案）**：DSN 在/SDK 在/worker+CP 均已初始化——但
+  捕获面只有 2 点（看门狗+背景 judge），且 **B 线 interpret 入口从未
+  init_sentry**。本波：interpret 入口 init + `_sentry_event`（每通去重）挂
+  MT_TIMEOUT_FALLBACK/MT_LANE_DEAD/mt fail 三类；A 线 REPEAT_GUARD 掐句与
+  CP famine 翻转的捕获面随 W2 波后补（避免与 W2 的 agent.py 改动冲突）。
+- **方舟 MT 专模判死**（ARK key 已到）：`doubao-seed-translation-250915` 仅
+  Responses 端点（chat/completions 拒认）；**粤语目标语=InternalServiceError、
+  zh-HK=不支持、en 可用但非流式整包 2.7s**（顺丰→Shunfeng 未吃术语）——主用
+  普粤对不可用，MT 臂出局。方舟通用 DeepSeek 模型需控制台开通（账号当前全
+  404「或无权限」）。DeepSeek 官方留任待晚峰终判。
+- 全量 5040 passed/4 skipped。

@@ -851,6 +851,36 @@ def _mt_fail_line(target_lang: str) -> str:
     return lines.get(target_lang, lines["zh"])
 
 
+# 402 黑洞短路(W1-②,2026-10-08):DeepSeek 余额打空时 call-0bdf1392/07684e13
+# 两通 perceived 39.7s——每句都付「流式开流失败→回退 _mt_once 再失败→兜底」
+# 双跑+排队,账本全是兜底句。余额/鉴权类错误**重试永远不会好**——首次命中即
+# 标记本通 MT 车道死亡,后续句秒走兜底(零 provider 调用),spec 投机同步封。
+# 刻意不含 429/超时/finish_reason=insufficient_system_resource(瞬态,重试有
+# 意义);观测行 `[interp] MT_LANE_DEAD` 供告警 grep(运营动作=充值/切道)。
+_MT_FATAL_MARKERS = (
+    "insufficient balance",
+    "payment required",
+    "402",
+    "unauthorized",
+    "401",
+    "invalid api key",
+    "api key doesn't exist",
+    "authenticationerror",
+)
+
+
+def _mt_fatal_provider_error(exc: BaseException) -> str:
+    """致命供应商错误分类器(纯函数,单测直喂):命中返回 marker,否则空串。
+
+    大小写不敏感子串匹配 repr;瞬时错误(超时/429/连接重置/系统资源不足)不
+    命中——它们走原有重试/回退链。"""
+    text = repr(exc).lower()
+    for marker in _MT_FATAL_MARKERS:
+        if marker in text:
+            return marker
+    return ""
+
+
 def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
     """sidecar 地址解析:settings 值 > env > 缺省(去尾部斜杠)。"""
     return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
@@ -1639,6 +1669,139 @@ def _interp_spec_wait_s() -> float:
     return min(max(v, 0.0), _SPEC_WAIT_MAX_S)
 
 
+# —— W3b·spec busy 闸放宽(2026-10-08,spec 命中率 4/108 主刀) ---------------------
+# 架构体检实证:busy 闸=FIFO 非空∨MT 在途∨摘译 pending 任一真即封——连续说话时
+# FIFO 常非空+frag hold 期 _mt_busy 恒真,整通只开出 4/108 次投机。两刀:
+# ① FIFO 条件从「非空」改「深度 ≥BOK_INTERP_SPEC_BUSY_DEPTH」(默认 2):深度 1
+#   =待译积压真忙(下一句已排队,投机让位);深度 0-1 句在队=FIFO 秒空,正常说话
+#   节奏里闸恒开(1=旧「非空即封」档,一键回退)。
+# ② frag hold 期不再无条件封——hold 是「等合并」不是「真忙」:_mt_busy 置位点
+#   从取句即置挪到 frag absorb 之后(真 MT 起跑才置位,见 _mt_say_worker)。hold
+#   期 spec 可开火:命中=下段 final 走 spec 交付(不进队,absorb 超时放行碎片,
+#   零重复——同一段内容只会走其中一条路);未命中=下段照旧入队被并入。
+#   已知小代价:hold+HIT 竞态窗内 _LagLedger FIFO 配对可能错行(spec 的
+#   note_src 插队在 hold 中碎片之前)——只影响 INTERP_LAG 观测行的归属,不影响
+#   播放/记账平衡,文档化接受。
+# ③ 观测:fired/blocked 计数挂在 _spec_stats(闭包共享 dict),开火行带双计数、
+#   封锁期首拍打 INTERP_SPEC busy 行(每封锁 episode 一行,不刷屏)。
+# kill-switch BOK_INTERP_SPEC_BUSY_DEPTH(默认 2;1=旧「非空即封」档;坏值回 2,
+# <1 钳 1)。_mt_busy 与 backlog.source_drops_pending 两条件语义不动。
+_SPEC_BUSY_DEPTH_ENV = "BOK_INTERP_SPEC_BUSY_DEPTH"
+_SPEC_BUSY_DEPTH_DEFAULT = 2
+
+
+def _spec_busy_depth() -> int:
+    """spec 开火的 FIFO 深度门(纯函数,单测直喂):qsize ≥ depth 才算忙。
+    坏值回缺省 2;<1 钳 1(1=旧「非空即封」档)。"""
+    raw = os.environ.get(_SPEC_BUSY_DEPTH_ENV, "")
+    try:
+        v = int(raw) if raw else _SPEC_BUSY_DEPTH_DEFAULT
+    except ValueError:
+        return _SPEC_BUSY_DEPTH_DEFAULT
+    return max(1, v)
+
+
+# —— W3b·刀2 本向回声/重复去重(2026-10-08,体检:同文本 10s 重复译文 26 次+
+# 跨向重复 34 次) -------------------------------------------------------
+# 一体台双麦同桌面串音=同一句话两个方向都成轮(译文播两遍);同向 ASR 重复
+# final 也实测在案("Hello. How are you?" 一通译 3 遍)。本向可判的两类:
+# ①dup-final:同归一文本在窗内重复(同 mic 串音/ASR 重发);
+# ②self-heard:final ≈ 本向近期输出译文(≥0.85)——输出被自家输入侧再转写。
+# 真·跨向并发去重需 CP 中转两 worker 状态(票据留档,不硬造)。
+# 命中=整轮丢弃(不落原文行/不进队/不烧 spec)。同传语义:数秒内逐字重复几乎
+# 必是串音而非客户意图。kill-switch BOK_INTERP_ECHO_DEDUP(默认开)。
+_ECHO_DEDUP_ENV = "BOK_INTERP_ECHO_DEDUP"
+_ECHO_DUP_WINDOW_ENV = "BOK_INTERP_ECHO_DUP_WINDOW_S"
+_ECHO_DUP_WINDOW_DEFAULT_S = 8.0
+_ECHO_SIM_GATE = 0.85
+
+
+def _echo_dedup_enabled() -> bool:
+    return os.environ.get(_ECHO_DEDUP_ENV, "1") == "1"
+
+
+def _echo_dup_window_s() -> float:
+    """dup-final 判重窗秒(纯函数):坏值回 8.0;负数钳 0。"""
+    raw = os.environ.get(_ECHO_DUP_WINDOW_ENV, "")
+    try:
+        v = float(raw) if raw else _ECHO_DUP_WINDOW_DEFAULT_S
+    except ValueError:
+        return _ECHO_DUP_WINDOW_DEFAULT_S
+    return max(0.0, v)
+
+
+class _InterpEchoDedup:
+    """本向回声/重复判重器(纯逻辑,时钟注入可单测)。
+
+    ``check(text, now, own_translations)`` → 命中原因串(""=放行)。recent 环
+    只存归一文本(≤8 条),与秒级 final 节奏匹配。"""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._recent: deque = deque(maxlen=8)
+
+    def check(self, text: str, now: float | None = None, own_translations: "tuple[str, ...]" = ()) -> str:
+        ts = float(self._clock()) if now is None else float(now)
+        norm = _spec_norm(text)
+        if not norm:
+            return ""
+        window = _echo_dup_window_s()
+        for t, n in self._recent:
+            if ts - t <= window and n == norm:
+                return "dup-final"
+        # self-heard:输出侧译文被输入侧再转写(语言相同时才可能高相似)
+        for tr in own_translations:
+            ntr = _spec_norm(tr)
+            if not ntr:
+                continue
+            if difflib.SequenceMatcher(a=norm, b=ntr).ratio() >= _ECHO_SIM_GATE:
+                return "self-heard"
+        self._recent.append((ts, norm))
+        return ""
+
+
+# —— W3b·刀3 结巴清理(2026-10-08,体检:结巴照译「我我我我我，要不要？」) ------
+# 确定性重复折叠(纯本地,只进 MT 输入副本——原文单轨铁律):CJK 单字连续 ≥3
+# 折 1;同双字组连续 ≥3 折 1 组。拉丁/数字 run 不动(型号/编号风险)。
+# 服务端官方臂=豆包 enable_ddc(BOK_DOUBAO_DDC,默认关——会剥语气词,与语气
+# 标记 v2 冲突,A/B 耳测定档);客户端折叠=本层,kill-switch
+# BOK_INTERP_STUTTER_FIX(默认开)。
+_STUTTER_FIX_ENV = "BOK_INTERP_STUTTER_FIX"
+_CJK_CHAR = r"\u4e00-\u9fff"
+_STUTTER_SINGLE_RE = re.compile(rf"([{_CJK_CHAR}])\1{{2,}}")
+
+
+def _stutter_fix_enabled() -> bool:
+    return os.environ.get(_STUTTER_FIX_ENV, "1") == "1"
+
+
+def _fold_stutter(text: str) -> str:
+    """确定性结巴折叠(纯函数,单测直喂):单字 run ≥3→1;2/3 字组重复 ≥3→1 组。
+
+    3 字组覆盖 A-not-A 型口吃单元(要不要/是不是/对不对——中文高频结巴形状)。"""
+    if not text:
+        return text
+    out = _STUTTER_SINGLE_RE.sub(r"\1", text)
+    changed = True
+    while changed:
+        changed = False
+        for k in (2, 3):  # 组长:双字(好的好的)/三字(A-not-A)
+            for i in range(0, max(0, len(out) - k * 3)):
+                unit = out[i : i + k]
+                if len(unit) < k or not all("\u4e00" <= ch <= "\u9fff" for ch in unit):
+                    continue
+                if out.startswith(unit * 3, i):
+                    j = i + k * 3
+                    while out.startswith(unit, j):
+                        j += k
+                    out = out[:i] + unit + out[j:]
+                    changed = True
+                    break
+            if changed:
+                break
+    return out
+
+
 def _persona_voice_map(persona: dict) -> dict:
     """B 线人设音色 → 三语言同把声(纯函数,单测直喂;A 线同款整场同声语义)。
 
@@ -1924,6 +2087,7 @@ class _SpecMtController:
         log: Callable[[str], None] = print,
         note_src: Callable[[str], None] | None = None,
         spec_wait_s: float | None = None,
+        stats: dict | None = None,
     ) -> None:
         self._enabled = enabled
         self._detector = detector
@@ -1933,6 +2097,9 @@ class _SpecMtController:
         self._say_cached = say_cached  # (final_src, text, pcm) -> None(异常上抛)
         self._enqueue = enqueue  # (rest) -> None:余段入 FIFO+记账
         self._log = log
+        # W3b busy 闸放宽:fired/blocked 计数(与 busy 闸闭包共享同一 dict;
+        # None=不计数,开火行逐字节同旧)。
+        self._stats = stats
         # C2(2026-10-08 时效波):not_ready 有界延迟交付——confirm 时 slot 在途但
         # sim 已过门=必中,等合成落地再 HIT(有界);兜底=正常入队(note_src 先记账
         # 保配对)。note_src 缺省 None=旧行为(不延迟,立刻 miss)。
@@ -1959,7 +2126,14 @@ class _SpecMtController:
         if old is not None and not old.done():
             old.cancel()  # 单飞:新 span 顶掉旧投机(cancel→本地车道 abort/云端纯弃)
         hold.task = asyncio.create_task(self._fire(span))
-        self._log(f"[interp] INTERP_SPEC fire chars={len(span)}")
+        if self._stats is not None:
+            self._stats["fired"] = self._stats.get("fired", 0) + 1
+            self._log(
+                f"[interp] INTERP_SPEC fire chars={len(span)} "
+                f"fired={self._stats['fired']} blocked={self._stats.get('blocked', 0)}"
+            )
+        else:
+            self._log(f"[interp] INTERP_SPEC fire chars={len(span)}")
 
     async def _fire(self, span: str) -> None:
         try:
@@ -2152,6 +2326,16 @@ async def entrypoint(ctx) -> None:
         _asr_engine_from_cfg,
         _parse_vocab_terms,
     )
+    # Sentry(R3 单点;W1-② 2026-10-08 补线):B 线 worker 此前**从未初始化**——
+    # DSN 设了也只 A 线/CP 有事件。幂等+缺席 no-op(sentry_hook 纪律)。
+    try:
+        from bok_voice_obs.sentry_hook import capture as _sentry_capture
+        from bok_voice_obs.sentry_hook import init_sentry as _init_sentry
+
+        _init_sentry("agent-worker")
+    except Exception:  # noqa: BLE001 - 观测缺席绝不阻业务
+        def _sentry_capture(*_a, **_k):  # type: ignore[misc]
+            return None
 
     meta: dict = {}
     try:
@@ -2462,10 +2646,28 @@ async def entrypoint(ctx) -> None:
     # 积压由 _PlaybackBacklog 门槛追最新弃旧。
     _llm_instructions = _translation_instructions(source_lang, target_lang, _glossary)
     _mt_pairs: deque = deque(maxlen=8)  # (源,译) 滚动对——_rolling_pairs 的参考料
+    # W3b 刀2:本向回声/重复判重器(时钟真钟;单测直接构造注入)。
+    _echo_dedup = _InterpEchoDedup()
     _mt_latency = {"ms": 0}
     # Wave 2 首子句时延(流式 say 才有语义:final→首子句交 TTS;整句路径=0)
     _mt_first = {"ms": 0}
     _src_q: asyncio.Queue = asyncio.Queue(maxsize=48)
+    # W1-② 402 黑洞短路(2026-10-08):致命供应商错误(余额/鉴权)标记本通死道——
+    # 后续句秒走兜底零 provider 调用;spec 投机同步封(busy 闸并门)。只在当通
+    # 内存,挂断即清,无跨通污染。
+    _mt_lane_dead = {"reason": ""}
+    # Sentry 每通去重账本(W1-②):同 key 只报一次防刷屏(超时/兜底可能连续多句)。
+    _sentry_once: set[str] = set()
+
+    def _sentry_event(key: str, message: str, **tags: str) -> None:
+        """运营关键事件上报(去重;SDK 缺席/DSN 空=完整 no-op)。"""
+        if key in _sentry_once:
+            return
+        _sentry_once.add(key)
+        try:
+            _sentry_capture(RuntimeError(message), room=room_name, line="b", **tags)
+        except Exception:  # noqa: BLE001 - 观测件永不外抛
+            pass
 
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
@@ -2510,10 +2712,13 @@ async def entrypoint(ctx) -> None:
         while True:
             text = await _src_q.get()
             _round += 1
-            # 真 MT 在途旗(2026-10-06 投机翻译 busy 闸消费;置位/清位零行为变化,
-            # BOK_INTERP_SPEC_MT=0 时无读者)。
-            _mt_busy["flag"] = True
             try:
+                # W1-② 死道快败:致命错误已标记 → 该句零 provider 调用直走兜底
+                # (402 类重试永不好;治 call-0bdf1392 每句双跑黑洞)。
+                if _mt_lane_dead["reason"]:
+                    session.say(_mt_fail_line(target_lang))
+                    _lag.done_mt(0)  # 兜底句配对记账,防 _on_item 偷弹下一条
+                    continue
                 # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
                 # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
                 if _mt_consume_skip(backlog, text):
@@ -2522,12 +2727,17 @@ async def entrypoint(ctx) -> None:
                 # Wave 3a 碎片闸(hold-and-merge,2026-10-08):纯应承碎片 hold
                 # ≤BOK_INTERP_FRAG_HOLD_S 等下段并入一次翻译(账本 drop_src 补偿
                 # 在 _frag_absorb 内);超时=照旧单独出译。kill-switch=0 短路
-                # =旧路径逐字节(零额外 await)。hold 期 _mt_busy 已置位=投机
-                # 不开火(下段改走队列被并入,防双烧)。
+                # =旧路径逐字节(零额外 await)。W3b busy 闸放宽(2026-10-08):
+                # hold 期不再置位 _mt_busy(hold 是等合并不是真忙,spec 可开火
+                # ——命中=下段 final 走 spec 交付不进队,零重复;未命中=下段
+                # 照旧入队被并入),置位点挪到真 MT 起跑前。
                 if _interp_frag_merge_enabled() and _interp_frag_is_ack(text):
                     text, _frag_n, _frag_hold_ms = await _frag_absorb(
                         text, q=_src_q, backlog=backlog, lag=_lag
                     )
+                # 真 MT 在途旗(2026-10-06 投机翻译 busy 闸消费;W3b 起仅覆盖真
+                # 译段,BOK_INTERP_SPEC_MT=0 时无读者)。
+                _mt_busy["flag"] = True
                 t0 = time.perf_counter()
                 # MT 入口确定性音近吸附(2026-10-08 P0,subagent 调研:今晚 69 条原文
                 # ≈19% ASR 噪声被忠实翻译):复用 A 线 asr_polish 确定性层(纯本地
@@ -2536,6 +2746,11 @@ async def entrypoint(ctx) -> None:
                 # ——与 A 线 ContextAwareLLM 冻结点同构。四语源(de/fr/ja/pt)表空
                 # 且 detect 有误判风险,直通。
                 text_mt = _polish_for_mt(text, source_lang)
+                # W3b 刀3:确定性结巴折叠(单字 run≥3 折 1/双字组重复≥3 折 1 组;
+                # 只进 MT 输入副本,原文单轨铁律;拉丁数字 run 不动)。官方臂
+                # enable_ddc 在 doubao_asr 请求体(BOK_DOUBAO_DDC,默认关)。
+                if _stutter_fix_enabled():
+                    text_mt = _fold_stutter(text_mt)
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text_mt)
                 # Wave 2 流式交付(2026-10-08):流式 say 逐子句喂出,首子句即合成
                 # 开播——旧「整句排干再合成」的尾段等待被吃掉;一源句=一 say=一
@@ -2582,6 +2797,10 @@ async def entrypoint(ctx) -> None:
                     f"lang={target_lang}",
                     flush=True,
                 )
+                _sentry_event(
+                    "mt_timeout", f"MT_TIMEOUT_FALLBACK lang={target_lang}",
+                    lane="mt", kind="timeout",
+                )
                 try:
                     session.say(_mt_fail_line(target_lang))
                     # 兜底句也是一次交付(2026-10-02 LagLedger 错位根修):say 出声
@@ -2598,6 +2817,25 @@ async def entrypoint(ctx) -> None:
                 # 声音,与超时静默(已修的兄弟 bug)同构。与超时分支同款:目标语中性
                 # 请示语兜底,绝不回放源文;译文行故意不补(诚实缺行)。say 再包 try。
                 print(f"[interp] mt/say failed: {exc!r}", flush=True)
+                # W1-② 402 短路:致命供应商错误(余额/鉴权)标记本通死道——后续句
+                # 秒走兜底;告警行+Sentry 一次(运营动作=充值/切道)。
+                _fatal = _mt_fatal_provider_error(exc)
+                if _fatal:
+                    _mt_lane_dead["reason"] = _fatal
+                    print(
+                        f"[interp] MT_LANE_DEAD reason={_fatal} round={_round} "
+                        f"room={room_name} (fast-fail till call end — 充值/切道后下一通恢复)",
+                        flush=True,
+                    )
+                    _sentry_event(
+                        "mt_lane_dead",
+                        f"MT_LANE_DEAD reason={_fatal}",
+                        lane="mt", kind="fatal-provider",
+                    )
+                else:
+                    _sentry_event(
+                        "mt_fail", f"mt/say failed: {exc!r}"[:180], lane="mt", kind="error"
+                    )
                 try:
                     session.say(_mt_fail_line(target_lang))
                     _lag.done_mt(0)  # 同上:兜底句配对记账,防 _on_item 错位
@@ -2616,6 +2854,8 @@ async def entrypoint(ctx) -> None:
     from .tts_cache import frames_aiter, pcm_to_frames
 
     _mt_busy = {"flag": False}  # 真 MT 在途旗(投机 busy 闸消费,见 _mt_say_worker)
+    # W3b busy 闸观测:fired/blocked 计数+封锁 episode 首拍旗(busy 闸与控制器共享)。
+    _spec_stats = {"fired": 0, "blocked": 0, "was": False}
     _spec_on = _spec_mt_enabled() and tts_provider is not None
     if _spec_on:
         print(
@@ -2662,8 +2902,33 @@ async def entrypoint(ctx) -> None:
 
     def _spec_busy_gate() -> bool:
         """真车道忙闸(闭包后绑 backlog——事件只在 session.start 后流动,装配序安全):
-        FIFO 非空/真 MT 在途/背压摘译 pending 任一真=投机让路。"""
-        return bool(not _src_q.empty() or _mt_busy["flag"] or backlog.source_drops_pending)
+        FIFO 深度 ≥ BOK_INTERP_SPEC_BUSY_DEPTH(默认 2;1=旧「非空即封」档)/真 MT
+        在途/背压摘译 pending 任一真=投机让路。封锁 episode 首拍打 INTERP_SPEC
+        busy 行(fired/blocked 累计计数,每 episode 一行不刷屏)。
+        W1-②:死道(402/鉴权)并门——投机在死道上只会白烧快速失败。"""
+        depth = _spec_busy_depth()
+        busy = bool(
+            _src_q.qsize() >= depth
+            or _mt_busy["flag"]
+            or backlog.source_drops_pending
+            or _mt_lane_dead["reason"]
+        )
+        st = _spec_stats
+        if busy:
+            st["blocked"] += 1
+            if not st["was"]:
+                st["was"] = True
+                print(
+                    f"[interp] INTERP_SPEC busy depth={depth} fifo={_src_q.qsize()} "
+                    f"mt={int(bool(_mt_busy['flag']))} "
+                    f"skip={int(bool(backlog.source_drops_pending))} "
+                    f"dead={int(bool(_mt_lane_dead['reason']))} "
+                    f"fired={st['fired']} blocked={st['blocked']}",
+                    flush=True,
+                )
+        else:
+            st["was"] = False
+        return busy
 
     def _spec_say_cached(final_src: str, text: str, pcm: bytes) -> None:
         """HIT 直播:held PCM 走 say(audio=frames) 零合成(qa_gate 罐头车同构)。
@@ -2693,6 +2958,7 @@ async def entrypoint(ctx) -> None:
         busy_gate=_spec_busy_gate,
         say_cached=_spec_say_cached,
         enqueue=_spec_enqueue,
+        stats=_spec_stats,
     )
     # W1×spec 饥饿修复(2026-10-08,call-21739d55 整通零开火定案):豆包档
     # clause-commit 在 interim 更新点先跑、会话级 interim 只带剥前缀尾巴,
@@ -2720,6 +2986,21 @@ async def entrypoint(ctx) -> None:
                 spec_ctl.on_interim(text)
             return
         last_user["text"] = text
+        # W3b 刀2 本向回声/重复去重:一体台双麦串音/ASR 重发——命中整轮丢弃
+        # (不落原文行/不进队/不烧 spec)。跨向真并发去重需 CP 中转(票据留档)。
+        if _echo_dedup_enabled():
+            _drop = _echo_dedup.check(
+                text,
+                now=time.monotonic(),
+                own_translations=tuple(t for _, t in list(_mt_pairs)[-3:]),
+            )
+            if _drop:
+                print(
+                    f"[interp] INTERP_ECHO_DROP reason={_drop} chars={len(text)} "
+                    f"text={text[:24]!r}",
+                    flush=True,
+                )
+                return
         _spawn_ledger(_add_turn(f"原文：{text}", source_lang))
         if spec_ctl.on_final(text):
             return

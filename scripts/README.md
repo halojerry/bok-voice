@@ -97,6 +97,7 @@
 | `scripts/probes/probe_interp_backlog.py` | B 线播放背压实弹探针（P2 `_PlaybackBacklog`，2026-09-16）。 | test_probe_backlog_count.py import / test_probe_backlog_count.py | 是 | 2026-10-02 |
 | `scripts/probes/probe_interp_continuous.py` | B 线「边说边译」连续语流探针（2026-09-17 长度触发子句提交验收）。 | test_probe_stimulus.py / security/mimosa/suppressions.json | 是 | 2026-09-21 |
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
+| `scripts/probes/probe_mt_matrix.py` | B 线 MT 车道选型矩阵探针（2026-10-08 W1）：deepseek官方/qwen-mt-flash(translation_options.terms)/方舟v4.1-flash/opencode zen 四臂逐 delta 计时+译文质量+术语落地;晚峰复测定车道。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_deepseek_stream.py` | DeepSeek 流式真伪归因探针（2026-10-08）：chat 流式/Responses API/非流式三形状逐 delta 计时+TTFB+缓存臂;Responses 思考开关=reasoning.effort "none"。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_spec_live.py` | B 线投机翻译实弹探针（2026-10-08 spec 复活验收）：多子句刺激（TTS 逗号停顿挤压到 VAD 静音线内=真人形状）→fire/CLAUSE_COMMIT/defer 日志判据。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_late_mic.py` | B 线差分探针:延迟麦克风发布 vs 即时发布(call-72112fd7 复现器)。 | 无(手动) | 是 | 2026-09-30 |

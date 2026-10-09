@@ -553,10 +553,13 @@ def test_on_user_input_wiring_source_pinned():
 
 
 def test_mt_busy_flag_wiring_source_pinned():
-    """真 MT 在途旗:worker 取句置位/finally 清位——投机 busy 闸的数据源。"""
+    """真 MT 在途旗:worker 取句置位/finally 清位——投机 busy 闸的数据源。
+    W1-②:闸改多行形状(新增死道并门 `_mt_lane_dead`),pin 同步。"""
     assert '_mt_busy["flag"] = True' in INTERP_SRC
     assert '_mt_busy["flag"] = False' in INTERP_SRC
-    assert "_mt_busy[\"flag\"] or backlog.source_drops_pending" in INTERP_SRC
+    assert "_mt_busy[\"flag\"]" in INTERP_SRC
+    assert "backlog.source_drops_pending" in INTERP_SRC
+    assert "or _mt_lane_dead[\"reason\"]" in INTERP_SRC
 
 
 def test_shutdown_spec_cancel_source_pinned():
