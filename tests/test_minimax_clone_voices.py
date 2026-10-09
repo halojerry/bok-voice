@@ -1,6 +1,6 @@
 """MiniMax 云端克隆音色（路线 B）settings 面：minimax_clones_json 防蒸发回归。
 
-克隆清单由 /api/tts/minimax-voices 直写 settings.tts.minimax_clones_json（绕过
+克隆清单由 /api/tts/cloud-voices 直写 settings.tts.minimax_clones_json（绕过
 ProviderSettings 模型）；PUT /api/settings 走 req.tts.model_dump() 重建整段——
 字段未在模型上声明时该键被静默蒸发 = 已克隆音色清单全丢（2026-09-18
 wt-saas-delivery 会话发现，落地前 main 实锤）。本文件钉死：字段声明后
@@ -49,11 +49,11 @@ def test_settings_put_preserves_minimax_clones(monkeypatch):
 
 
 def test_clone_list_endpoint_reads_settings_blob(monkeypatch):
-    """GET /api/tts/minimax-voices 读 settings blob（本地面板数据，非云调用）。"""
+    """GET /api/tts/cloud-voices 读 settings blob（本地面板数据，非云调用）。"""
     client, repo = _client_and_repo(monkeypatch)
     _seed_clones(repo)
 
-    resp = client.get("/api/tts/minimax-voices")
+    resp = client.get("/api/tts/cloud-voices")
     assert resp.status_code == 200
     rows = resp.json()
     assert rows[0]["voice_id"] == "bokcloneabc12345"
@@ -62,6 +62,6 @@ def test_clone_list_endpoint_reads_settings_blob(monkeypatch):
 def test_clone_list_endpoint_empty_default(monkeypatch):
     """未克隆过 → 空数组（非 404/500），web 下拉静默降级。"""
     client, repo = _client_and_repo(monkeypatch)
-    resp = client.get("/api/tts/minimax-voices")
+    resp = client.get("/api/tts/cloud-voices")
     assert resp.status_code == 200
     assert resp.json() == []

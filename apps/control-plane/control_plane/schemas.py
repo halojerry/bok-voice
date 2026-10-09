@@ -44,7 +44,9 @@ class LoginRequest(BaseModel):
     # username 上限 128（评审 I-2，fix round 1）：登录是预认证端点，超长串原样
     # 进 strip/查库/频控键=无谓成本；pydantic 层 422 拒收。
     username: str = Field(max_length=128)
-    password: str
+    # W⑧-6（2026-10-09）巨包钳制：password 同款上限（scrypt 对兆级串做 KDF
+    # =纯 DoS 放大器）。
+    password: str = Field(max_length=256)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -72,6 +74,29 @@ class UpdateUserRequest(BaseModel):
     role: str = ""  # 仅 root 可改
     # B4：None=不改权限（与 '' 区分——空 list 是「全关」这一显式意图）。
     permissions: list[str] | None = None
+
+
+# ---- SaaS 客户生命周期（W① 2026-10-09；端点恒 root 专属）----
+
+
+class CreateAccountRequest(BaseModel):
+    display_name: str = Field(default="", max_length=255)
+    # 客户管理员登录名/初始密码（密码 ≥12 位强门槛——客户侧唯一登录入口）。
+    admin_username: str = Field(max_length=128)
+    admin_password: str = Field(max_length=256)
+    # 有效期天数（1~3650）；0/缺省=永久（NULL）。
+    duration_days: int = 0
+
+
+class RenewAccountRequest(BaseModel):
+    # 续费天数：expires_at = max(now, 现值) + days（已过期则从当下起算）。
+    days: int
+
+
+class UpdateAccountRequest(BaseModel):
+    display_name: str = ""
+    # ISO 串；空串=不改；"permanent"=清期限（回永久档）。
+    expires_at: str = ""
 
 
 class CreateCallRequest(BaseModel):

@@ -130,7 +130,9 @@ def test_admin_surface_ok_but_scoped(monkeypatch):
     client, _repo, ids = _setup(monkeypatch)
     a = ids["admin"]
     # 管理面 200
-    assert client.get("/api/settings", headers=a).status_code == 200
+    # W③（2026-10-09）：/api/settings 收平台专属——admin 恒 403（引擎/模型段
+    # 是平台机密，掩码面也不再给客户管理员）。
+    assert client.get("/api/settings", headers=a).status_code == 403
     assert client.get("/api/knowledge", headers=a).status_code == 200
     assert client.get("/api/personas", headers=a).status_code == 200
     assert client.get("/api/reports/summary", headers=a).status_code == 200

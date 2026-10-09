@@ -98,6 +98,10 @@
 | `scripts/probes/probe_interp_continuous.py` | B 线「边说边译」连续语流探针（2026-09-17 长度触发子句提交验收）。 | test_probe_stimulus.py / security/mimosa/suppressions.json | 是 | 2026-09-21 |
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
 | `scripts/probes/probe_interp_fluency.py` | B 线流畅度探针（2026-10-09 W6×interp-lite 合流验收）：≥40字长句×3 连续推流，四判据=段间天窗>800ms 计数/单段出声 p50≥4s/首声 onset≤3.5s/原文提交单元 p50≥15 字。 | test_scripts_index.py | 是 | 2026-10-09 |
+| `scripts/probes/probe_minimax_bidi_native.py` | MiniMax t2a_v2_bidi 服务端攒句可行性探针（W7-P1，2026-10-09）：逐字直喂/flush 催尾/cancel 存活/ping RTT/早切对照+HTTP 字节对照，量「官方攒句可否替代客户端攒句/早切」。 | agent livekit_plugins.py（MiniMaxTTS bidi）/ probe_cloud_asr.py（取钥同源） | 是 | 2026-10-09 |
+| `scripts/probes/probe_doubao_native_arms.py` | 豆包 SAUC 官方参数臂探针（W7-P2，2026-10-09）：end_window_size 判停窗实测（缺省≈3s 金子发现）/enable_nonstream 二遍 CER/enable_ddc 结巴顺滑/force_to_speech_time 句头/result_type=single 形状。 | probe_cloud_asr.py（协议帧/语料/折叠评分 import 复用） | 是 | 2026-10-09 |
+| `scripts/probes/probe_interp_official_chain.py` | B 线官方化裸链探针（W7-P3，2026-10-09）：DeepSeek 流式 token 逐 delta 直发 MiniMax bidi，量 utterance 级 EVS/token 节奏/投机预热（缓存块粒度判定）。 | probe_deepseek_stream.py（取钥同源）/ livekit_plugins.py（bidi 端点） | 是 | 2026-10-09 |
+| `scripts/probes/probe_mt_lane_ttft.py` | MT 车道 TTFT 竞测探针（W7-P5，2026-10-09）：deepseek-flash vs 方舟 seed-2.0/2.1-lite vs qwen-flash 三臂流式首 token/速率/术语/粤译质量——贴着说话出声的译道定盘。 | probe_mt_matrix.py（方舟臂鉴权/env 同源） | 是 | 2026-10-09 |
 | `scripts/probes/probe_mt_matrix.py` | B 线 MT 车道选型矩阵探针（2026-10-08 W1）：deepseek官方/qwen-mt-flash(translation_options.terms)/方舟v4.1-flash/opencode zen 四臂逐 delta 计时+译文质量+术语落地;晚峰复测定车道。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_mt_firstplay.py` | DeepSeek 流式 MT「首可播块」台架（2026-10-09 W8-A2）：首个可合成分句（句末标点或 ≥12 字逗号界）墙钟分布×6 句×两向，对照列=spec 稳定判据仿真触发时刻（LATENCY_BUDGETS §5a 测量仪器）。 | test_scripts_index.py | 是 | 2026-10-09 |
 | `scripts/probes/probe_deepseek_stream.py` | DeepSeek 流式真伪归因探针（2026-10-08）：chat 流式/Responses API/非流式三形状逐 delta 计时+TTFB+缓存臂;Responses 思考开关=reasoning.effort "none"。 | test_scripts_index.py | 是 | 2026-10-08 |
@@ -137,7 +141,7 @@
 | `scripts/seed/build_asr_variants.py` | 离线构建 ASR 音近变体词表资产(2026-09-27)。 | asr_polish.py | 否 | 2026-10-04 |
 | `scripts/seed/merge_asr_variants_extra.py` | curated 变体幂等并进吸附资产(2026-10-08 B 线 P0;builder 重建后须重跑回填,extra=asr_variants_extra_bline.json)。 | asr_polish.py / asr_variants.json | 否 | 2026-10-08 |
 | `scripts/seed/export_ecapa_onnx.py` | v2 认人票：官方 speechbrain ECAPA ckpt 自导出单文件 ONNX（临时 venv 跑，torch 懒导入非生产依赖；parity 断言+sha256 存档）。 | speaker_lock.py ECAPA 档 | 否 | 2026-10-07 |
-| `scripts/seed/cache_minimax_auditions.py` | MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。 | minimax-voices.ts | 是 | 2026-10-03 |
+| `scripts/seed/cache_cloud_auditions.py` | 云端音色官方试听缓存（2026-10-02 音色目录换血配套；2026-10-09 W④ 更名+目录 voice-auditions）。 | voice-catalog.ts | 是 | 2026-10-09 |
 | `scripts/seed/gen_filler_assets.py` | 垫话音频资产生成器(2026-09-10 拍板,spec 讨论见会话)。 | agent fillers.py / test_speed_unification.py | 是 | 2026-10-04 |
 | `scripts/seed/gen_ambience.py` | W6 场景底噪资产生成器(2026-10-06):三场景无缝循环 wav+manifest,种子化确定性合成。 | agent ambience.py / test_ambience.py | 是 | 2026-10-06 |
 | `scripts/seed/gen_route_gates.py` | 生成 security/route-gates.json：枚举 CP 全部 FastAPI 路由 + 源码闸标记提取。 | test_route_gate_coverage.py | 否 | 2026-09-23 |
@@ -149,5 +153,5 @@
 | `scripts/seed/prep_tts_dataset.py` | 原始客服录音 → Qwen3-TTS SFT 数据集流水线（docs/TTS-SFT-DATA-PREP.md 阶段 C 数据先行）。 | test_prep_tts_dataset.py import / test_prep_tts_dataset.py | 否 | 2026-10-04 |
 | `scripts/seed/prepare_csc_data.py` | 粤语/普通话 CSC（拼写纠错）自训数据挖掘管道（2026-09-27）。 | test_probe_stimulus_tools.py import / CP hotword_mining.py | 否 | 2026-10-04 |
 | `scripts/seed/render_asr_corpus_v2.py` | ASR 评测语料 v2：粤语条目重渲（好音频版，2026-10-03）。 | AGENTS.md | 否 | 2026-10-03 |
-| `scripts/seed/render_asr_corpus_4lang.py` | 四语（de/fr/ja/pt）豆包 ASR 实测语料渲染（W2c，2026-10-06）：MiniMax 云 TTS×客服六句型/语→16k wav+manifest（reports/asr-4lang-corpus，gitignored），供 probe_cloud_asr --corpus 放行/限缩判定。 | probe_cloud_asr.py / cache_minimax_auditions.py（护栏+目录单源 import） | 是 | 2026-10-06 |
+| `scripts/seed/render_asr_corpus_4lang.py` | 四语（de/fr/ja/pt）豆包 ASR 实测语料渲染（W2c，2026-10-06）：MiniMax 云 TTS×客服六句型/语→16k wav+manifest（reports/asr-4lang-corpus，gitignored），供 probe_cloud_asr --corpus 放行/限缩判定。 | probe_cloud_asr.py / cache_cloud_auditions.py（护栏+目录单源 import） | 是 | 2026-10-06 |
 | `scripts/seed/seed_invite_templates.py` | 三语「客服邀约」话术种子（2026-09-24 精炼版）。 | test_branch_syntax_parity.py / prepare_csc_data.py | 是 | 2026-09-26 |

@@ -1,13 +1,13 @@
 -- ============================================================================
 -- Bok Voice control-plane 全量 schema —— P0 引导件(**生成物,勿手改**)
 -- ============================================================================
--- 生成方式: scripts/dump_postgres_ddl.py
+-- 生成方式: scripts/ops/dump_postgres_ddl.py
 --   1) 对源库真跑 control_plane.deps.build_engine()(建表 + 幂等补列迁移 + 数据迁移);
 --   2) 源容器内 pg_dump --schema-only 导出(见下方"源命令")。
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-10-02
+-- 生成日期: 2026-10-09
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
@@ -78,6 +78,7 @@ CREATE TABLE public.accounts (
     id character varying(64) NOT NULL,
     org_id character varying(64) NOT NULL,
     display_name character varying(255) NOT NULL,
+    expires_at timestamp without time zone,
     created_at timestamp without time zone NOT NULL
 );
 

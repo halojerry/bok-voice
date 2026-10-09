@@ -1495,7 +1495,6 @@ function ConsoleLive(p: LiveProps) {
     let sinkErr = "";
     try {
       const blob = await postBlob("/api/tts/preview", {
-        provider: "qwen3_tts",
         voice: "Vivian",
         language: "zh",
         text: label,

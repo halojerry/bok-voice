@@ -2,13 +2,53 @@
  "schemaVersion": "route-gates/v1",
  "routes": [
   {
+   "path": "/api/accounts",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "list_accounts_ep,create_account_ep",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": "W① SaaS 客户生命周期 root 专属（require_role root+审计；密码不入 detail）"
+  },
+  {
+   "path": "/api/accounts/{account_id}",
+   "methods": [
+    "PATCH"
+   ],
+   "handlers": "update_account_ep",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": "W① root 专属：改显示名/期限（permanent 清期限）"
+  },
+  {
+   "path": "/api/accounts/{account_id}/renew",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "renew_account_ep",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": "W① root 专属续费（max(now,现值)+days，清到期缓存）"
+  },
+  {
    "path": "/api/asr/health",
    "methods": [
     "GET"
    ],
    "handlers": "asr_health",
    "gates": [
-    "page"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -106,8 +146,8 @@
    ],
    "handlers": "get_call,delete_call",
    "gates": [
-    "page",
     "account",
+    "page",
     "mgmt-auto"
    ],
    "note": "",
@@ -164,7 +204,6 @@
    ],
    "handlers": "hangup",
    "gates": [
-    "page",
     "account"
    ],
    "note": "",
@@ -178,8 +217,8 @@
    ],
    "handlers": "get_call_logs",
    "gates": [
-    "page",
-    "account"
+    "account",
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1146,7 +1185,6 @@
    ],
    "handlers": "get_settings,put_settings",
    "gates": [
-    "mgmt",
     "identity-self",
     "mgmt-auto"
    ],
@@ -1161,7 +1199,7 @@
    ],
    "handlers": "setup_status",
    "gates": [
-    "mgmt-auto"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1174,7 +1212,7 @@
    ],
    "handlers": "setup_download",
    "gates": [
-    "mgmt-auto"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1614,6 +1652,33 @@
    "reason": ""
   },
   {
+   "path": "/api/tts/cloud-voices",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "tts_minimax_voices_list,tts_minimax_voice_clone",
+   "gates": [
+    "platform"
+   ],
+   "note": "identity-gate-only",
+   "reviewed": true,
+   "reason": "W④ 克隆清单 GET=interpret|settings-any（负载仅不透明音色 id）；POST 克隆=platform"
+  },
+  {
+   "path": "/api/tts/cloud-voices/{voice_id}",
+   "methods": [
+    "DELETE"
+   ],
+   "handlers": "tts_minimax_voice_delete",
+   "gates": [
+    "platform"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": "W④ 克隆删除=platform（克隆=平台操作）"
+  },
+  {
    "path": "/api/tts/filler-preview",
    "methods": [
     "GET"
@@ -1633,35 +1698,7 @@
    ],
    "handlers": "tts_health",
    "gates": [
-    "page"
-   ],
-   "note": "",
-   "reviewed": true,
-   "reason": ""
-  },
-  {
-   "path": "/api/tts/minimax-voices",
-   "methods": [
-    "GET",
-    "POST"
-   ],
-   "handlers": "tts_minimax_voices_list,tts_minimax_voice_clone",
-   "gates": [
-    "page",
-    "mgmt-auto"
-   ],
-   "note": "",
-   "reviewed": true,
-   "reason": ""
-  },
-  {
-   "path": "/api/tts/minimax-voices/{voice_id}",
-   "methods": [
-    "DELETE"
-   ],
-   "handlers": "tts_minimax_voice_delete",
-   "gates": [
-    "mgmt-auto"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1674,7 +1711,7 @@
    ],
    "handlers": "tts_preview",
    "gates": [
-    "mgmt-auto"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1687,7 +1724,7 @@
    ],
    "handlers": "tts_speakers",
    "gates": [
-    "page"
+    "platform"
    ],
    "note": "",
    "reviewed": true,
@@ -1701,10 +1738,9 @@
    ],
    "handlers": "tts_voices,tts_register_voice",
    "gates": [
-    "page",
     "mgmt-auto"
    ],
-   "note": "",
+   "note": "identity-gate-only",
    "reviewed": true,
    "reason": ""
   },

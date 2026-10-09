@@ -207,19 +207,20 @@ def test_endpoint_404_and_permission_matrix(monkeypatch, tmp_path):
     r = client.post("/api/auth/login", json={"username": "peon", "password": PW})
     h = {"Authorization": f"Bearer {r.json()['token']}"}
     assert client.get(f"/api/calls/{CALL_A}/logs", headers=h).status_code == 403
-    # 默认页面键（含 calls）的 user → 200；跨账号 → 404
+    # W③（2026-10-09）logs 收平台专属：原始 agent.log 行含模型名/端点/音色 id
+    # ——有 calls 页键的 user/admin 也 403；跨账号口径随之恒 403（先于归属判定）。
     repo.create_user(username="agent-ok", password_hash=hash_password(PW), role="user",
                      org_id="org-t", account_id="acc-001", permissions_json="")
     h_ok = {"Authorization": "Bearer " + client.post(
         "/api/auth/login", json={"username": "agent-ok", "password": PW}
     ).json()["token"]}
-    assert client.get(f"/api/calls/{CALL_A}/logs", headers=h_ok).status_code == 200
+    assert client.get(f"/api/calls/{CALL_A}/logs", headers=h_ok).status_code == 403
     repo.create_user(username="other-acct", password_hash=hash_password(PW), role="user",
                      org_id="org-t", account_id="acc-002", permissions_json="")
     h_other = {"Authorization": "Bearer " + client.post(
         "/api/auth/login", json={"username": "other-acct", "password": PW}
     ).json()["token"]}
-    assert client.get(f"/api/calls/{CALL_A}/logs", headers=h_other).status_code == 404
+    assert client.get(f"/api/calls/{CALL_A}/logs", headers=h_other).status_code == 403
 
 
 def test_endpoint_missing_log_file_returns_empty_page(monkeypatch, tmp_path):

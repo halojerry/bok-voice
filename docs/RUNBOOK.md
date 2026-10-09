@@ -7,6 +7,7 @@
 - **锚纪律**：一律符号名（类/函数/env 键），不点行号——行号必漂，符号名靠编辑器搜。
 - **回退开关**列只收 `tools/bokctl/env.py` `_FORWARD_ENV` 已登记的键（prod 转发保真）；`—` = 无开关，只能改码或查因。
 - **取证方法**（turns 账本 → 日志标记窗 → 离线复算）见 `.agents/skills/call-diagnosis/SKILL.md`；日志标记词汇表见其 `references/markers.md`。
+- **SaaS 安全面**（暴露清单/凭据轮换矩阵/CSP/TURN/滥用闸/残余风险）唯一入口=`docs/SECURITY-SAAS.md`。
 - 校验：`scripts/ops/check_doc_paths.py`（断链）+ `tests/test_doc_hygiene.py`；本页新增行也过这两道门。
 
 | 症状 | 第一现场 | 探针/复算 | 测试 | 回退开关 |

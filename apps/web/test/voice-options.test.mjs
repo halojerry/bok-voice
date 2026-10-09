@@ -40,7 +40,7 @@ test("合并去重：firstOption→目录→克隆，目录与克隆同 id 只�
   const opts = vo.buildVoiceSelectOptions({
     catalog: CATALOG,
     slotLang: "zh",
-    minimaxClones: [
+    cloudClones: [
       { voice_id: "zh-a", label: "重复目录 id" }, // 与目录条目同 id → 丢弃
       { voice_id: "clone-1", label: "我的声" },
       { voice_id: "clone-1", label: "重复克隆" }, // 克隆内部重复 → 丢弃
@@ -57,10 +57,10 @@ test("合并去重：firstOption→目录→克隆，目录与克隆同 id 只�
 
 // ---- ② slotLang 过滤 + 未知语言回落全量；克隆不吃过滤 ----
 test("语言过滤与回落：已知语言滤目录，未知（vi/缺省）回落全量，克隆恒在", () => {
-  const zh = vo.buildVoiceSelectOptions({ catalog: CATALOG, slotLang: "zh", minimaxClones: [{ voice_id: "c1", label: "x" }] });
+  const zh = vo.buildVoiceSelectOptions({ catalog: CATALOG, slotLang: "zh", cloudClones: [{ voice_id: "c1", label: "x" }] });
   assert.deepEqual(zh.map((o) => o.value), ["zh-a", "c1"]);
   for (const slot of ["vi", "", undefined]) {
-    const full = vo.buildVoiceSelectOptions({ catalog: CATALOG, slotLang: slot, minimaxClones: [{ voice_id: "c1", label: "x" }] });
+    const full = vo.buildVoiceSelectOptions({ catalog: CATALOG, slotLang: slot, cloudClones: [{ voice_id: "c1", label: "x" }] });
     assert.deepEqual(full.map((o) => o.value), ["canto-a", "zh-a", "en-a", "c1"], `slotLang=${String(slot)} 回落全量`);
   }
 });
@@ -70,7 +70,7 @@ test("克隆置顶：匹配 slotLang 的克隆排目录与预置之前", () => {
   const opts = vo.buildVoiceSelectOptions({
     catalog: CATALOG,
     slotLang: "cantonese",
-    minimaxClones: [
+    cloudClones: [
       { voice_id: "clone-en", label: "英克隆", sample_lang: "en" },
       { voice_id: "clone-canto", label: "粤克隆", sample_lang: "cantonese" },
     ],
@@ -90,12 +90,12 @@ test("标签风格：前缀风格默认「克隆 · 」可参数化；后缀风�
   const prefix = vo.buildVoiceSelectOptions({
     catalog: CATALOG,
     slotLang: "zh",
-    minimaxClones: [{ voice_id: "cv1", label: "我的声" }, { voice_id: "cv2" }],
+    cloudClones: [{ voice_id: "cv1", label: "我的声" }, { voice_id: "cv2" }],
   });
   assert.deepEqual(prefix.map((o) => o.label), ["普甲", "克隆 · 我的声", "克隆 · cv2"]);
 
   const customPrefix = vo.buildVoiceSelectOptions({
-    minimaxClones: [{ voice_id: "cv1", label: "我的声" }],
+    cloudClones: [{ voice_id: "cv1", label: "我的声" }],
     cloneLabelPrefix: "云克隆：",
   });
   assert.equal(customPrefix[0].label, "云克隆：我的声");

@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "node scripts/build-variants.mjs customer",
+    "build:platform": "node scripts/build-variants.mjs platform",
+    "build:restore": "node scripts/build-variants.mjs restore",
     "start": "next dev -H 127.0.0.1 -p 3000",
     "lint": "next lint",
     "test": "node --test \"test/*.test.mjs\""

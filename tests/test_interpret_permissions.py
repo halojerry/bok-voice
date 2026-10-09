@@ -1,7 +1,7 @@
 """B 线权限错配回归（2026-10-02 刀2，RC-5 权限矩阵）。
 
 修复契约：
-- TTS 读/试听面（GET /api/tts/voices、GET /api/tts/minimax-voices、
+- TTS 读/试听面（GET /api/tts/voices、GET /api/tts/cloud-voices、
   POST /api/tts/preview）闸 settings|interpret 任一页键——同传页「克隆音色列表 +
   输出设备指认试听」对 interpret-only 话务员不再静默空列表/403。
 - 通话资源端点按行 kind 分闸：kind=interpret 行放行 calls|interpret 任一页键
@@ -130,7 +130,7 @@ def test_interpret_only_user_tts_surfaces_open(monkeypatch):
     assert r.status_code == 200, r.text
     assert r.json()[0]["voice_id"] == "agent-probe"
 
-    r = client.get("/api/tts/minimax-voices", headers=h)
+    r = client.get("/api/tts/cloud-voices", headers=h)
     assert r.status_code == 200, r.text
 
     # 试听（同传控制台输出设备指认走本端点）：闸后真达 sidecar 代理段。
@@ -149,7 +149,7 @@ def test_keyless_user_tts_surfaces_stay_403(monkeypatch):
     _mk_user(repo, "peon", permissions="[]")
     h = _login(client, "peon")
     assert client.get("/api/tts/voices", headers=h).status_code == 403
-    assert client.get("/api/tts/minimax-voices", headers=h).status_code == 403
+    assert client.get("/api/tts/cloud-voices", headers=h).status_code == 403
     r = client.post("/api/tts/preview", headers=h, json={"provider": "qwen3_tts", "text": "x"})
     assert r.status_code == 403
 
@@ -257,7 +257,7 @@ def test_admin_and_root_unaffected(monkeypatch):
 
     for h in (ah, rh):
         assert client.get("/api/tts/voices", headers=h).status_code == 200
-        assert client.get("/api/tts/minimax-voices", headers=h).status_code == 200
+        assert client.get("/api/tts/cloud-voices", headers=h).status_code == 200
         r = client.post("/api/tts/preview", headers=h,
                         json={"provider": "qwen3_tts", "voice": "Vivian", "text": "试听"})
         assert r.status_code == 200, r.text
