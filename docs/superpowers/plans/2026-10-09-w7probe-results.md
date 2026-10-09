@@ -65,7 +65,32 @@
 
 ---
 
-**三轨门槛全部达成**（P1 ≤400ms 零碎裂 ✓ / P2 判停窗可调 ✓（须显式设置）/ P3 ≤1.5s ✓ / P5 译道定盘 DeepSeek 留任 ✓）。等 P4（含追嘴臂数字）后进阶段二拍板，确认后才动 W7-A 产品代码。
+## P4 官方 AgentSession 真形（2026-10-09 终版）——骨架可用，引擎判负
+
+探针 `w7p4_official_agent.py`+`probe_official_session.py`（暖态真房间 5 跑）：
+
+| 场景 | 数字 | 判定 |
+|---|---|---|
+| S1 单轮 EVS | mean **2338ms**（最好 1.61s，5 跑 2.05-2.71s）——拆账：SAUC 轮界 471-571 + DeepSeek TTFT 483-726 + **MiniMax 首包 725-949**（AgentSession 语音路径开销高于裸链的 420-870）+ 框架调度 | 贴 2.0s 线未稳过 |
+| S2 连续语音 600ms 间隙 | **轮切分非确定**：3/5 切开（连播<500ms 合一 burst）、2/5 并成单 final 且**第二句整吞** | 同传不可接受 |
+| S3 打断 | 5/5 PASS（lead 612-631ms 掐在途译文；残段转录项伪影） | 可用 |
+| S4 追嘴档 | **零收益**（mean 2772 vs S1 2338；说话中出声 0/15 轮） | 见下机制 |
+
+**S4 两条机制发现（重要）**：①1.8.2 框架 preemptive **只吃 PREFLIGHT_TRANSCRIPT**，emit INTERIM 的 DoubaoSTT 缺省零抢跑（llm_req=1/轮）；②stt_node 重标 INTERIM→PREFLIGHT 后抢跑能发（3/轮、提前 0.04-1.1s），但 **DeepSeek TTFT(0.36-0.97s) ≥ interim 节奏(0.17-0.7s)——每个新 interim 都在投机完成前把它取消**（采纳 0-1/3，playout 结构性停到 commit）。**追嘴要成立需投机链速度 ≫ interim 节奏，现役云腿不满足。**
+
+**引擎终判**：interp_lite/manual 管线胜出——AgentSession 路线 a) 延迟无冗余 b) S2 整吞风险 c) 追嘴物理不成立。lite 线的说话中出译（clause-commit 驱动）+ 我们的 spec-mt（稳定前缀自定节奏、不逐 interim 取消、held PCM final 即声）才是正确组合；**P5 的 TTFT 735ms 反转了 lite 审计表「投机收益窗小」的判断——MT 越慢投机越值**。副产品：官方形状同样需要豆包 START pre-roll 叉点；复现 M-27 派发竞速。
+
+## 侦察四路（R1-R4，2026-10-09）
+
+- **R1 LiveKit**：A1 PREFLIGHT 投机（P4 已证云腿物理不成立，留架构位）、A2 user_turn_limit、A3 dynamic endpointing(-100~300ms)、A4 min_words 打断门、A5 FlushSentinel、A6 multi-user-translator 发布形状+TranscriptSynchronizer。1.8.2 全现货。
+- **R2 xiaozhi**：轮式架构不搬；抄七件——两档标点集（首句逗号级/后续句号级）、sentence_id 票贯穿音频队列、两级打断（先静音 held 段可逆→final 再 cancel）、TTS 三档能力契约、MT 首可播块台架、流式术语滑动替换、竞速断句旁证（它豆包侧 end_window_size=200）。
+- **R3 GitHub/商用**：定位=**我们稳态 1.3s 已快过全部公开商用**（KUDO 4.1s/豆包同传 2-3s/Timekettle 3-5s/Forasoft 1.4-1.7s）。新弹药：**auto_tempo 变速背压**（Palabra 商用背书，1.0→1.35-1.45x 先变速后丢弃，speedup_pcm 复用）、sokuji 右上下文门（spec 触发标点+2-4 字再开火）、业界 SLO 锚（MT TTFT<250/TTS TTFB<300/<700ms=实时感带，唯一路径=spec HIT 面）、T3PO append-only 本地 MT 备查。
+- **R4 VAD**：本地 VAD 保留（CPU 成本≈零、A 线/本地回退依赖、尾巴 0.9s 是并段设计）；C 轻量兜底=显式 end_window=800+definite 看门狗（半天量）；去本地 VAD 仅当「句头被吞」独立票翻案。
+
+---
+
+**三轨门槛全部达成**（P1 ≤400ms 零碎裂 ✓ / P2 判停窗可调 ✓（须显式设置）/ P3 ≤1.5s ✓ / P5 译道定盘 DeepSeek 留任 ✓ / P4 引擎终判=manual 胜 ✓）。阶段二拍板面齐。
+
 
 
 W7-A 需带上探针教训：①end_window_size 必须**显式**设置（缺省 3s 不可用）；②`_fold_stutter` 官方路径直接退役（引擎缺省已折叠）；③早切/head-flush 全退役（官方攒句更优且治韵律断裂）；④轮尾 task_flush 必须发（省 2.1s）；⑤ping 保活已健在勿重复造。
