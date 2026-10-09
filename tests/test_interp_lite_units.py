@@ -175,15 +175,18 @@ def test_lite_doubao_config_official_arms(monkeypatch):
 
 
 def test_first_block_cut_pure():
-    """快启动层首块切点：标点 ≥5 字/保险丝 8 字/稳定性/数字 run 保护。"""
+    """快启动层首块切点：标点 ≥8 内容单位/保险丝 15 单位/稳定性/数字 run 保护。
+
+    2026-10-09 W8-B 调档：5→8（标点）/ 8→15（保险丝）——Ethan 拍板「你叫什么名字？
+    不该被切」——短句只在强标点出整句，逗号攒 12+ 单位，无标点跑 15+ 才兜底。"""
     from agent_runtime.providers.doubao_asr import _first_block_cut
 
-    # 弱标点边界 ≥5 字（含标点计数），且上一 interim 同坐标稳定。
-    assert _first_block_cut("我想请问，", "我想请问，") == 5
-    # <5 字不切。
+    # 弱标点边界 ≥8 内容单位（含标点计），且上一 interim 同坐标稳定。
+    assert _first_block_cut("我想请问一下这个订单，", "我想请问一下这个订单，") == 11
+    # <8 单位不切（「我想」=2 单位太短——攒）。
     assert _first_block_cut("我想，", "我想，") is None
-    # 无标点 → 保险丝 8 字。
-    assert _first_block_cut("我想请你们帮我看", "我想请你们帮我看") == 8
+    # 无标点 → 保险丝 15 单位。
+    assert _first_block_cut("我想请你们帮我查一下这个订单的状态", "我想请你们帮我查一下这个订单的状态") == 15
     # 首次目击（prev_full 空=未稳定）不切。
     assert _first_block_cut("我想请问，你们", "") is None
     # W8-B 词计修订：数字 run 边界被 run 门拒绝后，词计下本形状仅 5 内容单位
@@ -209,7 +212,9 @@ def test_first_block_wiring_lite_only(monkeypatch):
     stt_lite = da.DoubaoSTT(api_key="k", vad_=vad, clause_commit=True, len_fuse=True)
     events = asyncio.run(da._drive_clause(stt_lite, vad, packets=3))
     finals_lite = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
-    assert finals_lite and finals_lite[0] == "我想请问，"  # 7 字弱标点快启动
+    # W8-B 调档：快启动 8 单位 → 「我想请问」(5 单位)不切——等整句句号
+    # 或攒到 12+ 单位的逗号档。finals 应含长段而非 7 字碎刀。
+    assert finals_lite and len(finals_lite[0]) >= 10  # 长于旧碎刀（≥10 字）
 
     da._fake_merge(monkeypatch)
     da._make_connect_replies(

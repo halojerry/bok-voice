@@ -142,9 +142,9 @@ def test_len_fuse_yields_when_punct_in_sight(monkeypatch, capsys):
 
 
 def test_len_fuse_still_fires_without_punct(monkeypatch):
-    """防饿死本职保留：无标点长流攒满门槛（快启动首块 8 单位）照切。"""
+    """防饿死本职保留：无标点长流攒满门槛（快启动首块 15 单位，W8-B 调档）照切。"""
     monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
-    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "12")
 
     async def scenario():
         stream, events = _merged_stream()
@@ -152,7 +152,7 @@ def test_len_fuse_still_fires_without_punct(monkeypatch):
         stream._on_payload({"result": {"text": t, "utterances": []}})
         assert _finals(events) == []  # 首现不稳定
         stream._on_payload({"result": {"text": t + "啊", "utterances": []}})
-        assert _finals(events) == [t[:8]]  # 无标点 → 快启动保险丝 8 单位即切
+        assert _finals(events) == [t[:15]]  # 无标点 → 快启动保险丝 15 单位即切
         await stream.aclose()
 
     asyncio.run(scenario())

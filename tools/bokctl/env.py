@@ -986,9 +986,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     # ①逗号档字数 8→6(自然短语组提前半拍);②长度档字数 10→8(地板即 8);
     # ③句级提交限速 1.5→1.0s(连珠句排队窗缩短)。A 线 worker 唔带这些 env,
     # 客服线逐字节零变化;三键均显式 env 可覆盖(经下方透传白名单)。
-    env.setdefault("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "6")
-    env.setdefault("QWEN3_ASR_CLAUSE_LEN_CHARS", "8")
-    env.setdefault("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "1.0")
+    env.setdefault("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "12")
+    env.setdefault("QWEN3_ASR_CLAUSE_LEN_CHARS", "18")
+    env.setdefault("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "1.5")
     # VAD 停嘴门槛(2026-10-02 收编):旧版在此 setdefault 0.35(2026-09-17 B 线
     # 专属调参,当时 A 线 0.45)——但 env 优先级压过设置面,设置页对 B 线永久
     # 说谎(改了不生效)。现拆 setdefault:B 线与 A 线同读设置面 vad 段

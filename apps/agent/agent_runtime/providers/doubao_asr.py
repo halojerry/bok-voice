@@ -398,13 +398,13 @@ def _first_block_cut(text: str, prev_full: str) -> int | None:
                 j += 1
             seg = text[:j]
             if (
-                len(seg) >= 5
+                _clause_content_units(seg) >= 8
                 and not _has_latin_or_digit_run(seg, min_len=4)
                 and prev_full[:j] == seg
             ):
                 return j
         i += 1
-    fuse = _len_fuse_cut(text, 0, 8)
+    fuse = _len_fuse_cut(text, 0, 15)
     if (
         fuse is not None
         and prev_full[:fuse] == text[:fuse]
