@@ -560,7 +560,7 @@ def _start_llm(
     a_reply+judge+settle 全 openai）时整条本地链（mlx/queue proxy）不拉起。"""
     p = posture if posture is not None else _cloud_posture()
     if p["llm_cloud"]:
-        print(f"[bok] llm :1235 skipped (cloud: {p['llm_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        print(f"[bok] llm :1235 skipped (cloud: {p['llm_why']}; 要本地档才设 BOK_LOCAL_LLM=1)")
         return
     # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
@@ -691,7 +691,7 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path, posture
     """
     p = posture if posture is not None else _cloud_posture()
     if not p["mt_local"]:
-        print(f"[bok] mt :1236 skipped (cloud: {p['mt_why']}; BOK_LOCAL_LLM=1 强制拉起)")
+        print(f"[bok] mt :1236 skipped (cloud: {p['mt_why']}; 要本地档才设 BOK_LOCAL_LLM=1)")
         return False
     if core.healthy(1236):
         return True
@@ -761,7 +761,7 @@ def _start_settle_llm(
     p = posture if posture is not None else _cloud_posture()
     if p["settle_cloud"]:
         print(
-            f"[bok] settle lane :1237 skipped (cloud: {p['settle_why']}; BOK_LOCAL_LLM=1 强制拉起)",
+            f"[bok] settle lane :1237 skipped (cloud: {p['settle_why']}; 要本地档才设 BOK_LOCAL_LLM=1)",
             file=sys.stderr,
         )
         return False
@@ -1004,7 +1004,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
             # sidecar 不拉起（1.9GB+ 权重零消费）；BOK_LOCAL_ASR=1 是显式回拉口。
             print(
                 f"[bok] asr sidecar :8787 skipped (cloud: {posture['asr_why']};"
-                " BOK_LOCAL_ASR=1 强制拉起)"
+                " 要本地档才设 BOK_LOCAL_ASR=1)"
             )
         else:
             _start_proc(
@@ -1033,7 +1033,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
                 "QWEN3_TTS_WARMUP": "0" if paths.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
         )
     elif not tts_needed:
-        print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
+        print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; 要本地档才设 BOK_LOCAL_TTS=1)")
 
     _start_llm(current, run_dir, log_dir, posture)
     want_mt = _start_mt_llm(current, run_dir, log_dir, posture)
