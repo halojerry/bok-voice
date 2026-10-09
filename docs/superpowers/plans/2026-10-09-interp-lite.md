@@ -122,10 +122,50 @@ settle 半场闸、SessionReport 带 worker 标识。
 | asr_polish/stutter fold | DeepSeek prompt 已含 ASR 噪声纠错规则；`correct_table` 官方位待接 | e2e 误听率明显高于旧线 |
 | 抢跑/preemptive | DeepSeek 首 token ~350ms + 流式 say 已流水线化 | first_ms 归因到 prefill 等待 |
 
-## 9. 窗 B 排程（本窗不做）
+## 8a. 窗 A+：W6×interp-lite 合流收口（2026-10-09 同日，全部已落地）
 
-1. provider 搬移共源化（doubao/MiniMax 从旧包提出独立薄文件，新旧线同源）。
-2. 旧线 interpret.py 冻结（只修 P0 bug）；新线达标后 serve 默认翻转。
-3. A 线（agent.py 9,582）同法评估——巨石棘轮基线待其对应窗口。
-4. P0 文档欠账（REV_AUDIO 入 _FORWARD_ENV、LATENCY_BUDGETS/decisions/RUNBOOK 刷新、
-   遗留 worktree 清理）=独立小窗。
+**W6 三刀裁定**：刀1（句档）=薄线 env 化落地；刀2（spec 稳定前缀）=结构性不需要
+（无 spec、pump 解耦后 MT 全程并发）；刀3（queue_wait_ms）=入薄线账本。
+**W6 立项档三处勘误**：①`QWEN3_ASR_CLAUSE_LEN_CHARS` 在豆包路径此前**无实现**
+（键空转）——本窗补 `_len_fuse_cut`（构造旗 `len_fuse`，旧线默认关）；②其 §5
+「perceived ≤2.5s」与「单段 ≥4s」内部矛盾（perceived 含播完时长）——验收改
+天窗/段时长/onset/提交单元四判据；③三刀全是对旧线巨石的增量投入，零落地代码。
+
+**实弹发现的三个真 bug（全修）**：
+1. **豆包 clause 对齐静默吞字**（call-ed6326a5：每句吞 20-35 字）——双失配时
+   「已见全文认作已领地」却不发 FINAL；契约翻案=最长公共归一前缀之外的差量
+   **发 FINAL**（`DOUBAO_CLAUSE_ALIGN_DELTA` 观测行）；「宁漏勿重」作废。旧线 B 档同受益。
+2. 保险丝稳定判据须**归一化**比较（ASR 回溯改标点在 raw 比较下把保险丝打哑）。
+3. **框架 speech 队列串行拉生成器**=下一单元 MT 不起跑（尾巴单元 first_ms
+   6-7.8s=上一段播报时长+真实 MT 0.6s）——pump 缓冲解耦（MT 独立任务先拉流，
+   say 生成器只消费）。
+
+**句档 profile 定档**（`bokctl.servers.interp_lite_commit_env`，BOK_INTERP_LITE=1
+注入，运营显式 env 最高优先）：逗号档 999（结构性关闭）/保险丝 30（实弹 A/B：
+30 档 seg_p50=4.9s vs 20 档 3.4s，onset 同 9.4-10.1s）/限速 2.0。
+
+**验收读数**（默认档全链，句档+fuse30+pump+对齐修复）：
+- `e2e_interpret` **8/8 PASS**；`probe_interp_continuous` PASS（onset 早于讲完）。
+- `probe_interp_fluency`：onset 9.7-10.1s<第一句讲完 20.5-23.8s ✅、seg_p50
+  4.8-4.9s ✅、提交单元 p50 30-31 字 ✅、**吞字零** ✅；**未达**：段间天窗 5 个
+  （大窗 8.2-9.6s>8s 预算）。
+- **大窗根因定案**（四段账归因链）：不是 MT（主单元 first_ms 552-745ms、缓存
+  pct 0.35-0.64 全健康）、不是队列（queue_ms 0-1）——是**提交节律**：句尾尾巴
+  （1.5s 短音频）播完后，下一句 fuse 要攒 30 内容字（~6s 语流）+管线 1s。
+  **离散提交结构性填不满**；解=W6 刀2 的正确形态=interim 稳定前缀 MT（lite 版
+  抢跑，官方 pipeline_translator preemptive_generation 同构）——审计表「抢跑」
+  行触发条件正式命中，**窗 B 首票**。
+- 延迟 A/B（说完即停口径）：薄线 3572/3786 vs 旧线同姿势 3835；LATENCY_BUDGETS
+  §5 已按姿势分档（本地 MT2 3500/全云 4200）。
+
+**P0 欠账同窗清**：REV_AUDIO 入 `_FORWARD_ENV`；LATENCY_BUDGETS 分档；decisions.md
+收录六档；RUNBOOK 补 B 线三行（含 BOK_INTERP_LITE 总开关）。
+
+## 9. 窗 B 排程（下一窗）
+
+1. **interim 稳定前缀 MT（lite 抢跑）**——流畅度大窗的正解，W6 刀2 形态、官方
+   preemptive 同构；证据链已齐（上述四段账归因）。
+2. provider 搬移共源化（doubao/MiniMax 从旧包提出独立薄文件，新旧线同源）。
+3. 旧线 interpret.py 冻结（只修 P0 bug）；真人 soak 后 serve 默认翻转。
+4. A 线（agent.py 9,582）同法评估——巨石棘轮基线待其对应窗口。
+5. W6 未完票：官方 DDC/加速臂 A/B（DDC 与语气标记冲突维持关）、晚峰 18-22h MT 终判。

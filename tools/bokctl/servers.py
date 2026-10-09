@@ -1192,8 +1192,9 @@ def interp_lite_commit_env(base: dict) -> dict:
 
     - ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=999``：逗号（次级标点）档结构性关闭，
       只认句末标点（。！？；?!，强档另有 ≥6 字门不受此键影响）；
-    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=20``：连续无标点语流 20 内容字保险丝（防憋死；
-      拉丁 2× 语义在 provider 内）；
+    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=30``：连续无标点语流 30 内容字保险丝（实弹
+      定档 2026-10-09：30 字档 seg_p50=4.9s/onset 10.1s vs 20 字档 3.4s/9.4s，
+      大窗同源=提交节律非保险丝宽度；拉丁 2× 语义在 provider 内）；
     - ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S=2.0``：句档限速。
 
     三键语义=**覆盖 B 档碎片缺省**（``_interp_env`` 已 setdefault 6/8/1.0 进 base，
@@ -1202,7 +1203,7 @@ def interp_lite_commit_env(base: dict) -> dict:
     独立，旧线（开关关）零感知。回退=serve env 显式设旧值或 BOK_INTERP_LITE=0。"""
     profile = {
         "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS": "999",
-        "QWEN3_ASR_CLAUSE_LEN_CHARS": "20",
+        "QWEN3_ASR_CLAUSE_LEN_CHARS": "30",
         "QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "2.0",
     }
     out = dict(base)

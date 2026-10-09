@@ -46,6 +46,10 @@
 - [2026-10-02 b-line-wave1](superpowers/plans/2026-10-02-b-line-wave1.md) — B 线第一波（web UX 三刀同期）
 - [2026-10-04 repo-governance-plan](superpowers/plans/2026-10-04-repo-governance-plan.md) — 仓库治理计划（本索引与 `docs/RUNBOOK.md` 的出处，§3.3）
 - [2026-10-04 s2s-vs-cascade-report](superpowers/plans/2026-10-04-s2s-vs-cascade-report.md) — S2S vs 级联对照报告
+- [2026-10-06 demo-quality-wave](superpowers/plans/2026-10-06-demo-quality-wave.md) — 演示质量波（W1/W2 四语/W3b 等）
+- [2026-10-09 bline-fluency](superpowers/plans/2026-10-09-bline-fluency.md) — W6 B 线流畅度立项（碎片化归因+同传参照系+三刀提案；刀1 语义由 interp-lite 承接）
+- [2026-10-08 bline-parity](superpowers/plans/2026-10-08-bline-parity.md) — B 线 A 线化（语气词 v2/双向出声翻案）
+- [2026-10-09 interp-lite](superpowers/plans/2026-10-09-interp-lite.md) — 薄 B 线重建（官方替代表/LOC 预算/窗 A+ 流畅度收口：吞字修复/长度保险丝/pump 解耦/句档 30）
 
 ## ② 常设决策文档
 

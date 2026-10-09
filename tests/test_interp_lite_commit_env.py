@@ -38,7 +38,7 @@ def test_pure_overrides_fragment_defaults(monkeypatch):
     base = dict(_FRAGMENT_BASE)
     out = servers.interp_lite_commit_env(base)
     assert out["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"] == "999"  # 逗号档结构性关闭
-    assert out["QWEN3_ASR_CLAUSE_LEN_CHARS"] == "20"  # 无标点保险丝
+    assert out["QWEN3_ASR_CLAUSE_LEN_CHARS"] == "30"  # 无标点保险丝（实弹定档 2026-10-09）
     assert out["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "2.0"  # 句档限速
     assert base == _FRAGMENT_BASE  # 入参零 mutate
 
@@ -63,7 +63,7 @@ def test_worker_specs_lite_wiring(monkeypatch):
     e = interp[0]["env"]
     assert (e["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"],
             e["QWEN3_ASR_CLAUSE_LEN_CHARS"],
-            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("999", "20", "2.0")
+            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("999", "30", "2.0")
 
 
 def test_worker_specs_old_line_untouched(monkeypatch):

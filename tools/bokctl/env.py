@@ -801,6 +801,12 @@ _FORWARD_ENV = (
     #    门=必中，有界等合成落地再 HIT（done_callback+定时兜底入队）；缺省 0.6，
     #    0=关（旧行为逐字节）；钳 [0,3]；_interp_env 透传白名单同键） ——
     "BOK_INTERP_SPEC_WAIT_S",
+    # —— B 线 rev 译员耳语（2026-10-08 用户翻案「对方说英文我要听到英文转普通话
+    #    的翻译!」）：rev（对方→我）译文也合成 TTS 进我方耳机；0=回退单向化档
+    #    （rev 纯字幕零 TTS）。2026-10-09 P0 欠账收口：读点 interpret.py 与透传
+    #    元组（env.py _agent_worker_env 内）同键，此处入表=显式设值即 bok 转发
+    #    （立法姿势归位；此前仅走元组 passthrough 同效） ——
+    "BOK_INTERP_REV_AUDIO",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
