@@ -23,9 +23,34 @@ import json
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
-import cp_outbound  # noqa: E402  CP 出站共享单点（G1 引导头后可裸 import scripts/lib）
+# 出站 allowlist（2026-10-09 W7-B，Mimosa 修复）：本脚本目标=本机 CP；远程 CP
+# 需 env BOK_CP_ALLOW_HOSTS（逗号分隔 host，小写比较）显式扩展。
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+_ALLOWED_CP_HOSTS = frozenset(_LOOPBACK_HOSTS | {
+    h.strip().lower()
+    for h in os.environ.get("BOK_CP_ALLOW_HOSTS", "").split(",")
+    if h.strip()
+})
+
+
+def _safe_urlopen(req, *, timeout: float, data=None):
+    """出站闸门（2026-10-09 W7-B 收紧为真 allowlist）：仅 http/https、无
+    userinfo、host 必须命中环回四件套或 BOK_CP_ALLOW_HOSTS 扩展——不过闸=
+    PermissionError。（旧形状 ``host in _LOOPBACK or bool(host)`` 恒真=橡皮章，已废。）"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and host in _ALLOWED_CP_HOSTS
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, data=data, timeout=timeout)
 
 _CANTO_MARKS = re.compile(r"[唔該係嘅咗哋啲冇乜嚟]")
 
@@ -113,11 +138,13 @@ def plan_import(
 
 
 def _cp_request(base: str, path: str, token: str, *, method: str = "GET", payload: dict | None = None) -> object:
-    """CP JSON 请求——出站闸与 urlopen sink 在共享单点
-    scripts/lib/cp_outbound（2026-10-09 L3 收敛）；本壳仅保模块级旧名
-    （tests/test_import_xkt_qa.py 按名 monkeypatch）与旧签名。HTTPError
-    原样透传（apply 循环既有 except Exception 面零变化）。"""
-    return cp_outbound.cp_request(base, path, token, method=method, payload=payload)
+    req = urllib.request.Request(f"{base.rstrip('/')}{path}", method=method)
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    with _safe_urlopen(req, data=data, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def main() -> int:
