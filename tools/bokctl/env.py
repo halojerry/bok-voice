@@ -866,6 +866,32 @@ _FORWARD_ENV = (
     "BOK_DOUBAO_NONSTREAM",
     "BOK_DOUBAO_DDC",
     "BOK_DOUBAO_FIRST_TOKEN_BOOST",
+    # —— W8-A2 立法补漏（2026-10-09，interp_lite 全量 env 面对照收官）——
+    # VAD 部署覆盖四键（读点 agent.py/interpret.py/interp_lite.worker 的
+    # _vad_float/_cfg_float——**env_key 走变量参数，os.environ.get(env_key)
+    # 字面量正则结构性扫不到**，此前 4 键中 3 键零登记、VAD_MIN_SILENCE_DURATION
+    # 仅 B 线透传=A 线 prod 死门）。优先序=显式 env 部署覆盖 > 设置页 vad 段 >
+    # 代码缺省；未设不注入=设置页语义零变化。缺省：15/0.15/0.35(A 线)·0.45(B 线)/0.75。
+    "VAD_MAX_BUFFERED_SPEECH",
+    "VAD_MIN_SPEECH_DURATION",
+    "VAD_MIN_SILENCE_DURATION",
+    "VAD_ACTIVATION_THRESHOLD",
+    # B 线 interp 既有键入表归位（读点 interpret.py+interp_lite.worker 字面量；
+    # _interp_env 透传白名单同键在册，此处入表=REV_AUDIO「立法姿势归位」先例——
+    # 未设不注入，默认档零变化）：
+    # 语气词标记 v2 总闸（缺省 1；0=剥标记不出声，非 2.8 档自动熄火）；
+    "BOK_INTERP_VOICE_TAGS",
+    # B 线缺源遥测/自愈三件（call-72112fd7）：看护观测行总闸（缺省 1）/
+    # 看护间隔秒（缺省 10）/官方手动订阅重发自愈（缺省 1，0=纯观测档）；
+    "BOK_INTERP_SRC_TELEMETRY",
+    "BOK_INTERP_SRC_TELEMETRY_S",
+    "BOK_INTERP_SRC_HEAL",
+    # MT 出口语言门（缺省 1：错语言轮单次强化重试；0=回「出口不校验」档）；
+    "BOK_INTERP_MT_LANGGUARD",
+    # MiniMax 合成档覆盖（缺省按线：A 线 speech-2.8-hd/B 线 speech-2.8-turbo；
+    # 读点 voice_style/livekit_plugins/_resolve_minimax_model——B 线透传已有，
+    # 入表补 A 线 worker 面 prod 死门）。
+    "MINIMAX_MODEL",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
