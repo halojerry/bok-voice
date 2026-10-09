@@ -101,6 +101,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # MT 选型矩阵探针(2026-10-08 W1):DashScope qwen-mt translation_options 的
     # 目标语代码(yue)是厂商 API 真字面量——只豁免带该枚举值的行。
     "scripts/probes/probe_mt_matrix.py": re.compile(r'"target_lang": "yue"'),
+    # 官方化裸链探针(2026-10-09 W7-P3):MiniMax language_boost 外部枚举
+    # (cantonese→"Chinese,Yue")同产品 minimax 车道政策——只豁免该映射行,
+    # 探针内部语言字段一律 cantonese。
+    "scripts/probes/probe_interp_official_chain.py": re.compile(r'"Chinese,Yue"'),
     # vendored s2s（Apache-2.0 上游镜像 @81b688b4）：Whisper/SenseVoice 的 BCP-47
     # 语言枚举（"yue" token 表/解码选项/`"yue"→"cantonese"` 上游映射）是
     # 「别人的接口」类不透明标识符——上游镜像不改写；我方接线

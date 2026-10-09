@@ -63,9 +63,29 @@
 
 **稳态滞后更新**：TTFT 地板 0.75s（本日读数）+ 首句短促 0.25s + MiniMax 首包 0.3s ≈ **1.3s 可达**，≤1.5s 目标成立；再往下无云道可换（唯一未试=晚峰时段性，18-22h 复测窗口 deepseek×2.1-lite 各一轮）。
 
+## P4 官方 AgentSession 真形（2026-10-09 终版）——骨架可用，引擎判负
+
+真房间 5 跑（探针文件 W8 以合规形状重生，原始数字=reports/w7probe/p4-session.md）：
+
+| 场景 | 数字 | 判定 |
+|---|---|---|
+| S1 单轮 EVS | mean **2338ms**（最好 1.61s，5 跑 2.05-2.71s）——拆账：SAUC 轮界 471-571 + DeepSeek TTFT 483-726 + **MiniMax 首包 725-949**（AgentSession 语音路径开销高于裸链 420-870）+ 框架调度 | 贴 2.0s 线未稳过 |
+| S2 连续语音 600ms 间隙 | **轮切分非确定**：3/5 切开、2/5 并单 final 且**第二句整吞** | 同传不可接受 |
+| S3 打断 | 5/5 PASS（lead 612-631ms 掐在途译文） | 可用 |
+| S4 追嘴档 | **零收益**（mean 2772 vs S1 2338；说话中出声 0/15 轮） | 机制见下 |
+
+S4 机制：①1.8.2 preemptive **只吃 PREFLIGHT_TRANSCRIPT**，emit INTERIM 的 DoubaoSTT 缺省零抢跑；②重标后 **DeepSeek TTFT(0.36-0.97s) ≥ interim 节奏(0.17-0.7s)=投机完成前被逐 interim 取消**（采纳 0-1/3，playout 停到 commit）。**引擎终判：interp_lite/manual 胜出**；追嘴正确路径=lite clause-commit+我方 spec-mt；P5 TTFT 735ms 反转 lite 审计表「投机收益窗小」判断。
+
+## 侦察五路（R1-R5，2026-10-09）
+
+- **R1 LiveKit**：PREFLIGHT 投机（P4 证云腿物理不成立，留架构位）、user_turn_limit、dynamic endpointing(-100~300ms)、min_words 打断门、FlushSentinel、multi-user-translator 发布形状——1.8.2 全现货，归档为引擎翻案时启用。
+- **R2 xiaozhi**：轮式架构不搬；七件可抄（两档标点集/sentence_id 票贯穿音频队列/两级打断/TTS 三档契约/MT 首可播块台架/流式术语滑动替换/竞速断句旁证）。
+- **R3 GitHub/商用**：**稳态 1.3s 已快过全部公开商用**（KUDO 4.1s/豆包同传 2-3s/Timekettle 3-5s/Forasoft 1.4-1.7s）；auto_tempo 变速背压（Palabra 背书）、sokuji 右上下文门、业界 SLO 锚（<700ms=实时感带，唯一路径=spec HIT 面）。
+- **R4 VAD**：本地 VAD 保留（CPU≈零/A 线依赖/尾 0.9s 是并段设计）；C 轻量兜底=显式 end_window=800+definite 看门狗；去本地 VAD 仅当「句头被吞」独立票翻案。
+- **R5 StreamSpeech**：「<500ms」系讹传，论文最优档 AL 1.27-1.69s 与我们同量级；无 zh/粤语权重；不接。三份礼物=spec 门控同构佐证/小闸斜率平/<1.3s 是当前技术物理面。
+
 ---
 
-**三轨门槛全部达成**（P1 ≤400ms 零碎裂 ✓ / P2 判停窗可调 ✓（须显式设置）/ P3 ≤1.5s ✓ / P5 译道定盘 DeepSeek 留任 ✓）。等 P4（含追嘴臂数字）后进阶段二拍板，确认后才动 W7-A 产品代码。
+**总判读**：三轨门槛全达成 + 引擎终判 + R1-R5 弹药清单齐——阶段二拍板面完整，W8 开工。
 
-
-W7-A 需带上探针教训：①end_window_size 必须**显式**设置（缺省 3s 不可用）；②`_fold_stutter` 官方路径直接退役（引擎缺省已折叠）；③早切/head-flush 全退役（官方攒句更优且治韵律断裂）；④轮尾 task_flush 必须发（省 2.1s）；⑤ping 保活已健在勿重复造。
+W7-A 带课五条：①end_window_size 必须显式设置（缺省 3s 不可用）；②`_fold_stutter` 官方路径退役（引擎缺省已折叠）；③早切/head-flush 全退役（官方攒句更优且治韵律断裂）；④轮尾 task_flush 必须发（省 2.1s）；⑤ping 保活已健在勿重复造。
