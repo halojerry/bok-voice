@@ -709,6 +709,10 @@ _FORWARD_ENV = (
     "MINIMAX_BIDI_PREWARM_RETRY",
     "MINIMAX_BIDI_STALL_MAX_HEALS",
     "MINIMAX_BIDI_SYNTH_WARMUP",
+    #    flush 后 recv 尾窗空闲秒数（call-dd85e5f5 截尾翻案：0.5s 会撞服务端
+    #    句间合成隙误收摊，孤儿音频落下一流纪元门禁被丢=译文截半；缺省 2.5，
+    #    钳 [0.3,10]；task_finished 事件仍即时收摊不受此窗影响） ——
+    "MINIMAX_BIDI_TAIL_IDLE_S",
     "MINIMAX_CONTINUOUS_SOUND",
     "MINIMAX_EMOTION",
     "MINIMAX_FIRST_AUDIO_TIMEOUT_S",
@@ -801,6 +805,19 @@ _FORWARD_ENV = (
     #    门=必中，有界等合成落地再 HIT（done_callback+定时兜底入队）；缺省 0.6，
     #    0=关（旧行为逐字节）；钳 [0,3]；_interp_env 透传白名单同键） ——
     "BOK_INTERP_SPEC_WAIT_S",
+    # —— B 线 rev 译员耳语（2026-10-08 用户翻案「对方说英文我要听到英文转普通话
+    #    的翻译!」）：rev（对方→我）译文也合成 TTS 进我方耳机；0=回退单向化档
+    #    （rev 纯字幕零 TTS）。2026-10-09 P0 欠账收口：读点 interpret.py 与透传
+    #    元组（env.py _agent_worker_env 内）同键，此处入表=显式设值即 bok 转发
+    #    （立法姿势归位；此前仅走元组 passthrough 同效） ——
+    "BOK_INTERP_REV_AUDIO",
+    # —— B 线薄线服务端分句总闸（2026-10-09 官方优先翻案，Ethan 拍板「让 ASR
+    #    自己切分然后给 LLM」）：1（缺省）=消费豆包 show_utterances 的 definite
+    #    分句即发 FINAL，本地三层闸（标点/保险丝/快启动）让位；0=回本地闸回退档 ——
+    "BOK_INTERP_SERVER_UTT",
+    # —— 豆包服务端分句灵敏度（end_window_size，[300,5000]ms，缺省 500=同传节奏；
+    #    仅 interp_lite 装配下发；BOK_INTERP_SERVER_UTT=0 时无效） ——
+    "BOK_DOUBAO_END_WINDOW_MS",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
