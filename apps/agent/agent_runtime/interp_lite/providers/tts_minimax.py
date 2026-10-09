@@ -93,6 +93,7 @@ def build(tts_cfg: dict, target_lang: str, session_voices=None, persona_voices=N
         pw = tts.prewarm()
         if asyncio.iscoroutine(pw):
             try:
+                # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=首段译句就地握手回退（旧线同款豁免）。
                 asyncio.get_running_loop().create_task(pw)
             except RuntimeError:
                 pw.close()
