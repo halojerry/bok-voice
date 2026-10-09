@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。
+"""云端音色官方试听缓存（2026-10-02 音色目录换血配套；2026-10-09 W④ 更名）。
 
-对 apps/web/lib/minimax-voices.ts 目录里的每只音色，调 MiniMax 官方合成
-t2a_v2 生成一句固定试听文本，落 apps/web/public/minimax-auditions/<voice_id 安全化>.mp3
+对 apps/web/lib/voice-catalog.ts 目录里的每只音色，调云端官方合成
+t2a_v2 生成一句固定试听文本，落 apps/web/public/voice-auditions/<voice_id 安全化>.mp3
 （同一次批量跑顺带当 2054 voice-not-exist 的体检——新增音色 ID 先跑本脚本）。
 
 - 试听文本按音色语言固定一句（粤/普/英/德/法/日/葡，见 LANG_TEXT；新四语与
@@ -18,10 +18,10 @@ t2a_v2 生成一句固定试听文本，落 apps/web/public/minimax-auditions/<v
 - 限频(1002)/传输抖动退避重试 ×3，2054/鉴权错立即失败不空转。
 
 用法：
-  .venv312/bin/python scripts/seed/cache_minimax_auditions.py            # 全量（幂等）
-  .venv312/bin/python scripts/seed/cache_minimax_auditions.py --lang zh  # 只跑普通话
-  .venv312/bin/python scripts/seed/cache_minimax_auditions.py --voice GentleLady
-  .venv312/bin/python scripts/seed/cache_minimax_auditions.py --dry-run  # 只列清单
+  .venv312/bin/python scripts/seed/cache_cloud_auditions.py            # 全量（幂等）
+  .venv312/bin/python scripts/seed/cache_cloud_auditions.py --lang zh  # 只跑普通话
+  .venv312/bin/python scripts/seed/cache_cloud_auditions.py --voice GentleLady
+  .venv312/bin/python scripts/seed/cache_cloud_auditions.py --dry-run  # 只列清单
 """
 from __future__ import annotations
 # --- scripts import bootstrap (G1) ---
@@ -48,11 +48,12 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CATALOG_TS = ROOT / "apps" / "web" / "lib" / "minimax-voices.ts"
-# 2026-10-07 CI 修正：物化目录=apps/web/public/minimax-auditions（真文件直发，
+CATALOG_TS = ROOT / "apps" / "web" / "lib" / "voice-catalog.ts"
+# 2026-10-07 CI 修正：物化目录=apps/web/public/voice-auditions（真文件直发，
 # web 静态导出与 CP Docker web-build stage 均自足——根目录 assets/ 副本与
-# public 符号链接方案在 stage 内悬空 ENOENT，已撤）。
-OUT_DIR = ROOT / "apps" / "web" / "public" / "minimax-auditions"
+# public 符号链接方案在 stage 内悬空 ENOENT，已撤）。2026-10-09 W④ 目录更名
+# （minimax-auditions → voice-auditions：URL 面零厂商词）。
+OUT_DIR = ROOT / "apps" / "web" / "public" / "voice-auditions"
 SETTINGS_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bok_voice.db"
 
 MODEL = "speech-2.8-hd"
@@ -83,7 +84,7 @@ LANG_TEXT = {
 
 
 # ---- SSRF 护栏（与 gen_filler_assets/mm_voice 同姿势：云端目标钉死字面量，
-# env 覆盖也要过白名单，绝不带凭据发向非 MiniMax 主机） ----
+# env 覆盖也要过白名单，绝不带凭据发向非白名单主机） ----
 def _url_ok(url: str) -> bool:
     parts = urllib.parse.urlsplit(str(url or ""))
     return (
@@ -251,8 +252,8 @@ def synth_mp3(key: str, url: str, voice: str, text: str, speed: float) -> bytes:
                 time.sleep(3 * (attempt + 1))
                 continue
             if exc.code == 401:
-                raise RuntimeError("MiniMax 鉴权失败（key 过期/无效，检查设置页 TTS API Key）") from exc
-            raise RuntimeError(f"MiniMax HTTP {exc.code}: {exc.reason}") from exc
+                raise RuntimeError("云端鉴权失败（key 过期/无效，检查设置页 TTS API Key）") from exc
+            raise RuntimeError(f"云端 HTTP {exc.code}: {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             last = f"transport {exc!r}"
             if attempt < RETRIES - 1:
@@ -265,11 +266,11 @@ def synth_mp3(key: str, url: str, voice: str, text: str, speed: float) -> bytes:
         if code == 0:
             audio_hex = (payload.get("data") or {}).get("audio") or ""
             if not audio_hex:
-                raise RuntimeError(f"MiniMax 返回空音频: {str(base_resp)[:200]}")
+                raise RuntimeError(f"云端返回空音频: {str(base_resp)[:200]}")
             try:
                 data = bytes.fromhex(audio_hex)
             except ValueError as exc:
-                raise RuntimeError(f"MiniMax 音频非 hex 编码: {str(payload.get('data'))[:120]}") from exc
+                raise RuntimeError(f"云端音频非 hex 编码: {str(payload.get('data'))[:120]}") from exc
             if len(data) < 512:
                 raise RuntimeError(f"音频过短（{len(data)} 字节），疑非有效 mp3")
             if not (data[:3] == b"ID3" or (data[0] == 0xFF and (data[1] & 0xE0) == 0xE0)):
@@ -277,17 +278,17 @@ def synth_mp3(key: str, url: str, voice: str, text: str, speed: float) -> bytes:
             return data
         last = str(base_resp)
         if code == 2054:
-            raise RuntimeError("MiniMax 2054 voice-not-exist（音色 ID 无效，勿入目录）")
+            raise RuntimeError("云端 2054 voice-not-exist（音色 ID 无效，勿入目录）")
         if code == 1002 and attempt < RETRIES - 1:  # RPM 限频
             time.sleep(10 * (attempt + 1))
             continue
         break
-    raise RuntimeError(f"MiniMax base_resp={last}")
+    raise RuntimeError(f"云端 base_resp={last}")
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="MiniMax 官方试听缓存（目录全量 → apps/web/public/minimax-auditions/*.mp3）"
+        description="云端音色官方试听缓存（目录全量 → apps/web/public/voice-auditions/*.mp3）"
     )
     ap.add_argument("--voice", default="", help="只跑单只音色（完整 ID，或唯一前缀/子串）")
     ap.add_argument("--lang", default="", choices=list(LANGS), help="只跑某语种")

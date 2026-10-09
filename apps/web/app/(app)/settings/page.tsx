@@ -171,7 +171,8 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
       // 否则粤语音色会被用来念普通话文字 → 广式普通话），不中按字段键回落
       // （本地 Qwen3 多语音色 serena/vivian…走 speaker_cantonese/speaker_en 链）。
       const lang = resolvePreviewLang(voice, { fieldKey });
-      const blob = await previewVoice({ provider, text: previewSampleText(lang), voice, language: lang, sample_rate: 24000 });
+      // W④：provider 出参剥离——CP 服务端按 voice_id 前缀解析引擎。
+      const blob = await previewVoice({ text: previewSampleText(lang), voice, language: lang, sample_rate: 24000 });
       if (url) URL.revokeObjectURL(url);
       const u = URL.createObjectURL(blob);
       setUrl(u);
@@ -645,7 +646,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
       body.append("file", refFile);
       body.append("label", label || `我的声音-${new Date().toLocaleDateString()}`);
       body.append("sample_lang", "zh");
-      const created = await api.registerMinimaxVoice(body);
+      const created = await api.registerCloudVoice(body);
       onChange([...clones, {
         voice_id: String(created.voice_id ?? ""),
         label: String(created.label ?? label ?? ""),
@@ -666,7 +667,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
     setErr("");
     setBusy(true);
     try {
-      await api.deleteMinimaxVoice(voiceId);
+      await api.deleteCloudVoice(voiceId);
       onChange(clones.filter((c) => c.voice_id !== voiceId));
     } catch (e) {
       setErr(friendlyErrorText(String(e)));
@@ -685,7 +686,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
           : lang === "cantonese"
             ? "你好，我係用我把聲克隆出嚟嘅音色，唔該聽下。"
             : "你好，这是用我的声音克隆的音色。";
-      const blob = await previewVoice({ provider: "minimax", text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
+      const blob = await previewVoice({ text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
       await playAudioBlob(blob);
     } catch (e) {
       setErr(friendlyErrorText(String(e)));
@@ -762,7 +763,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
     if (!field.key.startsWith("speaker_")) return field;
     const cloneOpts = buildVoiceSelectOptions({
       slotLang: field.key === "speaker_cantonese" ? "cantonese" : field.key === "speaker_en" ? "en" : "zh",
-      minimaxClones: clones,
+      cloudClones: clones,
     });
     return cloneOpts.length > 0 ? { ...field, options: [...(field.options ?? []), ...cloneOpts] } : field;
   };

@@ -3,7 +3,7 @@
  * node --test 单文件转译直载，见 test/voice-options.test.mjs）。
  *
  * 语义权威 = docs/superpowers/plans/2026-09-19-ai-studio.md §8 T2 探针结论：
- * - 音色目录唯一数据源 = lib/minimax-voices.ts；设置页/personas/同传页各自的下拉
+ * - 音色目录唯一数据源 = lib/voice-catalog.ts；设置页/personas/同传页各自的下拉
  *   在这里统一装配（克隆清单按页注入），消灭四份手写合并/过滤/标签拷贝；
  * - 装配序：firstOption → 匹配 slotLang 的克隆置顶 → 目录/预置 → 其余克隆
  *   （Set 去重贯穿全序；克隆全语言可选，不吃 slotLang 过滤）；
@@ -45,12 +45,12 @@ const LANG_LABEL: Record<string, string> = {
 const DEFAULT_CLONE_PREFIX = "克隆 · ";
 
 export interface VoiceSelectSpec {
-  /** 静态目录（MINIMAX_VOICE_ENTRIES）。唯一吃 slotLang 过滤的来源。 */
+  /** 静态目录（VOICE_CATALOG_ENTRIES）。唯一吃 slotLang 过滤的来源。 */
   catalog?: VoiceCatalogEntry[];
   /** 当前槽位语言：过滤目录（未知回落全量）+ 匹配克隆置顶。 */
   slotLang?: string;
-  /** MiniMax 云端克隆（settings parseClones / 同传页 cloneVoices）。全语言可选。 */
-  minimaxClones?: Array<{ voice_id?: unknown; label?: unknown; sample_lang?: unknown }>;
+  /** 云端克隆（settings parseClones / 同传页 cloneVoices）。全语言可选。 */
+  cloudClones?: Array<{ voice_id?: unknown; label?: unknown; sample_lang?: unknown }>;
   /** 本地克隆音色（personas listTtsVoices / registerTtsVoice）。全语言可选。 */
   localClones?: Array<{ id?: unknown; lang?: unknown }>;
   /** 本地预置 speaker（personas listTtsSpeakers，多语模型，不过滤）。 */
@@ -107,7 +107,7 @@ export function buildVoiceSelectOptions(spec: VoiceSelectSpec = {}): VoiceOption
   const knownLang = KNOWN_LANGS.includes(lang) ? lang : "";
 
   const clones: CloneItem[] = [
-    ...(spec.minimaxClones ?? []).map((c) => ({
+    ...(spec.cloudClones ?? []).map((c) => ({
       id: String(c?.voice_id ?? ""),
       label: String(c?.label ?? ""),
       lang: String(c?.sample_lang ?? "").toLowerCase(),
@@ -144,8 +144,8 @@ export interface ResolvePreviewLangSpec {
 /**
  * 试听用哪种语言/文本：按音色 ID 正则判定，而不是按字段标签——
  * 粤语音色（Cantonese_*）即使被设成「整场同声」，试听也该用粤语示例文本，
- * 否则 MiniMax 会用粤语音色念普通话文字 → 广式普通话。
- * 正则不中再按字段键回落（settings 本地 Qwen 音色链）→ fallback → 普通话。
+ * 否则合成会用粤语音色念普通话文字 → 式样普通话。
+ * 正则不中再按字段键回落（settings 本地音色链）→ fallback → 普通话。
  * 返回 PreviewLang（七语）。
  *
  * moss_audio_ 克隆按具体 ID 判：日语组两枚（c373f8c3/10297aea，2026-10-06 W2）→ ja；

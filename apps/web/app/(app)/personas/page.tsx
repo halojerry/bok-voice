@@ -6,7 +6,7 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useToast } from "@/components/toast";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
-import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
+import { VOICE_CATALOG_ENTRIES } from "@/lib/voice-catalog";
 import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
 import { parseVoiceMap, primaryVoiceFor } from "@/lib/voice-map";
 import { previewVoice as synthesizePreview } from "@/lib/preview";
@@ -91,10 +91,10 @@ export default function PersonasPage() {
   const recRef = useRef<RecorderHandle | null>(null);
   const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // 人设选的是云端引擎（MiniMax/火山）：音色区切换到云端音色选择，隐藏本地克隆。
-  const engineIsCloud = ["minimax", "minimax_streaming", "volcano_streaming"].includes(
-    String(form.tts_provider ?? "").trim().toLowerCase(),
-  );
+  // 引擎三态抽象（W④ 2026-10-09）：API 对非 root 只出 cloud/local/""——
+  // 云端档切云端音色选择，隐藏本地克隆；具体厂商由平台侧决定，客户面零厂商词。
+  const engineTier = String(form.tts_provider ?? "").trim().toLowerCase();
+  const engineIsCloud = engineTier === "cloud";
 
   // 云端音色下拉只列与人设语言匹配的音色（英文人设只见英文音色，唔会乱）；
   // 未知/旧語言（如 vi）唔清空照列全部；跨語言已選值保留「自定义」項、唔静默改。
@@ -102,7 +102,7 @@ export default function PersonasPage() {
   const cloudVoiceOptions = useMemo(
     () =>
       buildVoiceSelectOptions({
-        catalog: MINIMAX_VOICE_ENTRIES,
+        catalog: VOICE_CATALOG_ENTRIES,
         slotLang: String(form.language ?? "").toLowerCase(),
       }),
     [form.language],
@@ -348,7 +348,6 @@ export default function PersonasPage() {
         // 避免「粤语音色念普通话文字 → 广式普通话」。
         const lang = (cloudPreviewLang || resolvePreviewLang(cloudVoice)) as "zh" | "cantonese" | "en";
         blob = await synthesizePreview({
-          provider: String(form.tts_provider ?? ""),
           text: previewSampleText(lang, form.name),
           voice: cloudVoice,
           language: lang,
@@ -457,22 +456,21 @@ export default function PersonasPage() {
           <div className="rounded-lg border border-(--card-border) p-3">
             <span className="label mb-1 block">语音引擎</span>
             <p className="mb-2 text-[11px] muted">
-              决定该人设通话用哪套 TTS：本地 Qwen3（可用下方克隆音色）或云端 MiniMax
-              （可在下方为这个人设选一个固定音色，整场同声）。留空 = 跟随全局设置。
+              决定该人设通话用哪套语音：本地引擎（可用下方克隆音色）或云端引擎
+              （可在下方为这个人设选一个固定音色，整场同声）。留空 = 跟随平台配置。
             </p>
             <select
               className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.tts_provider ?? ""}
               onChange={(e) => setForm({ ...form, tts_provider: e.target.value })}
             >
-              <option value="">跟随全局设置</option>
-              <option value="qwen3_tts">本地 Qwen3-TTS（可用克隆音色）</option>
-              <option value="minimax">MiniMax（云端 · 粤语地道/情感自然）</option>
-              <option value="volcano_streaming">火山引擎（云端）</option>
+              <option value="">跟随平台配置</option>
+              <option value="local">本地引擎（可用克隆音色）</option>
+              <option value="cloud">云端引擎（多语地道/情感自然）</option>
             </select>
-            {(form.tts_provider === "minimax" || form.tts_provider === "volcano_streaming") && (
+            {engineIsCloud && (
               <p className="mt-2 text-[11px] text-(--live-ink)">
-                云端引擎：人设绑定一个音色后，整场通话（粤/普/英）都用它发声。火山引擎目前仍用全局配置音色。
+                云端引擎：人设绑定一个音色后，整场通话（粤/普/英）都用它发声。
               </p>
             )}
           </div>
@@ -489,7 +487,7 @@ export default function PersonasPage() {
                   value={cloudVoice}
                   onChange={(e) => { setCloudVoice(e.target.value); setCloudPreviewLang(""); setPreviewUrl(""); }}
                 >
-                  <option value="">选择 MiniMax 音色…</option>
+                  <option value="">选择云端音色…</option>
                   {cloudVoiceOptions.map((opt) => (
                     <option key={opt.value} value={opt.value}>
                       {opt.label}

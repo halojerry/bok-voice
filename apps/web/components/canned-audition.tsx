@@ -67,7 +67,7 @@ export default function CannedAuditionCard() {
       const blob = await p;
       if (!blob) {
         const reason = typeof why === "function" ? why() : (why ?? "");
-        setNote(`合成失败${reason ? `：${reason}` : "：请确认已在「TTS 语音合成」配置 MiniMax API Key。"}`);
+        setNote(`合成失败${reason ? `：${reason}` : "：语音服务未配置，请联系平台管理员。"}`);
         return;
       }
       await play(URL.createObjectURL(blob), tag);
@@ -108,7 +108,6 @@ export default function CannedAuditionCard() {
       let why = "";
       void playBlob(
         previewVoice({
-          provider: "minimax",
           text: String(e.answer_text ?? ""),
           voice: String(e.voice_id ?? ""),
           language: lang,

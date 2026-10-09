@@ -73,6 +73,19 @@ jobs:
           npm ci
           npx tsc --noEmit
           npm run build
+      - name: Customer artifact vendor-literal gate (W④ 2026-10-09)
+        # SaaS 姿态：客户产物零厂商字面量（minimax/deepseek/doubao/豆包/火山/
+        # volcano/bytedance/qwen）——命中即构建失败。与源码面
+        # tests/test_vendor_literal_hygiene.py 双保险（产物级 grep 连 minify 后
+        # 的字符串/属性名都扫）。
+        working-directory: apps/web
+        run: |
+          if grep -rilE "minimax|deepseek|doubao|豆包|火山|volcano|bytedance|qwen" out/ ; then
+            echo "::error::客户产物含厂商字面量（见上列文件）"; exit 1
+          fi
+      - name: Platform console build (W④ 双构建对照档)
+        working-directory: apps/web
+        run: npm run build:platform
       - name: Web unit tests (node --test)
         working-directory: apps/web
         run: npm test

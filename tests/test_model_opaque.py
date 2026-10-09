@@ -100,10 +100,12 @@ def test_platform_only_surfaces(monkeypatch):
         code_root = client.get(path, headers=_h(rt)).status_code
         assert code_root in (200, 404), (path, code_root)  # root 可达（404=资源缺）
     # 克隆 CRUD 平台专属（GET 清单仍 interpret|settings-any）；POST 须带合法
-    # multipart 让闸先于 422 生效。
-    assert client.post("/api/tts/minimax-voices", headers=_h(at),
+    # multipart 让闸先于 422 生效。W④：端点路径中性化（cloud-voices）。
+    assert client.post("/api/tts/cloud-voices", headers=_h(at),
                        files={"file": ("a.wav", b"RIFF")}, data={"label": "t"}).status_code == 403
-    assert client.delete("/api/tts/minimax-voices/x", headers=_h(at)).status_code == 403
+    assert client.delete("/api/tts/cloud-voices/x", headers=_h(at)).status_code == 403
+    # 旧厂商名路径不复存在（404=路由本身没了，抓包面零厂商词）
+    assert client.get("/api/tts/minimax-voices", headers=_h(at)).status_code == 404
 
 
 def test_settings_masked_view_gone_for_admin(monkeypatch):
@@ -182,6 +184,37 @@ def test_calls_session_report_sanitized(monkeypatch):
     # root 视角：原文保留
     body_root = client.get(f"/api/calls/{row['id']}", headers=_h(rt)).json()
     assert body_root["session_report"]["usage"][0]["provider"] == "minimax"
+
+
+def test_persona_engine_three_tier_opaque(monkeypatch):
+    """W④：persona tts_provider 出仓三态（cloud/local/""），真值仅 root 可见。"""
+    client, repo = _client_and_repo(monkeypatch)
+    at = _login(client, "op-admin")
+    rt = _login(client, "op-root")
+    # 平台（root）设真值的 persona
+    created = client.post("/api/personas", headers=_h(rt), json={
+        "account_id": "acc-a", "name": "云引擎人设", "language": "zh",
+        "tts_provider": "minimax",
+    }).json()
+    pid = created["id"]
+    assert created["tts_provider"] == "minimax"  # root 视角=真值
+
+    rows = client.get("/api/personas", params={"account_id": "acc-a"}, headers=_h(at)).json()
+    row = next(r for r in rows if r["id"] == pid)
+    assert row["tts_provider"] == "cloud"
+    _assert_no_vendor_literals(rows)
+
+    detail = client.get(f"/api/personas/{pid}", headers=_h(at)).json()
+    assert detail["tts_provider"] == "cloud"
+
+    # admin PUT 真值=越权尝试 → 保留现值；三态 cloud=合法（映射到平台云端档）
+    put = client.put(f"/api/personas/{pid}", headers=_h(at), json={
+        "account_id": "acc-a", "name": "云引擎人设", "language": "zh",
+        "tts_provider": "minimax_streaming",
+    }).json()
+    assert put["tts_provider"] == "cloud"  # 出仓口径恒三态
+    raw = repo.get_persona(pid)
+    assert raw["tts_provider"] == "minimax"  # 真值未被越权改写（保留现值）
 
 
 def test_audit_redaction(monkeypatch):

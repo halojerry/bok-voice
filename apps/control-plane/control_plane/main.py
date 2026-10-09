@@ -1404,7 +1404,7 @@ def _save_minimax_clones(clones: list[dict]) -> None:
     _repo().save_settings(settings)
 
 
-@app.get("/api/tts/minimax-voices")
+@app.get("/api/tts/cloud-voices")
 async def tts_minimax_voices_list(request: Request) -> list[dict]:
     # 克隆清单是本地面板数据（settings blob）：设置页（settings）与同传页
     # （interpret）共用读面——同传页 voice 下拉/克隆音色列表此前静默空列表
@@ -1413,7 +1413,7 @@ async def tts_minimax_voices_list(request: Request) -> list[dict]:
     return _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
 
 
-@app.post("/api/tts/minimax-voices")
+@app.post("/api/tts/cloud-voices")
 async def tts_minimax_voice_clone(
     request: Request,
     file: UploadFile = File(...),
@@ -1493,7 +1493,7 @@ async def tts_minimax_voice_clone(
             "activated": False, "note": "未激活：7 天内首次合成（试听/会话使用）即激活并计费 ¥9.9/音色"}
 
 
-@app.delete("/api/tts/minimax-voices/{voice_id}")
+@app.delete("/api/tts/cloud-voices/{voice_id}")
 async def tts_minimax_voice_delete(voice_id: str, request: Request) -> dict:
     _require_platform(request)  # W③：克隆清单管理=平台操作
     api_key = _minimax_api_key()
@@ -5828,12 +5828,58 @@ def report_qa_pairs(
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 
+# ---- W④（2026-10-09）persona 引擎三态抽象：客户面零厂商词 ----
+# DB 存真值（agent 消费）；API 边界按角色映射：root/机器/auth-off 直通，
+# admin/user 出仓/入参只见 ""（跟随）/cloud/local。客户 PUT 的 cloud 由
+# 设置里的云端 provider 解析（平台定哪个厂商就是哪个）。
+_PERSONA_TTS_OPAQUE = {
+    "": "",
+    "minimax": "cloud",
+    "minimax_streaming": "cloud",
+    "volcano_streaming": "cloud",
+    "qwen3_tts": "local",
+    "fake": "",
+}
+
+
+def _persona_tts_opaque(value: str) -> str:
+    return _PERSONA_TTS_OPAQUE.get(str(value or ""), "cloud" if value else "")
+
+
+def _sanitize_persona_view(row: dict, request: Request) -> dict:
+    """非 root 视角：tts_provider 真值 → 三态抽象（cloud/local/""）。"""
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return row
+    out = dict(row)
+    out["tts_provider"] = _persona_tts_opaque(str(row.get("tts_provider") or ""))
+    return out
+
+
+def _persona_tts_from_opaque(incoming: str, existing: str, request: Request) -> str:
+    """非 root 入参翻译：cloud→平台云端真值、local→本地、""→保留现值；
+    真值入参（平台面兼容）仅 root 直通。"""
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return incoming
+    v = str(incoming or "")
+    if v == "":
+        return str(existing or "")
+    if v == "local":
+        return "qwen3_tts"
+    if v == "cloud":
+        tts = (_repo().get_settings() or {}).get("tts") or {}
+        cur = str(tts.get("provider") or "")
+        return cur if cur in ("minimax", "minimax_streaming", "volcano_streaming") else "minimax"
+    return str(existing or "")  # 真值入参=非平台面越权尝试 → 保留现值
+
+
 @app.get("/api/personas")
 def list_personas(request: Request, account_id: str = "acc-001") -> list[dict]:
     # 人设=管理面（页面矩阵：话务员不可见）。
     auto_gate_management(request)
     account_id = scoped_account(request, account_id)
-    return _repo().list_personas(account_id)
+    return [_sanitize_persona_view(r, request) for r in _repo().list_personas(account_id)]
 
 
 @app.get("/api/personas/{persona_id}")
@@ -5842,7 +5888,7 @@ def get_persona(persona_id: str, request: Request) -> dict:
     persona = deny_cross_account(request, _repo().get_persona(persona_id))
     if not persona:
         raise HTTPException(404, "persona not found")
-    return persona
+    return _sanitize_persona_view(persona, request)
 
 
 @app.post("/api/personas")
@@ -5859,6 +5905,12 @@ def create_persona(req: PersonaRequest, request: Request) -> dict:
         account_id = identity.account_id or account_id
     req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
+    # W④：非 root 建号的 tts_provider 入参走三态翻译（""=缺省跟随）。
+    if identity is not None and identity.role != "root" and str(getattr(req, "tts_provider", "") or ""):
+        persona = _repo().update_persona(
+            persona["id"],
+            {"tts_provider": _persona_tts_from_opaque(str(req.tts_provider), "", request)},
+        ) or persona
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
     # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
     # 装饰浅拷贝——内存 repo 返回活引用,直接写会把一次性状态键落进存储。
@@ -5866,7 +5918,7 @@ def create_persona(req: PersonaRequest, request: Request) -> dict:
     out["tts_pregen"] = persona_pregen_status(
         out, base_url=str(request.base_url).rstrip("/")
     )
-    return out
+    return _sanitize_persona_view(out, request)
 
 
 @app.put("/api/personas/{persona_id}")
@@ -5887,6 +5939,12 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     if existing and identity is not None and identity.role != "root":
         # 冻结归属：非 root 不得经 UpdatePersonaRequest.account_id 挪账号。
         payload["account_id"] = str(existing.get("account_id") or "")
+    # W④：非 root 的 tts_provider 入参走三态翻译（cloud/local/""；真值入参保留现值）。
+    payload["tts_provider"] = _persona_tts_from_opaque(
+        str(payload.get("tts_provider") or ""),
+        str((existing or {}).get("tts_provider") or ""),
+        request,
+    )
     persona = _repo().update_persona(persona_id, payload)
     if not persona:
         raise HTTPException(404, "persona not found")
@@ -5895,7 +5953,7 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     out["tts_pregen"] = persona_pregen_status(
         out, base_url=str(request.base_url).rstrip("/"), existing=existing
     )
-    return out
+    return _sanitize_persona_view(out, request)
 
 
 @app.put("/api/personas")
@@ -5910,13 +5968,19 @@ def upsert_persona(req: PersonaRequest, request: Request) -> dict:
         account_id = identity.account_id or account_id
     req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
+    # W④：非 root 入参三态翻译（同 POST /api/personas）。
+    if identity is not None and identity.role != "root" and str(getattr(req, "tts_provider", "") or ""):
+        persona = _repo().update_persona(
+            persona["id"],
+            {"tts_provider": _persona_tts_from_opaque(str(req.tts_provider), "", request)},
+        ) or persona
     _audit("persona.upsert", subject_type="persona", subject_id=persona.get("id", ""),
            account_id=req.account_id, detail={"name": req.name})
     out = dict(persona)
     out["tts_pregen"] = persona_pregen_status(
         out, base_url=str(request.base_url).rstrip("/")
     )
-    return out
+    return _sanitize_persona_view(out, request)
 
 
 @app.delete("/api/personas/{persona_id}")

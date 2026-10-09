@@ -748,7 +748,6 @@ export default function QaPage() {
       try {
         await playBlob(
           await previewVoice({
-            provider: "minimax",
             text: String(row.answer_text ?? ""),
             voice: String(row.voice_id ?? ""),
             language: String(row.lang ?? "zh"),
