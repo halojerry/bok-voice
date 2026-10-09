@@ -258,7 +258,7 @@ def filter_substring_swallowed(candidates: list[dict]) -> tuple[list[dict], list
     前 40 词、总长 ≤200 字符）。跨语言不比较（热词表按 lang 分表下发，zh 的
     「拼多多」与 cantonese 的「拼多多」互不稀释）。
 
-    空输入=([], []) 零漂移；非 dict 行原样保留（防御，不炸）。保序返回。
+    空输入=([], []) 零漂移；非 dict 行过滤掉（防御，不炸）。保序返回。
     """
     rows = [c for c in (candidates or []) if isinstance(c, dict)]
     norms = [(_norm_compare(r.get("word")), str(r.get("lang") or "")) for r in rows]

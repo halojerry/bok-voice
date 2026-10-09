@@ -104,9 +104,11 @@ def _sink_ip_boundary_check(url: str, extra_hosts: "tuple[str, ...] | frozenset[
     parts = urllib.parse.urlsplit(str(url or ""))
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise PermissionError(_DENIED_MSG.format(url=url))
-    allowed_hosts = set(extra_hosts or ())
+    allowed_hosts = {h.lower() for h in set(extra_hosts or ())}
     allowed_hosts.update(
-        h for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "").replace(",", " ").split() if h
+        h.lower()
+        for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "").replace(",", " ").split()
+        if h
     )
     if parts.hostname in allowed_hosts:
         return

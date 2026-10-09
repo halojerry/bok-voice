@@ -109,9 +109,9 @@ def cp_request(method: str, path: str, *, params=None, json=None, data=None,
     _parts = urlsplit(_url)
     if _parts.scheme not in ("http", "https") or not _parts.hostname:
         raise PermissionError(f"出站 URL 未过护栏（拒发）: {_url}")
-    _allowed = set(h for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "")
-                   .replace(",", " ").split() if h)
-    if _parts.hostname not in _allowed:
+    _allowed = {h.lower() for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "")
+                .replace(",", " ").split() if h}
+    if _parts.hostname.lower() not in _allowed:
         _port = _parts.port or (443 if _parts.scheme == "https" else 80)
         try:
             _infos = socket.getaddrinfo(_parts.hostname, _port, proto=socket.IPPROTO_TCP)

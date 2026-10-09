@@ -134,8 +134,10 @@ class BokMarkdownSource:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"} if self.token else {"Content-Type": "application/json"}
 
     def _outbound_url(self, endpoint: str) -> str:
-        """拼基址并过出站闸（发送期复验：形状+字面量，不做 DNS——保存期已全验，
-        避免请求路径被解析阻塞；对标 CP 短信 webhook 双重校验先例）。"""
+        """拼基址并过出站闸。守卫层=形状+字面量复验（resolve=False，不做 DNS——
+        保存期构造器已全验）；紧随的 sink 就地三验含 getaddrinfo 地址判定
+        （2026-10-09 给污点引擎可见的校验形状），DNS 失败同样 fail-closed 拒。
+        对标 CP 短信 webhook 双重校验先例。"""
         return _guard_outbound_url(f"{self.base_url}{endpoint}", resolve=False)
 
     def read(self, path: str) -> str:
