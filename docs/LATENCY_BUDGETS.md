@@ -120,10 +120,65 @@ probe_latency_soak 基线）。
 onset）与 `probe_interp_fluency`（天窗/段时长/提交单元），不用本表预算判死活。
 perceived 含整段播完时长，与「单段 ≥4s」目标内部矛盾（W6 §5 口径修正），只报告不设门。
 
+## 5a. 业界级联 SLO 对照（2026-10-09 W8-A2 锚，R3 调研定标）
+
+业界语音级联管线（cascaded pipeline）公开 SLO 口径，作为 B 线逐腿预算的外部参照系；
+**本表是对照镜不是新预算线**——B 线预算仍按 §5 分档执行：
+
+| 腿 | 业界 SLO | B 线现状（2026-10-09 实测口径） | 对账 |
+|---|---|---|---|
+| MT TTFT（翻译腿首 token） | **<250ms** | 本地 MT2（:1236）p50 ~260ms ✅ 达标；DeepSeek 云档（现役 mt 车道）TTFT p50 **735ms**（probe_mt_lane_ttft 三臂 24 请求/臂，2026-10-09） | 云档超标 ~3 倍——换道不涨速定案=DeepSeek 留任（粤译最地道+124tok/s），达标靠 spec HIT 把 MT 腿藏进说话期，不靠压 TTFT |
+| TTS TTFB（合成首包） | **<300ms** | MiniMax bidi 420-870ms（头段催产 flush 后服务端地板 210-343ms+传输/前导修剪） | 剩余大头之一；进一步压=换供应商/边缘部署级，非当前刀位 |
+| e2e（说完→出声） | **<2.5s** | 延迟探针预算 §5 分档 3500/4200ms；本地 MT2 档实测 avg ~2.2s ✅ | 预算线松于业界（方言对+本地硬件口径）；子句快路径感知 1.2-1.4s 已进实时带 |
+| 实时感带 | **<700ms** | 常规路径结构性够不着（ASR 提交+MT+TTS 三腿物理和） | **唯一路径=spec HIT**（interim 投机翻译 prewarm-and-confirm：final 到=held PCM 零合成直播，mt_ms=0）——spec 命中即 «final 即声»，是全线唯一进 700ms 带的通道 |
+
+结论（锚定用）：逐腿追 SLO 不是路径——MT/TTS 腿都在物理地板附近；**结构性杠杆只有
+两个**：①提交闸提前（子句/意群档，已做）②spec 命中率（含 probe_mt_firstplay 量
+「首可播块」分布，见 §6）。台架测 MT 首可播块用 `scripts/probes/probe_mt_firstplay.py`。
+
+首跑读数（2026-10-09，DeepSeek 云档 6 句×两向×2 轮，reports/w8a 本地存档）：**MT 首可播块
+p50 866ms / p90 1037ms**（逐句 p50 487-1009ms）——远超 MT TTFT<250ms SLO（首个
+delta≠可合成块，凑齐分句才是 TTS 解锁点）；spec 仿真开火面=带逗号子句句（2400-4399ms
+自源语起算），无逗号短句结构性零开火（只走 final 路）。**印证 <700ms 带唯一路径=spec
+HIT**：spec 路出声（开火+首可播）早于源语结束的长句，final 到=held PCM 直播即声。
+
+## 5b. 晚峰备胎道（seed-2.1-lite，2026-10-09 P5 定观察位）
+
+**定位**：DeepSeek 留任主道（粤译最地道）；火山方舟 `doubao-seed-2-1-lite-260915`
+为**晚峰（18:00-22:00）备胎观察位**——TTFT 1533/1981ms（probe_mt_lane_ttft 三臂）、
+粤译质量追平 DeepSeek；晚峰 DeepSeek 若劣化（TTFT p90 >2s 或超时率上升）按下面
+流程换道。方舟裸名 404（Ark 只认带日期版本 ID），`ARK_MODEL` 缺省已钉全名。
+
+**预置落库步骤（CP API，代码零改；密钥 env 注入勿入码）**：
+
+```bash
+# ① mt 车道改指方舟（api_key 传 env 占位；CP 掩码面，明文只在设置库）
+curl -X PUT "$CP/api/model-routing" -H "Authorization: Bearer $BOK_CP_TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+    "lanes": {"mt": {"provider": "openai",
+                     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                     "model": "doubao-seed-2-1-lite-260915",
+                     "api_key": "$ARK_API_KEY"}}}'   # ← 由 curl env 展开注入，绝不写入本文件
+# ② 快照存名（不含密钥；套档不清密钥）
+curl -X POST "$CP/api/model-routing/presets" -H "Authorization: Bearer $BOK_CP_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name": "mt-evening-ark"}'
+```
+
+**晚峰双道终判流程（18:00-22:00 窗）**：
+1. 主道（DeepSeek）与备胎（mt-evening-ark）各跑一轮 `probe_mt_lane_ttft --only deepseek,ark`
+   + `probe_interpret_latency`（`BOK_PROBE_LAG_BUDGET_MS=4200` 云档）；
+2. 终判判据：TTFT p50/p90 + e2e 延迟探针 PASS + 粤译眼测（唔标志记数）三对账；
+3. DeepSeek 恶化 → `POST /api/model-routing/presets/mt-evening-ark/apply` 换道
+   （下一通生效零重启）；峰后 `POST /api/model-routing/presets/cloud-deepseek/apply` 回切；
+4. 结论记回本节（数字+日期），连败两窗则把备胎转正评估提级。
+
 ## 6. 测量工具
 
 - `scripts/probes/probe_latency_soak.py`：多轮多样话术延迟测试台（逐轮墙钟首声 + eou/llm/tts
   三段 + 拆轮/打断/哑轮异常旗 + p50/p95 汇总 + JSON 报告）。改延迟相关代码后必跑。
+- `scripts/probes/probe_mt_firstplay.py`：DeepSeek 流式 MT「首可播块」台架（2026-10-09
+  W8-A2）——首个可合成分句（句末标点或 ≥12 字逗号界）墙钟分布 × 6 句题集，对照列=
+  spec 稳定判据仿真触发时刻；§5a 的 MT 腿与 <700ms 带 spec 可行性测量仪器。
 - `scripts/bench/measure_latency.py`：直打三 sidecar 的分段延迟（无 LiveKit）。
 - `scripts/probes/probe_filler_timing.py`：垫话/首声预算（首声 <2.5s 判据）。
 - `scripts/ops/llm_cache_report.py <worker.log>`：KV 命中与 TTFT 分布。

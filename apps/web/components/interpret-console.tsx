@@ -26,11 +26,15 @@
  * - 「听对方听到的翻译」开关(2026-10-07 W4b,默认关):开=把 fwd 译文轨
  *   (trans-<对方语言>,对方耳机里那份)也接进我方扬声器,与我方听到的原声叠加;
  *   订阅级控制——关=对该轨 setSubscribed(false) 连帧都不拉(与旧行为等价),
- *   开=订阅后经 me 路 AudioContext 放音,届时半双工 watcher 自动暂让我方麦
+ *   开=订阅后经 me 路 AudioContext 放音,届时同机闭麦 watcher 自动暂让我方麦
  *   (与对方侧 othHeld 同款防串译闸)。agent 侧 _apply_track_permissions 已放开
  *   me- 对该轨的订阅权(订阅≠自动播,deliver 端收听不受影响)。
- * - 自动半双工(默认开):我方译文出声时自动暂让对方麦克风——共享扬声器外放,
- *   对方麦会拾到译文原声,不暂让会把译文再翻译一遍(串译死循环)。
+ * - 自动半双工(W8-A3 2026-10-09 退位,缺省关=真全双工):Ethan 拍板拓扑=远程
+ *   双方各戴耳机各自设备,两线天然独立无串译环,暂让闸在该拓扑下是纯伤害
+ *   (对方说话被白丢)。meHeld/othHeld 暂让+声源仲裁整块机器保留但只服务
+ *   「同机一体演示档」(两人同机各一支麦+共享扬声器外放)——URL query
+ *   ?halfDuplex=1 临时打开(lib/interp-duplex.ts 单源),外放同桌必须开,
+ *   否则译文被对向麦拾回再译=串译死循环。
  * - 离开 = 结束我方连接 + hangup 整个 call(两个 interpreter 与对象端一起被踢)。
  *
  * 设备角色不变量(2026-09-12 双麦同源事故收口,判定在 lib/device-roles.ts):4 个角色槽
@@ -67,6 +71,7 @@ import {
   scriptMismatchWarning,
   type RoleSlot,
 } from "@/lib/device-roles";
+import { halfDuplexInitial } from "@/lib/interp-duplex";
 import {
   listAudioDevicesOf,
   requestMicPermission,
@@ -401,11 +406,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     }
   }, [roleIssues]);
 
-  // ---- 自动半双工(防串译,默认开) ----
+  // ---- 同机闭麦闸(W8-A3 退位,缺省关=真全双工) ----
+  // 拓扑定案(2026-10-09, Ethan 拍板):远程双方各戴耳机各自设备——两线天然独立
+  // 无串译环,暂让闸纯伤害(对方说话被白丢)。缺省互不闭麦;机器保留只服务
+  // 「同机一体演示档」(同机各一支麦+共享扬声器外放),经 ?halfDuplex=1 打开
+  // (lib/interp-duplex.ts 单源:HALF_DUPLEX_DEFAULT 编译期常量+query 覆盖)。
   // meHeld   = 对方译文(trans-<我方语言>,rev)出声中 → 我方麦暂让;
   // othHeld  = 我方译文(trans-<对方语言>,fwd)经共享扬声器外放中 → 对方麦暂让
   //            (对方麦拾到英文译文再翻一遍就是串译死循环)。
-  const [halfDuplex, setHalfDuplex] = useState(true);
+  const [halfDuplex, setHalfDuplex] = useState(() =>
+    halfDuplexInitial(typeof window === "undefined" ? "" : window.location.search),
+  );
   const [meHeld, setMeHeld] = useState(false);
   const [othHeld, setOthHeld] = useState(false);
   // 声源仲裁让麦(2026-09-12 对方耳机听到自己话被译一遍的根因=同桌物理串音:
@@ -1168,7 +1179,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, meConnected, otherConnected, canDual]);
 
-  // ---- 自动半双工:监听两个房间各自收到的 trans-* 译文轨出声 ----
+  // ---- 同机闭麦 watcher(演示档):监听两个房间各自收到的 trans-* 译文轨出声 ----
+  // 全双工缺省档(halfDuplex=关)直接熄火并清暂让;?halfDuplex=1 演示档才挂表。
   useEffect(() => {
     if (!halfDuplex) {
       setMeHeld(false);
@@ -1921,7 +1933,7 @@ function ConsoleLive(p: LiveProps) {
               <Dot on={liveBusy} />
               {liveBusy ? "出译中" : "待命"}
             </Stat>
-            <Stat label="半双工">{p.halfDuplex ? (holdBusy ? "暂让中" : "值守") : "关闭"}</Stat>
+            <Stat label="同机闭麦">{p.halfDuplex ? (holdBusy ? "暂让中" : "值守") : "全双工"}</Stat>
             <Stat label="会话时长">
               <SessionClock startedAt={p.startedAt} />
             </Stat>
@@ -1971,8 +1983,9 @@ function ConsoleLive(p: LiveProps) {
               onChange={(e) => p.setHalfDuplex(e.target.checked)}
             />
             <span>
-              自动半双工与声源仲裁:译文播报或对方说话时暂让对向麦克风,防共享扬声器串译。
-              外放同桌必开;**双人各戴耳机可关=真全双工**(双方边说边译、互不暂让),关后外放会串译死循环
+              同机模式闭麦(演示档,默认关):仅两人同机各一支麦+共享扬声器外放时开启——
+              译文播报或对方说话时暂让对向麦克风,防外放串译死循环。
+              缺省关=真全双工(远程双方各戴耳机,互不闭麦);外放同桌不开此项会串译
             </span>
           </label>
           <label className="flex items-start gap-2 text-xs leading-relaxed">
@@ -1992,8 +2005,8 @@ function ConsoleLive(p: LiveProps) {
               onChange={(e) => p.setHearMyTrans(e.target.checked)}
             />
             <span>
-              译员耳语:开=对方说的话翻成我方语言念给你听(默认开);关=只看字幕不出声。外放时
-              播报期间我方麦自动暂让防串译
+              译员耳语:开=对方说的话翻成我方语言念给你听(默认开);关=只看字幕不出声。同机演示档下
+              播报期间我方麦自动暂让防串译(全双工缺省不暂让)
             </span>
           </label>
           <label className="flex items-start gap-2 text-xs leading-relaxed">
@@ -2005,7 +2018,7 @@ function ConsoleLive(p: LiveProps) {
             />
             <span>
               听对方听到的翻译:开=我方译文也进我方扬声器,和对方耳机里那份完全一致(默认关)。
-              外放建议保持自动半双工,播报期间我方麦自动暂让防串译
+              同机演示档(外放)建议开同机模式闭麦,播报期间我方麦自动暂让防串译
             </span>
           </label>
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>

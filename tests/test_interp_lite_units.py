@@ -155,9 +155,11 @@ async def _deepseek_stream_http_error():
 # ---- LiteDoubaoSTT 官方参数档 ----
 
 
-def test_lite_doubao_config_official_arms():
+def test_lite_doubao_config_official_arms(monkeypatch):
     from agent_runtime.interp_lite.providers.asr_doubao import LiteDoubaoSTT
 
+    for k in ("BOK_INTERP_UTT_WAIT_S", "BOK_INTERP_UTT_MERGE"):
+        monkeypatch.delenv(k, raising=False)  # 缺省档钉（env 臂另有专测）
     stt = LiteDoubaoSTT(api_key="k")
     req = stt._config()["request"]
     assert req["enable_nonstream"] is True  # 官方推荐：二遍识别
@@ -220,7 +222,8 @@ def test_first_block_wiring_lite_only(monkeypatch):
 
 
 def test_server_utterances_config(monkeypatch):
-    """lite 装配：服务端分句缺省开+end_window_size 500；总闸/灵敏度 env 可调；旧线默认关。"""
+    """lite 装配：服务端分句缺省开+end_window_size 500 两档恒显式下发（W8-A2：
+    回退档下 definite 不消费但仍是端窗看门狗触发信号）；灵敏度 env 可调；旧线默认关。"""
     from agent_runtime.interp_lite.providers.asr_doubao import LiteDoubaoSTT
     from agent_runtime.providers.doubao_asr import DoubaoSTT as _Old
 
@@ -228,18 +231,54 @@ def test_server_utterances_config(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     lite = LiteDoubaoSTT(api_key="k")
     assert lite._server_utterances is True
+    assert lite._end_window_watchdog is True
     req = lite._config()["request"]
     assert req["end_window_size"] == 500
     assert _Old(api_key="k")._server_utterances is False  # 旧线零变化
+    assert _Old(api_key="k")._end_window_watchdog is False
 
     monkeypatch.setenv("BOK_INTERP_SERVER_UTT", "0")
     off = LiteDoubaoSTT(api_key="k")
     assert off._server_utterances is False
-    assert "end_window_size" not in off._config()["request"]  # 闸关不发该键
+    assert off._config()["request"]["end_window_size"] == 500  # 两档恒显式下发
 
     monkeypatch.setenv("BOK_INTERP_SERVER_UTT", "1")
     monkeypatch.setenv("BOK_DOUBAO_END_WINDOW_MS", "320")
     assert LiteDoubaoSTT(api_key="k")._config()["request"]["end_window_size"] == 320
+
+
+def test_lite_utt_wait_env_arm(monkeypatch):
+    """W8-A2 转交·尾窗 env 臂：薄线复用旧线 Wave 3b 两键（BOK_INTERP_UTT_WAIT_S/
+    BOK_INTERP_UTT_MERGE）——缺省 0.45 现值不变 / 显式臂生效 / 坏值回 0.45 / 负钳 0
+    =尾窗关 / 上限 3 / MERGE=0 整窗关。"""
+    from agent_runtime.interp_lite.providers.asr_doubao import LiteDoubaoSTT, lite_utt_wait_s
+
+    for k in ("BOK_INTERP_UTT_WAIT_S", "BOK_INTERP_UTT_MERGE"):
+        monkeypatch.delenv(k, raising=False)
+    assert lite_utt_wait_s() == 0.45
+    lite = LiteDoubaoSTT(api_key="k")
+    assert lite._utt_merge is True and lite._utt_wait_s == 0.45  # 缺省档零变化
+
+    monkeypatch.setenv("BOK_INTERP_UTT_WAIT_S", "0.3")
+    assert lite_utt_wait_s() == 0.3
+    lite = LiteDoubaoSTT(api_key="k")
+    assert lite._utt_merge is True and lite._utt_wait_s == 0.3  # 臂生效
+
+    monkeypatch.setenv("BOK_INTERP_UTT_WAIT_S", "abc")
+    assert lite_utt_wait_s() == 0.45  # 坏值回缺省
+    monkeypatch.setenv("BOK_INTERP_UTT_WAIT_S", "-1")
+    assert lite_utt_wait_s() == 0.0
+    lite = LiteDoubaoSTT(api_key="k")
+    assert lite._utt_merge is False and lite._utt_wait_s == 0.45  # 负钳 0=尾窗关
+
+    monkeypatch.setenv("BOK_INTERP_UTT_WAIT_S", "9")
+    assert lite_utt_wait_s() == 3.0  # 上限钳
+
+    monkeypatch.delenv("BOK_INTERP_UTT_WAIT_S")
+    monkeypatch.setenv("BOK_INTERP_UTT_MERGE", "0")
+    lite = LiteDoubaoSTT(api_key="k")
+    assert lite._utt_merge is False  # 总闸关档
+    assert lite._server_utterances is True and lite._end_window_watchdog is True  # 邻旗不连带
 
 
 def test_server_definite_commits_stream():

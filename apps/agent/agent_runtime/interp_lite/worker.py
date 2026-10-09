@@ -3,7 +3,9 @@
 同槽位契约（与 ``agent_runtime.interpret`` 完全一致，serve 开关 ``BOK_INTERP_LITE=1``
 时占 8082/8083）：agent_name=``bok-interp-fwd/rev``（INTERP_DIRECTION 决定）、
 ``GET :port/worker`` 健康面、dispatch metadata 键（listen_identity/deliver_identity/
-source_lang/target_lang/glossary/voices/persona_id）、``trans-<目标语言>`` 具名轨、
+source_lang/target_lang/glossary/voices；历史键 ``persona_id`` 只忽略并打一行告警
+——音色契约 2026-10-09 定案=按语言选 MiniMax 目录，人设路线已死）、
+``trans-<目标语言>`` 具名轨、
 订阅权限白名单（deliver 端；fwd 侧补授权 listen 端「听对方听到的翻译」）、
 turns line=b 原文/译文分行落库、SessionReport 带 worker 标识、settle 半场闸、
 订阅看护自愈。差异只在管线内核（pipeline.py docstring）与 provider 装配
@@ -19,16 +21,18 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 
 # 旧线单源复用（不双轨；这些是跨线共享的业务/账本/收尾件）。
 from ..interpret import (
     _caption_text,
     _direction_audio_enabled,
+    _echo_dedup_enabled,
     _exit_stage,
+    _InterpEchoDedup,
     _lag_turn_timing,
     _LagLedger,
     _parse_session_voices,
-    _persona_voice_map,
     _resolve_minimax_model,
     _session_report_payload,
     _spawn_pooled_task,
@@ -104,14 +108,16 @@ async def entrypoint(ctx) -> None:
     tts_cfg = settings.get("tts", {}) or {}
     vad_cfg = settings.get("vad", {}) or {}
 
-    persona_voices: dict = {}
-    persona_id = str(meta.get("persona_id") or "").strip()
-    if persona_id:
-        try:
-            persona_voices = _persona_voice_map(await cp.get_persona(persona_id))
-            print(f"[interp-lite] persona voice id={persona_id[:16]} (A-line collapse)", flush=True)
-        except Exception as exc:  # noqa: BLE001 - 人设拉取失败不阻通话
-            print(f"[interp-lite] persona fetch failed id={persona_id[:16]}: {exc!r}", flush=True)
+    # 音色契约（2026-10-09 定案，Ethan 三令五申）：同传音色=按语言选 MiniMax 目录。
+    # 唯一解析序=会话级 voices_json（按语言键）> 设置分语言三键 > 默认；人设路线
+    # 已死——历史 dispatch metadata 里的 persona_id 只忽略并打一行告警，绝不回源
+    # 拉人设（tts_minimax.voice_map_for 无 persona 层）。
+    if str(meta.get("persona_id") or "").strip():
+        print(
+            "[interp-lite] dispatch persona_id present — ignored (voice=per-language "
+            "MiniMax catalog: voices_json > settings speakers > default)",
+            flush=True,
+        )
 
     # ---- ASR（cloud-only：doubao 档，官方参数档见 providers/asr_doubao.py）----
     vad_provider = inference.VAD(
@@ -144,9 +150,7 @@ async def entrypoint(ctx) -> None:
     print(f"[interp-lite] asr=doubao-lite (nonstream+force_to_speech) lang={source_lang}", flush=True)
 
     # ---- TTS（MiniMax bidi 复用装配；text-only 方向不装配=零握手浪费）----
-    tts_provider = (
-        tts_minimax.build(tts_cfg, target_lang, session_voices, persona_voices) if dir_audio else None
-    )
+    tts_provider = tts_minimax.build(tts_cfg, target_lang, session_voices) if dir_audio else None
     tts_model = _resolve_minimax_model() if dir_audio else ""
     voice_tags = (
         dir_audio
@@ -193,6 +197,12 @@ async def entrypoint(ctx) -> None:
     _lag = _LagLedger()
     _first_ms = {"ms": 0}
     _ledger_tasks: set = set()
+    # 本向回声/重复判重器（旧线单源 _InterpEchoDedup，kill-switch 同键
+    # BOK_INTERP_ECHO_DEDUP）：同机演示档外放串音/ASR 重发/自家译文被输入侧
+    # 再转写——命中整轮丢弃（不落原文行/不进队）。耳机全双工拓扑下是纯安全网
+    # （有人违规外放扬声器时兜底），零开销常驻。
+    echo_dedup = _InterpEchoDedup()
+    own_translations: deque = deque(maxlen=8)
 
     async def _add_turn(text: str, language: str, latency: int = 0, *, started_ms: int = 0,
                         ended_ms: int = 0, perceived_ms: int = 0) -> None:
@@ -211,6 +221,7 @@ async def entrypoint(ctx) -> None:
         text = str(getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or "").strip()
         if not text or role != "assistant":
             return
+        own_translations.append(text)  # echo-dedup self-heard 参考料（本向近期译文）
         latency = int(pipeline.last_ms.get("ms") or 0)  # 逐句 MT 时长（done_mt 时覆写）
         rec = _lag.pop_pending()
         if rec is not None:
@@ -241,12 +252,31 @@ async def entrypoint(ctx) -> None:
     pipeline = InterpPipeline(
         session, mt, build_instructions(source_lang, target_lang, _glossary),
         target_lang=target_lang, voice_tags=voice_tags, lag=_lag, first_ms=_first_ms,
+        # W8-A1：投机翻译+轮尾催尾装配（机器件在 pipeline/spec_mt 内部；总闸关/
+        # text-only 时内部全 None=旧路径）。stt 供 raw-interim 原文挂点直喂。
+        tts_provider=tts_provider,
+        stt_provider=stt_provider,
     )
 
     def _on_user_input(ev) -> None:
         text = str(getattr(ev, "transcript", "") or "").strip()
         if not text or not getattr(ev, "is_final", False):
             return  # interim 不喂（投机/抢跑=本地档补偿，lite 不带）
+        # echo-dedup（旧线单源）：dup-final（同文本窗内重复）/self-heard（≈本向
+        # 近期译文）命中=整轮丢弃——不落原文行、不进队（与旧线同语义）。
+        if _echo_dedup_enabled():
+            drop = echo_dedup.check(
+                text,
+                now=time.monotonic(),
+                own_translations=tuple(list(own_translations)[-3:]),
+            )
+            if drop:
+                print(
+                    f"[interp-lite] INTERP_ECHO_DROP reason={drop} chars={len(text)} "
+                    f"text={text[:24]!r}",
+                    flush=True,
+                )
+                return
         _spawn_pooled_task(_add_turn(f"原文：{text}", source_lang), _ledger_tasks, "LEDGER_TASK_ERR")
         pipeline.enqueue(text)
 
@@ -256,6 +286,7 @@ async def entrypoint(ctx) -> None:
 
     async def _shutdown() -> None:
         _mt_worker.cancel()
+        pipeline.shutdown()  # 投机在途任务收线卫生（W8-A1；无 spec=no-op）
         await _exit_stage("mt_drain", _mt_worker, timeout_s=3.0)
         await _exit_stage("mt_aclose", mt.aclose(), timeout_s=3.0)
         if tts_provider is not None:

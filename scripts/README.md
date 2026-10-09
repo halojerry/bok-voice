@@ -1,7 +1,7 @@
 # scripts/ 索引（G1；G1c 起顶层 .py 清零）
 
 > 本索引由 `tests/test_scripts_index.py` 钉住：新增/删除/改名 `scripts/` 下任何 .py 必须同步本表，否则测试红；「最近证据」= 最近一次实质提交（G1a 引导头机械提交 69f89fa 不计）。
-> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 135 个：`probes/` 51 + `bench/` 19 + `e2e/` 10 + `seed/` 15 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
+> 覆盖 `scripts/` 下全部受管 .py（不含 `cuda/`、`artifacts/`、`__pycache__/`；含 `archive/`）——当前 136 个：`probes/` 52 + `bench/` 19 + `e2e/` 10 + `seed/` 15 + `pipeline/` 11 + `ops/` 11 + `runtime/` 3 + `lib/` 3 + `archive/` 12（计数由 `test_scripts_index` 双向钉，以表为准）。**顶层只剩 `.sh`/`.ps1`/`.spec` 安装与构建入口**——发行管线（release.yml 断言/deploy 脚本）引用且无 PR 期验证，搬迁需发行干跑先行，故留顶层。`cuda/` 是独立交付包、`artifacts/` 是生成物（CI 钉路径），均不在本表。**桶语义**：probes=真栈行为取证 / bench=台架压测测量 / e2e=整通验收 / pipeline=模型与数据管线 / seed=资产导入种子 / ops=构建安装门禁与仓治理 / runtime=产品运行时 exec（CP/bok 契约）/ lib=被跨桶 import 的助手（引导头桶集合成员）。
 > 每个受管 .py 头部含 G1 引导头（marker `# --- scripts import bootstrap (G1) ---`），见 `docs/superpowers/plans/2026-10-04-repo-governance-plan.md` §3.1；`tests/test_script_bootstrap.py` 收口；`scripts/ops/import_smoke.py` 逐件装载冒烟（CI ci.yml 常驻步）。
 
 | 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |
@@ -99,6 +99,7 @@
 | `scripts/probes/probe_interp_duplex.py` | B 线全双工争用探针（2026-09-16）——两向同时说话，量双向延迟与零丢句。 | 无(手动) | 是 | 2026-09-19 |
 | `scripts/probes/probe_interp_fluency.py` | B 线流畅度探针（2026-10-09 W6×interp-lite 合流验收）：≥40字长句×3 连续推流，四判据=段间天窗>800ms 计数/单段出声 p50≥4s/首声 onset≤3.5s/原文提交单元 p50≥15 字。 | test_scripts_index.py | 是 | 2026-10-09 |
 | `scripts/probes/probe_mt_matrix.py` | B 线 MT 车道选型矩阵探针（2026-10-08 W1）：deepseek官方/qwen-mt-flash(translation_options.terms)/方舟v4.1-flash/opencode zen 四臂逐 delta 计时+译文质量+术语落地;晚峰复测定车道。 | test_scripts_index.py | 是 | 2026-10-08 |
+| `scripts/probes/probe_mt_firstplay.py` | DeepSeek 流式 MT「首可播块」台架（2026-10-09 W8-A2）：首个可合成分句（句末标点或 ≥12 字逗号界）墙钟分布×6 句×两向，对照列=spec 稳定判据仿真触发时刻（LATENCY_BUDGETS §5a 测量仪器）。 | test_scripts_index.py | 是 | 2026-10-09 |
 | `scripts/probes/probe_deepseek_stream.py` | DeepSeek 流式真伪归因探针（2026-10-08）：chat 流式/Responses API/非流式三形状逐 delta 计时+TTFB+缓存臂;Responses 思考开关=reasoning.effort "none"。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_spec_live.py` | B 线投机翻译实弹探针（2026-10-08 spec 复活验收）：多子句刺激（TTS 逗号停顿挤压到 VAD 静音线内=真人形状）→fire/CLAUSE_COMMIT/defer 日志判据。 | test_scripts_index.py | 是 | 2026-10-08 |
 | `scripts/probes/probe_interp_late_mic.py` | B 线差分探针:延迟麦克风发布 vs 即时发布(call-72112fd7 复现器)。 | 无(手动) | 是 | 2026-09-30 |

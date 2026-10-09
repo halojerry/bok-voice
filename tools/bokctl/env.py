@@ -814,6 +814,15 @@ _FORWARD_ENV = (
     # —— 豆包服务端分句灵敏度（end_window_size，[300,5000]ms，缺省 500=同传节奏；
     #    仅 interp_lite 装配下发；BOK_INTERP_SERVER_UTT=0 时无效） ——
     "BOK_DOUBAO_END_WINDOW_MS",
+    # —— W8-A1×interp-lite 投机翻译两键（2026-10-09；interp_lite worker 专属）：
+    #    读键姿势=模块常量+os.environ.get(_ENV)（静态扫描器不认字面量，故此处
+    #    显式登记即立法——不入表=prod 封闭 env 死门）：
+    #    BOK_INTERP_SPEC_RIGHT_CTX 投机开火右上下文门字数（spec_mt.py，缺省 2，
+    #    0=关回旧线无右上下文档）；
+    #    BOK_INTERP_TAIL_FLUSH 轮尾 task_flush 催尾总闸（pipeline.py，缺省 1，
+    #    0=旧路径逐字节——排干后零额外动作）。 ——
+    "BOK_INTERP_SPEC_RIGHT_CTX",
+    "BOK_INTERP_TAIL_FLUSH",
     # —— demo 质量波（2026-10-06，docs/superpowers/plans/2026-10-06-demo-quality-wave.md）：
     #    W1c 垫话云车道解禁（默认 1=cloud a_reply 车道也 arm 垫话；0 回旧 auto-off）——
     "BOK_FILLER_CLOUD",
@@ -1041,6 +1050,18 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
         "BOK_INTERP_SRC_TELEMETRY",
         "BOK_INTERP_SRC_TELEMETRY_S",
+        # 豆包服务端分句两键（2026-10-09 官方优先翻案 + W8-A2）：薄线 worker 经
+        # asr_doubao 装配直读 os.environ（server_utterances 总闸/end_window 灵敏度
+        # ms）；_FORWARD_ENV 已登记（经 passthrough 到 worker env），此处同键=
+        # B 线透传白名单显式在册（_interp_env 透传纪律，与 SPEC_MT 等同姿势）。
+        "BOK_INTERP_SERVER_UTT",
+        "BOK_DOUBAO_END_WINDOW_MS",
+        # W8-A1×interp-lite 投机翻译两键（读键姿势=模块常量+os.environ.get(_ENV)，
+        # _FORWARD_ENV 已显式登记；此处 B 线透传白名单同键）：
+        # SPEC_RIGHT_CTX=投机开火右上下文门字数（缺省 2，0=关）；
+        # TAIL_FLUSH=轮尾 task_flush 催尾总闸（缺省 1，0=旧路径逐字节）。
+        "BOK_INTERP_SPEC_RIGHT_CTX",
+        "BOK_INTERP_TAIL_FLUSH",
         # B 线订阅自愈 2026-09-30：set_subscribed 官方手动订阅口(对账定案)
         # ——检测到已发布未订上即重发订阅;=0 回纯观测档。
         "BOK_INTERP_SRC_HEAL",

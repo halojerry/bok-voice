@@ -13,13 +13,21 @@ ASR definite（VAD 段会话+负 seq 定稿，provider 层）→ FIFO → DeepSe
   重试永不好）：首次命中标死道，后续句秒走目标语请示句兜底，零 provider 调用。
 - MT 超时/异常兜底台词（``interpret._mt_fail_line``）：绝不回放源文。
 
-不带（计划档 §8 审计表）：spec-mt/碎片闸/背压/摘译/回声去重/润色——本地档补偿。
+不带（计划档 §8 审计表）：碎片闸/背压/摘译/回声去重/润色——本地档补偿。
+W8-A1 回归两件（全 env 门控，缺省保守）：
+- **spec-mt**（``BOK_INTERP_SPEC_MT`` 缺省 1；装配见 ``spec_mt.py``——机器件单源
+  import 旧线）：说话中稳定子句投机 MT+TTS 成 held PCM，final 前缀确认
+  HIT=零合成直播；busy 闸让位真车道（FIFO 深度/真 MT 在途/死道）。
+- **轮尾 task_flush**（``BOK_INTERP_TAIL_FLUSH`` 缺省 1）：FIFO 空+当前 say
+  排干后向 MiniMax bidi 连接催一枚 task_flush（无标点短尾立即起合成，
+  免等官方无标点兜底窗；通道见 ``providers/tts_minimax.tail_flush_channel``）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from collections import deque
 
@@ -34,6 +42,12 @@ from .voice_tags import TagGate
 _SENT_TIMEOUT_S = 15.0
 _QUEUE_MAX = 48
 _FIRST_PIECE_MIN_CHARS = 4  # 首段语言门的软证据窗
+_TAIL_FLUSH_ENV = "BOK_INTERP_TAIL_FLUSH"
+
+
+def _tail_flush_enabled() -> bool:
+    """轮尾催尾总闸（默认开；0=旧路径逐字节——排干后零额外动作）。"""
+    return os.environ.get(_TAIL_FLUSH_ENV, "1") == "1"
 
 
 class _GateFailError(Exception):
@@ -82,6 +96,9 @@ class InterpPipeline:
         voice_tags: bool,
         lag,
         first_ms: dict,
+        tts_provider=None,
+        stt_provider=None,
+        stats: dict | None = None,
     ):
         self.session = session
         self.mt = mt
@@ -96,11 +113,48 @@ class InterpPipeline:
         self.queue_wait_ms = {"ms": 0}  # 逐句 FIFO 等待（W6 刀3-lite 四段账）
         self.pairs: deque = deque(maxlen=8)  # (源,译) 滚动对
         self.lane_dead = {"reason": ""}
+        self.mt_busy = {"flag": False}  # 真 MT 在途旗（spec busy 闸消费，旧线同构）
         self.round = 0
+        self._last_say = None  # 最近一次 say 的 SpeechHandle（轮尾催尾的取消门）
+        self._spec = None
+        self._tail_flush = None
+        # 轮尾催尾通道（TTS 在场才装配；MiniMax bidi 专用，其他 provider 无害跳过）
+        if tts_provider is not None and _tail_flush_enabled():
+            from .providers.tts_minimax import tail_flush_channel
+
+            self._tail_flush = tail_flush_channel(tts_provider)
+        # 投机翻译装配（机器件单源旧线，见 spec_mt.py；text-only/总闸关=None=旧路径）
+        if tts_provider is not None:
+            from . import spec_mt
+
+            self._spec = spec_mt.build(
+                self,
+                tts_provider=tts_provider,
+                run_mt=spec_mt.run_mt_factory(
+                    mt, instructions, self.pairs, _collect, _SENT_TIMEOUT_S
+                ),
+                stats=stats,
+            )
+            if self._spec is not None and stt_provider is not None and hasattr(
+                stt_provider, "raw_interim_listener"
+            ):
+                # 豆包原文挂点直喂（clause-commit 坐标系；旧线同判——挂点在位时
+                # 会话级 interim 不再重复喂，防双喂坐标漂移）。
+                stt_provider.raw_interim_listener = self._spec.on_interim
+                print("[interp-lite] spec feed=raw-interim (clause-commit coords)", flush=True)
+                print("[interp-lite] spec_mt armed (prewarm-and-confirm)", flush=True)
 
     # ---- 入口（worker 的 user_input_transcribed 回调调用；原文落库在 worker 侧）----
     def enqueue(self, text: str) -> None:
-        """源句入队（满=摘最新句防雪崩，旧线同语义）；入队成功才记账（RC-8）。"""
+        """final 入口：先过投机确认（HIT=held PCM 直播+余段入队，跳过正常路径），
+        未中/关闸=照旧入队（旧线 _on_user_input 同序）。"""
+        if self._spec is not None and self._spec.on_final(text):
+            return
+        self.enqueue_raw(text)
+
+    def enqueue_raw(self, text: str) -> None:
+        """纯入队（spec 余段/defer 兜底共用；**不过确认门**——防 on_final 递归）。
+        满=摘最新句防雪崩（旧线同语义）；入队成功才记账（RC-8）。"""
         try:
             self.q.put_nowait(text)
         except asyncio.QueueFull:
@@ -108,6 +162,11 @@ class InterpPipeline:
             return
         self._enq.append(time.perf_counter())
         self.lag.note_src(text)
+
+    def shutdown(self) -> None:
+        """收线卫生：投机在途任务 cancel（绝不外抛；无 spec=no-op。旧线同判）。"""
+        if self._spec is not None:
+            self._spec.cancel("shutdown")
 
     def _done(self, mt_ms: int) -> None:
         """配对记账单点（同时覆写 last_ms 供 worker 落库 latency_ms）。"""
@@ -133,7 +192,12 @@ class InterpPipeline:
                     self.session.say(_mt_fail_line(self.target_lang))
                     self._done(0)
                     continue
-                await self._translate_say(text, t0)
+                self.mt_busy["flag"] = True
+                try:
+                    await self._translate_say(text, t0)
+                finally:
+                    self.mt_busy["flag"] = False
+                await self._maybe_tail_flush()
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -150,6 +214,28 @@ class InterpPipeline:
                 await self._fallback_say(f"error {exc!r}")
             finally:
                 self.q.task_done()
+
+    # ---- 轮尾催尾：FIFO 空+当前 say 排干+未被取消，向 bidi 连接催一枚 task_flush ----
+    async def _maybe_tail_flush(self) -> None:
+        """催无标点短尾（P1 实测省 ~2.1s：免等 MiniMax 官方无标点兜底窗）。
+
+        四道闸缺一不发：通道在场（env/TTS 装配）、FIFO 空（有后句=下一句的
+        continue 自然催）、真 MT 不在途、当前 say 未被取消（取消流 recv 已死，
+        迟到的 task_flushed 会毒化下一流的接收循环）。发送本身由通道守卫
+        （连接不在场/死亡/异常一律静默 no-op）。"""
+        flush = self._tail_flush
+        if flush is None or not self.q.empty():
+            return
+        if self.mt_busy["flag"] or self.lane_dead["reason"]:
+            return
+        if getattr(self._last_say, "interrupted", False):
+            return
+        try:
+            await flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 纯增益，绝不成为新故障源
+            pass
 
     # ---- 单句：流式 say；gate/error_pre 回退整句重开流 ----
     async def _translate_say(self, text: str, t0: float) -> None:
@@ -243,7 +329,7 @@ class InterpPipeline:
                 done.set()
 
         try:
-            self.session.say(_gen())
+            self._last_say = self.session.say(_gen())
         except Exception as exc:  # noqa: BLE001 - say 提交失败=error_pre 回退
             out["state"] = "error_pre"
             print(f"[interp-lite] MT_STREAM say submit failed {exc!r}", flush=True)
@@ -264,7 +350,7 @@ class InterpPipeline:
                 return
             if not out["yielded"]:
                 # clean 但零 yield（极端短流兜底）：整句出声，一次配对。
-                self.session.say(self._final_text(translated))
+                self._last_say = self.session.say(self._final_text(translated))
             self.pairs.append((text, translated))
             self._done(int((time.perf_counter() - t0) * 1000))
             return
@@ -287,7 +373,7 @@ class InterpPipeline:
                 f"[interp-lite] MT_LANG_MISMATCH retry target={self.target_lang} emit-as-is",
                 flush=True,
             )
-        self.session.say(self._final_text(translated))
+        self._last_say = self.session.say(self._final_text(translated))
         self.pairs.append((text, translated))
         self.first_ms["ms"] = 0
         self._done(int((time.perf_counter() - t0) * 1000))

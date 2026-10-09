@@ -59,6 +59,11 @@ _PACKET_BYTES = 16000 * 2 * 200 // 1000  # 200ms@16k mono PCM16
 _SEG_CAP_BYTES = 16000 * 2 * 60  # 重试缓冲上限 60s
 _CONNECT_TIMEOUT_S = 8.0
 _FINAL_TIMEOUT_S = 6.0
+# R4-C 端窗看门狗（2026-10-09 W8-A2）：definite 到而本地迟迟不 END 的病理兜底
+# 宽限（>2s 才收段）与轮询节拍。宽限常量不设 env（病理兜底不值得运营面；
+# 单测 monkeypatch 本常量提速）。
+_END_WINDOW_WATCHDOG_S = 2.0
+_END_WINDOW_WATCHDOG_TICK_S = 0.25
 
 # 火山 SAUC 二进制帧（V3 协议族；官方 demo protocol.py 语义）
 MSG_FULL_CLIENT_REQ = 0b0001
@@ -346,6 +351,7 @@ class DoubaoSTT(stt.STT):
         clause_commit: bool = False,
         len_fuse: bool = False,
         server_utterances: bool = False,
+        end_window_watchdog: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -394,6 +400,11 @@ class DoubaoSTT(stt.STT):
         # show_utterances 的 definite 分句（见新即发 FINAL），本地三层闸不跑；
         # False（缺省）=本地闸档=旧线逐字节零变化。仅 interp_lite 装配传 True。
         self._server_utterances = bool(server_utterances)
+        # R4-C 端窗看门狗（2026-10-09 W8-A2）：True=definite 到而本地迟迟不 END
+        # （>``_END_WINDOW_WATCHDOG_S``）→ 主动走既有收段路径的病理兜底（VAD 卡死
+        # 时负 seq 永远发不出=段缓冲无界增长、未 definite 尾巴永不落稿）。缺省
+        # False=旧线逐字节零变化（不观测、不建任务）；仅 interp_lite 装配传 True。
+        self._end_window_watchdog = bool(end_window_watchdog)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
         # 回复在途旗、收线窗旗、本轮 partial 末稿。云档语义见各方法 docstring。
         self._partial_ms_override: int | None = None
@@ -616,6 +627,14 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # stt_._server_utterances=False（缺省）=本地闸档=旧线逐字节零变化。
         self._server_utt = bool(getattr(stt_, "_server_utterances", False))
         self._su_emitted = 0  # 已发 FINAL 的 definite 分句计数（按序单调）
+        # R4-C 端窗看门狗（W8-A2；stt_._end_window_watchdog=False=零行为）：
+        # 段内 definite 计数/锚钟与 definite 合计文本（冻结判据=全文不再超出该
+        # 合计——definite 常与全文增长同帧到达，钟面比较会假阳，按内容比）。
+        self._wd_enabled = bool(getattr(stt_, "_end_window_watchdog", False))
+        self._wd_task: asyncio.Task | None = None
+        self._wd_definite = 0
+        self._wd_definite_at = 0.0
+        self._wd_definite_text = ""
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
@@ -720,6 +739,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
 
     def _on_payload(self, j: dict) -> None:
         res = j.get("result") or {}
+        if self._wd_enabled:
+            self._wd_observe(res)
         if self._server_utt:
             self._server_definite_commits(res)
         text = str(res.get("text") or "")
@@ -727,6 +748,76 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             # 单调累积（实弹取证）；防御性取最长，防服务端变体重置。
             self._last_server_text = text
             self._maybe_interim(text)
+
+    def _wd_observe(self, res: dict) -> None:
+        """端窗看门狗观测（R4-C，纯记账零副作用）：definite 分句计数只增不减
+        （服务端 utterances 全量重发=按数取增量），增量时刻记锚钟、增量瞬间把
+        definite 合计文本快照下来（冻结判据=全文不再超出该合计——definite 常与
+        全文增长同帧到达，钟面比较会假阳，按内容比）。"""
+        definite = [
+            u for u in (res.get("utterances") or [])
+            if u.get("definite") and str(u.get("text") or "").strip()
+        ]
+        if len(definite) > self._wd_definite:
+            self._wd_definite = len(definite)
+            self._wd_definite_at = time.monotonic()
+            self._wd_definite_text = "".join(str(u.get("text") or "") for u in definite)
+
+    def _wd_arm(self) -> None:
+        """段开武装（START 分支调用）：记账清零 + 起看门狗任务；未启用=零行为。"""
+        if not self._wd_enabled:
+            return
+        self._wd_cancel()
+        self._wd_definite = 0
+        self._wd_definite_at = 0.0
+        self._wd_definite_text = ""
+        self._wd_task = asyncio.create_task(self._end_window_watch())
+
+    def _wd_cancel(self) -> None:
+        """收看门狗任务（END/收线窗/声纹丢段/流关闭共用；未启/已停=无害 noop）。"""
+        t, self._wd_task = self._wd_task, None
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def _end_window_watch(self) -> None:
+        """端窗看门狗循环（R4-C「VAD 卡死」病理兜底，2026-10-09 W8-A2）。
+
+        前提（P2 实证）：豆包 SAUC 不显式设 ``end_window_size`` 时缺省 ~3044ms 才
+        definite（lite 显式下发后 definite 会先于本地 END 到达）。开火判据=**喂帧
+        中**（会话活、非定稿在途、非尾窗）且 definite 增量出现过、且 definite 之后
+        服务端再无任何新内容（全文冻结=服务端听到的是静音）、且超宽限本地仍未
+        END——即「服务端已判停、本地 VAD 卡在 speaking」的病理段 → 主动走既有
+        :meth:`_finalize_utterance` 收段（负 seq 定稿+FINAL+复位），复用既有生命
+        周期不新造。真语音续行（definite 后 text 仍增长）恒让位——看门狗绝不拦腰
+        切活语音。任务收尾姿势镜像 ``_tail_watch``（CancelledError 静默退、异常
+        复位不阻后续段）。"""
+        try:
+            while True:
+                await asyncio.sleep(_END_WINDOW_WATCHDOG_TICK_S)
+                if not self._session_alive or self._finishing or self._tailing:
+                    return
+                if self._wd_definite <= 0 or self._wd_definite_at <= 0.0:
+                    continue
+                if str(self._last_server_text or "").strip() != self._wd_definite_text.strip():
+                    continue  # 全文超出 definite 合计=仍有未提交内容（真语音续行）
+                if time.monotonic() - self._wd_definite_at <= _END_WINDOW_WATCHDOG_S:
+                    continue
+                break
+        except asyncio.CancelledError:
+            return
+        print(f"[doubao] END_WINDOW watchdog fired definite={self._wd_definite}", flush=True)
+        # 单一收段者：若 VAD END 恰在此刻落地武装了尾窗，取消之（残留由本次
+        # 收段一并负 seq 定稿，双 finalizer 不会同时飞行）。
+        self._cancel_tail()
+        self._finishing = True
+        try:
+            await self._finalize_utterance()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 看门狗收段失败不阻后续段
+            print(f"DOUBAO_END_WINDOW_WATCH_ERROR {exc!r}", flush=True)
+            self._finishing = False
+            self._reset_segment()
 
     def _server_definite_commits(self, res: dict) -> None:
         """服务端 definite 分句消费（官方优先翻案 2026-10-09）。
@@ -1129,6 +1220,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH)
                     )
                     self._gate.segment_start()
+                    # R4-C 端窗看门狗：段开武装（记账清零+起任务；未启用=零行为）。
+                    self._wd_arm()
                     # legacy=每段必开新会话（段末已关）；utt=会话跨停顿存活，
                     # 仅在确无活会话时开（续说复用=并段的关键）。
                     if not self._session_alive:
@@ -1149,6 +1242,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:
                         continue
+                    # R4-C 端窗看门狗：本地 END 先到=段正常收口，看门狗下岗。
+                    self._wd_cancel()
                     # 收线/告别直念窗：整段丢弃（不发 EOS/FINAL，把告别说完）。
                     if bool(getattr(self._stt_, "_closing_say", False)):
                         started = False
@@ -1193,6 +1288,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             await asyncio.gather(_forward_input(), _recognize())
         finally:
             self._cancel_tail()
+            self._wd_cancel()
             await self._close_session()
 
     def _cancel_tail(self) -> None:
