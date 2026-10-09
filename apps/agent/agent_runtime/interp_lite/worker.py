@@ -150,7 +150,29 @@ async def entrypoint(ctx) -> None:
     print(f"[interp-lite] asr=doubao-lite (nonstream+force_to_speech) lang={source_lang}", flush=True)
 
     # ---- TTS（MiniMax bidi 复用装配；text-only 方向不装配=零握手浪费）----
-    tts_provider = tts_minimax.build(tts_cfg, target_lang, session_voices) if dir_audio else None
+    # 播放背压 auto_tempo（W8-B，jinxi 水位设计移植）：积压水位→变速追播。
+    # 总闸 BOK_INTERP_AUTO_TEMPO（缺省开；"0"=tempo 全 None=旧路径逐字节）。
+    # 决策留在 interp_lite 侧（pipeline 每单元 _tempo_tick），变速经 frame_transform
+    # 工厂注入 TTS 装配（A 线不经过本参数=零变化）。
+    from . import auto_tempo as _auto_tempo
+
+    tempo = _auto_tempo.build_tempo_controller()
+    if tempo is not None:
+        print(
+            f"[interp-lite] auto_tempo armed t_ms={tempo.thresholds_ms} "
+            f"speeds={tempo.speeds} hold_s={tempo.hold_s}",
+            flush=True,
+        )
+    frame_transform = (
+        tempo.make_frame_transform(int(tts_cfg.get("sample_rate") or 24000))
+        if tempo is not None and dir_audio
+        else None
+    )
+    tts_provider = (
+        tts_minimax.build(tts_cfg, target_lang, session_voices, frame_transform=frame_transform)
+        if dir_audio
+        else None
+    )
     tts_model = _resolve_minimax_model() if dir_audio else ""
     voice_tags = (
         dir_audio
@@ -281,6 +303,8 @@ async def entrypoint(ctx) -> None:
         # text-only 时内部全 None=旧路径）。stt 供 raw-interim 原文挂点直喂。
         tts_provider=tts_provider,
         stt_provider=stt_provider,
+        # W8-B：播放背压 auto_tempo（总闸关=texto None=旧路径逐字节）。
+        tempo=tempo,
     )
 
     def _on_user_input(ev) -> None:

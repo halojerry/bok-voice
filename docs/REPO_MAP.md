@@ -32,7 +32,7 @@
 | `main.py` | worker 入口（A 线 `bok-voice`） |
 | `agent.py` | A 线装配：语言钉定/ASR/LLM/抢跑/打断/话术推进 hook/心跳/收尾 |
 | `interpret.py` | B 线同传 worker（fwd/rev，Hy-MT2 :1236 + MiniMax 三语音色） |
-| `interp_lite/` | B 线薄线试点（2026-10-09，`BOK_INTERP_LITE=1` serve 开关换入口；官方参数+薄胶水：`providers/{asr_doubao,mt_deepseek,tts_minimax}` 一厂商一文件+`pipeline`（流式 say 直通管）+`voice_tags`（官方 19 标签 TagGate）；蓝图 `docs/superpowers/plans/2026-10-09-interp-lite.md`，LOC 硬预算 `tests/test_interp_lite_budget.py`） |
+| `interp_lite/` | B 线薄线试点（2026-10-09，`BOK_INTERP_LITE=1` serve 开关换入口；官方参数+薄胶水：`providers/{asr_doubao,mt_deepseek,tts_minimax}` 一厂商一文件+`pipeline`（流式 say 直通管）+`voice_tags`（官方 19 标签 TagGate）+`spec_mt`（投机翻译）+`auto_tempo`（播放水位变速追播，`BOK_INTERP_AUTO_TEMPO` 总闸；OLA 单源 `bok_voice_core.audio_tempo`）；蓝图 `docs/superpowers/plans/2026-10-09-interp-lite.md`，LOC 硬预算 `tests/test_interp_lite_budget.py`） |
 | `flow.py` | 话术分步推进引擎（FlowController/rule_verdict/should_auto_advance） |
 | `dialer.py` | SIP 外播薄层（`dial_outbound` 四态出口：real=官方 CreateSIPParticipant / mock=CP 派生真语音被叫；`resolve_dial_mode` env→settings→mock） |
 | `control_plane.py` | CP HTTP 客户端 |
