@@ -18,7 +18,7 @@ os.environ.setdefault("BOK_JWT_SECRET", "x" * 40)
 import pytest
 
 from bok_voice_business_db.repository import InMemoryBusinessRepository
-from control_plane.auth import hash_password
+from control_plane.auth import clear_account_expiry_cache, hash_password
 
 PW = "Passw0rd" + "!x"
 
@@ -40,6 +40,9 @@ def _client_and_repo(monkeypatch, auth_on=True):
         lambda account_id: repo.get_account(account_id), raising=False,
     )
     monkeypatch.setattr(app.state, "node_store", NodeStore(None), raising=False)
+    # 测试隔离：auth._ACCOUNT_EXPIRY_CACHE 模块级 TTL 缓存跨测试存活——
+    # 换仓即清（前一测试把同名账号缓存成 expired 会污染本文件全部 403）。
+    clear_account_expiry_cache()
     return TestClient(app), repo
 
 

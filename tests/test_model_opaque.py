@@ -24,7 +24,7 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 os.environ.setdefault("BOK_JWT_SECRET", "x" * 40)
 
 from bok_voice_business_db.repository import InMemoryBusinessRepository
-from control_plane.auth import hash_password
+from control_plane.auth import clear_account_expiry_cache, hash_password
 
 PW = "Passw0rd" + "!x"
 
@@ -46,6 +46,9 @@ def _client_and_repo(monkeypatch):
         lambda account_id: repo.get_account(account_id), raising=False,
     )
     monkeypatch.setattr(app.state, "node_store", NodeStore(None), raising=False)
+    # 测试隔离：auth._ACCOUNT_EXPIRY_CACHE 模块级 TTL 缓存跨测试存活——
+    # 换仓即清（前一测试把同名账号缓存成 expired 会污染本文件全部 403）。
+    clear_account_expiry_cache()
     _mk(repo, "op-admin", "admin", "acc-a")
     _mk(repo, "op-peon", "user", "acc-a")
     _mk(repo, "op-root", "root", "")
@@ -97,8 +100,10 @@ def test_platform_only_surfaces(monkeypatch):
     for path in platform_only:
         assert client.get(path, headers=_h(at)).status_code == 403, path
         assert client.get(path, headers=_h(ut)).status_code == 403, path
+        # root 过闸即通过：health 类探针打本地 sidecar，栈起/没起 200/503 皆业务态
+        # （环境敏感断言会抖——只判「不是 401/403 闸错」）。
         code_root = client.get(path, headers=_h(rt)).status_code
-        assert code_root in (200, 404), (path, code_root)  # root 可达（404=资源缺）
+        assert code_root not in (401, 403), (path, code_root)
     # 克隆 CRUD 平台专属（GET 清单仍 interpret|settings-any）；POST 须带合法
     # multipart 让闸先于 422 生效。W④：端点路径中性化（cloud-voices）。
     assert client.post("/api/tts/cloud-voices", headers=_h(at),
