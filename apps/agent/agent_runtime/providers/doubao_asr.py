@@ -726,6 +726,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             raise
         except Exception as exc:  # noqa: BLE001
             self._session_error = self._session_error or f"recv:{exc!r}"
+            # call-9e0dada0 取证插桩：服务端/网络先行关流=会话文本冻结的候选根因
+            print(f"DOUBAO_ASR_SESSION_CLOSED_BY_PEER {exc!r}", flush=True)
         finally:
             if self._final_evt is not None:
                 self._final_evt.set()
@@ -1127,6 +1129,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
     # ---- 主循环（VAD 双任务骨架，与 _Qwen3ASRLiveStream 同构）----
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
+        started = False  # 取证插桩可见位（_recognize 经 nonlocal 维护）
 
         async def _forward_input() -> None:
             async for input in self._input_ch:
@@ -1137,6 +1140,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             vad_stream.end_input()
 
         async def _recognize() -> None:
+            nonlocal started
             started = False
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
@@ -1214,6 +1218,12 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                     speech_end_time = (
                         time.time() - event.silence_duration - event.inference_duration
                     )
+                    # call-9e0dada0 取证插桩：VAD END 的静音时长（判「真停顿」vs 误 END）
+                    print(
+                        f"DOUBAO_SEG_EOS silence={event.silence_duration:.2f}s "
+                        f"inference={event.inference_duration:.2f}s",
+                        flush=True,
+                    )
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.END_OF_SPEECH,
@@ -1235,6 +1245,14 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         try:
             await asyncio.gather(_forward_input(), _recognize())
         finally:
+            # call-9e0dada0 取证插桩：STT 流寿命终点（vad 流尽/框架关流）——
+            # 若在 started=1 时到这里=流被上游提前关（段截断的根因位）。
+            print(
+                f"DOUBAO_SEG_STREAM_END started={int(started)} "
+                f"finishing={int(self._finishing)} tailing={int(self._tailing)} "
+                f"alive={int(self._session_alive)}",
+                flush=True,
+            )
             self._cancel_tail()
             await self._close_session()
 
