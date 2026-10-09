@@ -58,6 +58,9 @@ _MARKERS: list[tuple[str, str]] = [
     (r"\b_campaign_transition\s*\(", "campaign-transition(page+account)"),
     (r"\bresolve_node_token\s*\(", "node-token"),
     (r"\bcurrent_identity\s*\(", "identity-self"),
+    # W③（2026-10-09）平台专属面：仅 root/机器通道/auth-off（settings/诊断/
+    # 克隆/logs/setup——模型面收口）。
+    (r"\b_require_platform\s*\(", "platform"),
 ]
 
 # 全局豁免面（identity_gate 的 _EXEMPT_PATHS 家族 + 机器通道特性端点）

@@ -136,9 +136,19 @@ def test_startup_refuses_non_loopback_without_auth(monkeypatch):
     monkeypatch.setenv("BOK_BIND_HOST", "0.0.0.0")
     monkeypatch.delenv("BOK_AUTH_REQUIRED", raising=False)
     monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
-    # 拒绝发生在任何 DB 迁移/种子之前（副作用为零）
+    monkeypatch.delenv("BOK_INSECURE_PUBLIC_BIND", raising=False)
+    # 拒绝发生在任何 DB 迁移/种子之前（副作用为零）。W⑥-3（2026-10-09）后
+    # 命中新收紧闸：公网 bind × 用户认证未开 → 拒（即便设了 CP_TOKEN——机器
+    # 通道不开用户门禁，原「双关全空」闸拦不住的裸启口）。
+    with pytest.raises(RuntimeError, match="用户面无认证"):
+        cp_main._startup()
+    # 显式认账放行实验室档：随后由旧「双关全空」闸兜底（本形态仍拒——双关
+    # 全空）；设了 CP_TOKEN 的 CP-token-only 档则放行（=旧语义，见下条）。
+    monkeypatch.setenv("BOK_INSECURE_PUBLIC_BIND", "1")
     with pytest.raises(RuntimeError, match="裸放行"):
         cp_main._startup()
+    monkeypatch.setenv("BOK_CP_TOKEN", "cp-only-mode-token")
+    cp_main._startup()  # 认账 + CP-token-only：按旧语义放行（用户面走机器闸）
 
 
 def test_startup_refusal_uses_uvicorn_argv_host(monkeypatch):

@@ -427,7 +427,9 @@ def test_admin_delegation_default_and_legacy(monkeypatch):
     client, _repo, ids = _setup(monkeypatch)
     me = client.get("/api/auth/me", headers=ids["admin"]).json()
     assert "settings" in me["permissions"] and "users" in me["permissions"]
-    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    # W③（2026-10-09）：settings 面收平台专属——存量全量章 admin 也 403（引擎/
+    # 模型段是平台机密）；audit 面照旧管理键语义。
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 403
     assert client.get("/api/audit", headers=ids["admin"]).status_code == 200
     # root 建新 admin（不带 permissions）→ 默认章
     r = client.post("/api/users", headers=ids["root"],
@@ -463,7 +465,8 @@ def test_admin_delegation_grant_and_revoke(monkeypatch):
     assert client.get("/api/settings", headers=h8).status_code == 403
     assert client.patch(f"/api/users/{boss8_id}", headers=ids["root"],
                         json={"permissions": ["calls", "settings", "users"]}).status_code == 200
-    assert client.get("/api/settings", headers=h8).status_code == 200
+    # W③：settings 键下发不再打真相 GET 面（恒 403）；users 键验即时生效。
+    assert client.get("/api/settings", headers=h8).status_code == 403
     assert client.get("/api/users", headers=h8).status_code == 200
     # 收回即时生效
     assert client.patch(f"/api/users/{boss8_id}", headers=ids["root"],
@@ -527,11 +530,14 @@ def test_users_visibility_triad(monkeypatch):
 
 
 def test_settings_secret_surface_root_only(monkeypatch):
-    """settings?internal=1 明文回源：root/机器通道/auth-off 可读；admin 403；掩码面照常。"""
+    """settings?internal=1 明文回源：root/机器通道/auth-off 可读；admin 403。
+
+    W③（2026-10-09）后掩码面同样收平台专属——admin 对 GET 恒 403（provider/
+    base_url/model 属平台机密）。"""
     client, _repo, ids = _setup(monkeypatch)
     assert client.get("/api/settings?internal=1", headers=ids["admin"]).status_code == 403
     assert client.get("/api/settings?internal=1", headers=ids["root"]).status_code == 200
-    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 403
     # auth-off（无身份非加固）保持可读——单机形态零变化
     assert client.get("/api/settings?internal=1").status_code == 200
 
@@ -542,8 +548,8 @@ def test_settings_put_root_only(monkeypatch):
     settings 键）改一处=所有本地部署跟着变，故引擎段只归平台方。GET 掩码面
     仍按 settings 键（voice-options/personas 读面靠它）。"""
     client, _repo, ids = _setup(monkeypatch)
-    # admin（存量 ''=全量，含 settings 键）：读掩码面 200、写恒 403
-    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    # admin（存量 ''=全量，含 settings 键）：W③ 后读恒 403、写恒 403
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 403
     assert client.put("/api/settings", headers=ids["admin"],
                       json={"policy": "offline_first"}).status_code == 403
     # user：auto_gate 先拦（管理键恒 403）

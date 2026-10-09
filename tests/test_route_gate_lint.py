@@ -54,6 +54,7 @@ _GATE_TOKENS = (
     "scoped_account(",
     "current_identity(",
     "same_account(",
+    "_require_platform(",  # W③ 平台专属面（settings/诊断/克隆/logs/setup）
 )
 
 # 已知带闸的共用助手（瘦 handler 委托它们；助手的闸声明在各自函数体内）。
