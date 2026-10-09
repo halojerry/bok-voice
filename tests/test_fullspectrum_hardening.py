@@ -10,11 +10,10 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 os.environ.setdefault("BOK_JWT_SECRET", "x" * 40)
 
 import pytest
-from fastapi.testclient import TestClient
-
 from bok_voice_business_db.repository import InMemoryBusinessRepository
 from control_plane.main import _dial_quota_take
 from control_plane.nodes_store import NodeStore
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
@@ -28,7 +27,9 @@ def client(monkeypatch):
     monkeypatch.setattr(app.state, "account_lookup",
                         lambda account_id: repo.get_account(account_id), raising=False)
     monkeypatch.setattr(app.state, "node_store", NodeStore(None), raising=False)
-    repo.create_user(username="quota-admin", password_hash=__import__("control_plane.auth", fromlist=["hash_password"]).hash_password("Passw0rd!x"),
+    from control_plane.auth import hash_password
+
+    repo.create_user(username="quota-admin", password_hash=hash_password("Passw0rd!x"),
                      role="admin", org_id="", account_id="acc-q")
     yield TestClient(app), repo, cp
     cp._DIAL_QUOTA_DAY.clear()

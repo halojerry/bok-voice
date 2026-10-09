@@ -26,10 +26,9 @@ PW = "Passw0rd" + "!x"
 
 
 def _client_and_repo(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from control_plane.main import app
     from control_plane.nodes_store import NodeStore
+    from fastapi.testclient import TestClient
 
     repo = InMemoryBusinessRepository()
     monkeypatch.setattr("control_plane.main._repo", lambda: repo)

@@ -33,10 +33,9 @@ VENDOR_LITERALS = ("minimax", "deepseek", "doubao", "豆包", "火山", "volcano
 
 
 def _client_and_repo(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from control_plane.main import app
     from control_plane.nodes_store import NodeStore
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
     repo = InMemoryBusinessRepository()
@@ -52,10 +51,6 @@ def _client_and_repo(monkeypatch):
     _mk(repo, "op-admin", "admin", "acc-a")
     _mk(repo, "op-peon", "user", "acc-a")
     _mk(repo, "op-root", "root", "")
-    tokens = {}
-    for name in ("op-admin", "op-peon", "op-root"):
-        r = repo.get_user_by_username(name)
-        tokens[name] = None
     return TestClient(app), repo
 
 

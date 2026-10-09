@@ -16,7 +16,6 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 os.environ.setdefault("BOK_JWT_SECRET", "x" * 40)
 
 import pytest
-
 from bok_voice_business_db.repository import InMemoryBusinessRepository
 from control_plane.auth import clear_account_expiry_cache, hash_password
 
@@ -24,10 +23,9 @@ PW = "Passw0rd" + "!x"
 
 
 def _client_and_repo(monkeypatch, auth_on=True):
-    from fastapi.testclient import TestClient
-
     from control_plane.main import app
     from control_plane.nodes_store import NodeStore
+    from fastapi.testclient import TestClient
 
     if auth_on:
         monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")

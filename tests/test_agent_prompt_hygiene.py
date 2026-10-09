@@ -99,4 +99,7 @@ def test_web_no_dangerous_html_sink():
             continue
         if "dangerouslySetInnerHTML" in (REPO_ROOT / rel).read_text(encoding="utf-8"):
             offenders.append(rel)
-    assert not offenders, "出现 dangerouslySetInnerHTML（如确需，进 hygiene allowlist 并评审）:\n" + "\n".join(offenders)
+    assert not offenders, (
+        "出现 dangerouslySetInnerHTML（如确需，进 hygiene allowlist 并评审）:\n"
+        + "\n".join(offenders)
+    )

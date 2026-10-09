@@ -34,9 +34,8 @@ ADMIN_PW = "Customer-Pw-" + "12chars"  # 夹具口令（≥12 位）
 
 
 def _client_and_repo(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from control_plane.main import app
+    from fastapi.testclient import TestClient
 
     repo = InMemoryBusinessRepository()
     monkeypatch.setattr("control_plane.main._repo", lambda: repo)

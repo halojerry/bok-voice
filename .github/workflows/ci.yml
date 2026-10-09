@@ -77,10 +77,11 @@ jobs:
         # SaaS 姿态：客户产物零厂商字面量（minimax/deepseek/doubao/豆包/火山/
         # volcano/bytedance/qwen）——命中即构建失败。与源码面
         # tests/test_vendor_literal_hygiene.py 双保险（产物级 grep 连 minify 后
-        # 的字符串/属性名都扫）。
+        # 的字符串/属性名都扫）。-I=跳二进制（mp3 试听资产的字节噪声会碰巧
+        # 拼出厂商词，文件名本身是中性音色 id——CI 实弹翻车钉死）。
         working-directory: apps/web
         run: |
-          if grep -rilE "minimax|deepseek|doubao|豆包|火山|volcano|bytedance|qwen" out/ ; then
+          if grep -rilEI "minimax|deepseek|doubao|豆包|火山|volcano|bytedance|qwen" out/ ; then
             echo "::error::客户产物含厂商字面量（见上列文件）"; exit 1
           fi
       - name: Platform console build (W④ 双构建对照档)
