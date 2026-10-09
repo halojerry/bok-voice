@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import hmac
 import io
@@ -12,7 +13,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 import time
 import uuid
 import wave
@@ -737,8 +737,13 @@ def health() -> dict:
 
 @app.get("/api/settings")
 def get_settings(request: Request, internal: bool = False) -> dict:
-    # 设置=节点运维面（含云端凭据），话务员不可见；agent 机器通道直通（下发制键闸）。
-    _gate_management(request, "settings")
+    # W③（2026-10-09）设置面收 root+机器通道：引擎/模型段（provider/base_url/
+    # model/克隆音色清单）属平台机密——掩码面也不给 admin（红队评审：掩码只清
+    # api_key，provider/base_url/model 明文回）。agent 机器通道热读照旧；
+    # auth-off 单机形态直通。镜像 PUT 判据（2026-09-27）。
+    ident = current_identity(request)
+    if ident is not None and ident.role != "root":
+        raise HTTPException(403, "设置面仅平台方（root）可访问")
     # 浅拷贝后才动：内存仓 get_settings 返回活引用，直接写 model_routing_json
     # 会把该键持久化进仓（随后掩码面 _mask_secrets 撞字符串 500）。
     raw = dict(_repo().get_settings())
@@ -1187,16 +1192,17 @@ async def notify_sms(payload: dict, request: Request) -> dict:
 
 @app.get("/api/asr/health")
 async def asr_health(request: Request) -> dict:
-    # P3-A（2026-09-17 全量 debug）：sidecar 诊断读面归管理面（settings 键）——
-    # auth-on 下任意 user JWT 曾可探 sidecar 健康/读克隆音色清单。auth-off 直通。
-    _gate_page(request, "settings")
+    # P3-A（2026-09-17 全量 debug）：sidecar 诊断读面归管理面——auth-on 下任意
+    # user JWT 曾可探 sidecar 健康。W③（2026-10-09）再收紧到平台专属。
+    _require_platform(request)
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{_qwen3_asr_url()}/health")
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        print(f"[cp] asr health error: {exc!r}", flush=True)
+        raise HTTPException(status_code=503, detail="识别服务暂不可用，请稍后再试") from exc
 
 
 @app.get("/api/asr/hotwords")
@@ -1231,7 +1237,7 @@ def asr_hotwords(request: Request, account_id: str = "", lang: str = "") -> dict
 
 @app.get("/api/tts/health")
 async def tts_health(request: Request) -> dict:
-    _gate_page(request, "settings")  # P3-A：诊断读面归管理面
+    _require_platform(request)  # W③：诊断读面收平台专属
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/health")
@@ -1243,7 +1249,7 @@ async def tts_health(request: Request) -> dict:
 
 @app.get("/api/tts/speakers")
 async def tts_speakers(request: Request) -> list[str]:
-    _gate_page(request, "settings")  # P3-A：诊断读面归管理面
+    _require_platform(request)  # W③：诊断读面收平台专属
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/v1/speakers")
@@ -1264,7 +1270,10 @@ async def tts_voices(request: Request) -> list[dict]:
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # W③：str(exc) 会带 sidecar URL（127.0.0.1:8788）——interpret 话务员
+        # 可达面，detail 通用化，原文进服务端日志。
+        print(f"[cp] tts voices error: {exc!r}", flush=True)
+        raise HTTPException(status_code=503, detail="语音服务暂不可用，请稍后再试") from exc
 
 
 @app.delete("/api/tts/voices/{voice_id}")
@@ -1412,7 +1421,7 @@ async def tts_minimax_voice_clone(
     sample_lang: str = Form("zh"),
 ) -> dict:
     """参考音频 → MiniMax 云端克隆 voice_id（不激活、0 费用；见节首注释）。"""
-    auto_gate_management(request)
+    _require_platform(request)  # W③：克隆=平台操作（客户只消费清单）
     label = label.strip()[:64]
     sample_lang = (sample_lang.strip().lower() or "zh")[:16]
     audio = await file.read()
@@ -1486,7 +1495,7 @@ async def tts_minimax_voice_clone(
 
 @app.delete("/api/tts/minimax-voices/{voice_id}")
 async def tts_minimax_voice_delete(voice_id: str, request: Request) -> dict:
-    auto_gate_management(request)
+    _require_platform(request)  # W③：克隆清单管理=平台操作
     api_key = _minimax_api_key()
     if not api_key:
         raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
@@ -1560,23 +1569,43 @@ def tts_filler_preview(lang: str = "zh", i: int = 0, request: Request = None) ->
         raise HTTPException(status_code=500, detail=f"filler preview failed: {exc}") from exc
 
 
+# W③（2026-10-09）试听 provider 服务端解析：云端音色 id 形态前缀（bokclone*/
+# Cantonese_*/English_*/moss_*——与 lib 侧目录同源的不透明 id 判据）。客户端
+# 不再传 provider 字段（抓包/请求体零厂商名）；显式 provider 仅平台老调用兼容。
+_MINIMAX_VOICE_PREFIXES = ("bokclone", "Cantonese_", "English_", "moss_")
+
+
+def _resolve_preview_provider(payload: dict) -> str:
+    explicit = str(payload.get("provider") or "").strip().lower()
+    if explicit:
+        return explicit
+    voice = str(payload.get("voice") or payload.get("voice_id") or "")
+    if voice.startswith(_MINIMAX_VOICE_PREFIXES):
+        return "minimax"
+    return "qwen3_tts"
+
+
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict, request: Request) -> Response:
-    """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
-    （voice 是 MiniMax 音色 ID，如 Cantonese_Male_news_anchor_vv2）。返回 WAV。"""
-    provider = str(payload.get("provider") or "qwen3_tts").lower()
-    # 闸按 provider 分流(2026-10-02 review 修):本地 qwen3_tts 零云耗,interpret-only
-    # 话务员的「输出设备指认」放行(RC-5 权限错配);minimax 族烧云端真金——维持
-    # settings 管理面闸(与旧 auto_gate_management 同强度,interpret 话务员不可烧)。
-    _gate_page_any(request, ("interpret",) if provider.startswith("qwen3") else ("settings",))
+    """试听一段 TTS（W③ 改造：voice_id 服务端解析 provider，客户端不传厂商名）。
+
+    云端音色（bokclone*/Cantonese_* 等）走云合成；其余走本地 sidecar。返回 WAV。"""
+    provider = _resolve_preview_provider(payload)
+    # 闸按解析后的 provider 分流：本地 qwen3_tts 零云耗，interpret 话务员的
+    # 「输出设备指认」放行（RC-5）；云端族烧真金且属平台操作——W③ 收平台专属。
+    if provider.startswith("qwen3"):
+        _gate_page_any(request, ("interpret",))
+    else:
+        _require_platform(request)
     # W⑥-4：合成类烧钱面按账号限速（合法凭证重放烧配额的闸）。
     _cost_rate_limit(request)
     sample_rate = int(payload.get("sample_rate") or 24000)
     text = str(payload.get("text") or "")
-    voice = str(payload.get("voice") or "")
+    voice = str(payload.get("voice") or payload.get("voice_id") or "")
     language = str(payload.get("language") or "zh")
-    # 试听烧真金(MiniMax 云配额)却从不留痕——voice.clone/delete 同族操作都审计
-    # (2026-09-17 全量 debug F10 补齐)。
+    # 试听烧真金(云配额)却从不留痕——voice.clone/delete 同族操作都审计
+    # (2026-09-17 全量 debug F10 补齐)。W③：detail 的 provider=解析档（内部值），
+    # 不回给客户端。
     _audit("tts.preview", subject_type="tts_voice", subject_id=voice[:128],
            detail={"provider": provider, "language": language, "chars": len(text)})
     if not voice and provider in ("minimax", "minimax_streaming"):
@@ -1659,7 +1688,9 @@ async def tts_preview(payload: dict, request: Request) -> Response:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # W③：qwen3 腿 interpret 话务员可达——detail 通用化，原文进服务端日志。
+        print(f"[cp] tts preview error: {exc!r}", flush=True)
+        raise HTTPException(status_code=502, detail="试听生成失败，请稍后再试") from exc
 
 
 # ---- 三层 RBAC 认证（路线 B1）：登录 / 身份 / 改密 / 账号管理 ----
@@ -2198,6 +2229,17 @@ def _account_public(row: dict, admin_username: str = "", user_count: int = 0) ->
 def _account_is_expired(expires_at_iso: str) -> bool:
     exp = parse_expires_at(expires_at_iso)
     return exp is not None and datetime.now(timezone.utc) >= exp
+
+
+def _require_platform(request: Request) -> None:
+    """W③（2026-10-09）平台专属面：仅 root/机器通道/auth-off 直通。
+
+    模型与引擎面（settings/诊断/克隆/日志原文/本地模型清单）对客户 admin/user
+    不可见——镜像 PUT /api/settings 判据（机器通道 identity=None 照旧，agent
+    热读不受影响）。"""
+    ident = current_identity(request)
+    if ident is not None and ident.role != "root":
+        raise HTTPException(403, "该面仅平台方可访问")
 
 
 def _account_expiry_from_days(duration_days: int):
@@ -2847,7 +2889,51 @@ def list_calls(request: Request, account_id: str = "acc-001", status: str = "", 
         st = stats.get(c.get("id") or "", {})
         c["turn_count"] = st.get("turns", 0)
         c["avg_latency_ms"] = st.get("avg_latency_ms", 0)
+        _sanitize_call_report(c, request)
     return calls
+
+
+def _sanitize_call_report(row: dict, request: Request) -> dict:
+    """W③（2026-10-09）：非 root 视角剥 session_report 的 usage 明细——LiveKit
+    SessionReport.usage 逐项带 provider/model（厂商名直出客户面）。保留报告
+    其余字段（时长/条数聚合无损）；root 与无身份（auth-off/机器）原文照旧。
+
+    注意：内存仓 get_* 返回浅拷贝（嵌套 dict 共享引用）——剥除必须作用于
+    深拷贝，否则污染存储行（root 视角连带被剥，2026-10-09 实弹翻车钉死）。
+    """
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return row
+    if not any(k in row for k in ("session_report", "session_reports_json")):
+        return row
+    out = dict(row)
+    for key in ("session_report", "session_reports_json"):
+        if key in out:
+            out[key] = copy.deepcopy(out[key])
+            val = out[key]
+            if isinstance(val, dict):
+                _strip_report_usage(val)
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        _strip_report_usage(item)
+    return out
+
+
+def _strip_report_usage(report: dict) -> None:
+    usage = report.get("usage")
+    if isinstance(usage, list):
+        for u in usage:
+            if isinstance(u, dict):
+                u.pop("provider", None)
+                u.pop("model", None)
+    # 嵌套形态（task_usage 等映射值列表）同剥。
+    for v in report.values():
+        if isinstance(v, list):
+            for u in v:
+                if isinstance(u, dict):
+                    u.pop("provider", None)
+                    u.pop("model", None)
 
 
 @app.get("/api/calls/{call_id}")
@@ -2860,7 +2946,7 @@ def get_call(call_id: str, request: Request) -> dict:
     call = deny_cross_account(request, call)
     if not call:
         raise HTTPException(404, "call not found")
-    return call
+    return _sanitize_call_report(call, request)
 
 
 @app.delete("/api/calls/{call_id}")
@@ -5519,6 +5605,23 @@ def delete_intent_rule(rule_id: str, request: Request) -> dict:
 # ---- 罐头状态面(2026-09-17 qa-canvas Phase 1 Task 3) ----
 
 
+def _opaque_tts_provider_map(provider_map: dict | None) -> dict:
+    """W③（2026-10-09）：canned-status 的 tts_provider 值映射成不透明档。
+
+    原值是厂商名（minimax/minimax_streaming/qwen3_tts/volcano_streaming）——
+    qa/branches 页是话务员默认页键可达面，厂商名不出客户面。语义保留：
+    "cloud"=有罐头缓存链（可播）；"local"=运行时无缓存链（status ok 也播不出）。
+    """
+    out: dict[str, str] = {}
+    for lang, prov in (provider_map or {}).items():
+        p = str(prov or "")
+        if not p:
+            out[str(lang)] = ""
+        else:
+            out[str(lang)] = "local" if p.startswith("qwen3") else "cloud"
+    return out
+
+
 @app.get("/api/qa/canned-status")
 def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
     """QA 条目罐头物化状态(透传 pregen_tts --qa-status,TTL 缓存;画布状态面用)。"""
@@ -5533,9 +5636,9 @@ def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
         # 状态若按默认音色判 ok,与绑定了人设音色的运行时可能不同源(永远 miss)。
         # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
         "voice_source": out.get("voice_source") or {},
-        # F11(2026-09-23)信息位:逐语言有效 TTS provider——非 minimax 族=运行时
-        # 无罐头缓存链(_tts_cache=None),status ok 也播不出来(物化键不同源)。
-        "tts_provider": out.get("tts_provider") or {},
+        # F11(2026-09-23)信息位:逐语言有效 TTS provider——W③ 起出仓为不透明档
+        # (cloud=有罐头缓存链可播 / local=运行时无缓存链,物化键不同源)。
+        "tts_provider": _opaque_tts_provider_map(out.get("tts_provider")),
     }
 
 
@@ -5596,8 +5699,9 @@ def branch_canned_status_ep(request: Request, account_id: str = "acc-001") -> di
         # F1(2026-09-20)信息位:逐语言音色来源,同 qa_canned_status_ep 注释。
         # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
         "voice_source": out.get("voice_source") or {},
-        # F11(2026-09-23)信息位:逐语言有效 TTS provider,同 qa_canned_status_ep。
-        "tts_provider": out.get("tts_provider") or {},
+        # F11(2026-09-23)信息位:逐语言有效 TTS provider,同 qa_canned_status_ep
+        # ——W③ 起出仓为不透明档（cloud/local）。
+        "tts_provider": _opaque_tts_provider_map(out.get("tts_provider")),
     }
 
 
@@ -7447,14 +7551,38 @@ def list_audit(request: Request, account_id: str = "", action: str = "", call_id
     account_id = scoped_account(request, account_id)
     repo = _repo()
     if hasattr(repo, "list_audit_events"):
-        return repo.list_audit_events(account_id=account_id, action=action, call_id=call_id, limit=limit)
+        events = repo.list_audit_events(account_id=account_id, action=action, call_id=call_id, limit=limit)
+        return [_redact_audit_event(e, request) for e in events]
     return []
+
+
+# W③（2026-10-09）：非 root 审计红action——settings.save / model_routing.* 类目
+# 的 detail 含 provider/base_url/model（引擎与路由机密），行过滤；其余行的
+# detail 里同名键值替换 [redacted]。
+_AUDIT_MODEL_ACTIONS_PREFIXES = ("settings.", "model_routing.", "tts.preview", "voice.")
+
+
+def _redact_audit_event(event: dict, request: Request) -> dict:
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return event
+    action = str(event.get("action") or "")
+    if action.startswith(_AUDIT_MODEL_ACTIONS_PREFIXES):
+        return {**event, "detail": {"redacted": "platform-only"}}
+    detail = event.get("detail")
+    if isinstance(detail, dict):
+        clean = {
+            k: ("[redacted]" if k in ("provider", "base_url", "model", "api_key") else v)
+            for k, v in detail.items()
+        }
+        return {**event, "detail": clean}
+    return event
 
 
 @app.get("/api/setup")
 def setup_status(request: Request) -> dict:
     """Report first-run model readiness for the desktop setup wizard."""
-    auto_gate_management(request)
+    _require_platform(request)  # W③：本地模型清单=平台机密
     try:
         import subprocess
 
@@ -7473,7 +7601,7 @@ def setup_status(request: Request) -> dict:
 @app.post("/api/setup/download")
 def setup_download(request: Request) -> dict:
     """Trigger model download (best-effort; UI polls /api/setup for progress)."""
-    auto_gate_management(request)
+    _require_platform(request)  # W③：模型下载=平台操作
     try:
         import subprocess
 
@@ -7893,11 +8021,12 @@ def get_call_logs(
     """实时日志尾读（契约 §5）：``{lines, next_offset, eof}``，``after`` 字节游标。
 
     数据源=agent.log（``BOK_AGENT_LOG`` 覆盖 > 平台 app-data logs/agent.log）；
-    过滤=行内含 call_id + 原始 print 行按最近结构行归属跟随。权限=calls 页闸
-    （root 可经既有键授权面放给 admin/用户，不新增权限模型）。limit 默认 200、
+    过滤=行内含 call_id + 原始 print 行按最近结构行归属跟随。limit 默认 200、
     上限 1000；本轮超限时停在未消费行起点（零丢行），下一轮自 next_offset 续读。
+    W③（2026-10-09）收平台专属：原始 agent.log 行含模型名/音色 id/端点 URL
+    （红队评审=对客户的实际泄露通道），root 才可读；客户侧排查走平台支持。
     """
-    _gate_page(request, "calls")
+    _require_platform(request)
     row = _repo().get_call(call_id)
     if not row:
         raise HTTPException(404, "call not found")
