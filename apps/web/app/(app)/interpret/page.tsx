@@ -6,7 +6,7 @@ import { useAccount } from "@/components/account-context";
 import { useToast } from "@/components/toast";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
-import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
+import { VOICE_CATALOG_ENTRIES } from "@/lib/voice-catalog";
 import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
 import { playAudioBlob, previewVoice } from "@/lib/preview";
 
@@ -30,7 +30,7 @@ const SOURCE_LANGS = [
 ];
 
 /** 目标语（译文 TTS 出声侧）：七语全放——MT=DeepSeek 任意对、TTS=MiniMax
- * 四语目录（lib/minimax-voices.ts，audition 真合成验证）。即「我讲普通话、
+ * 四语目录（lib/voice-catalog.ts，audition 真合成验证）。即「我讲普通话、
  * 对方听到德语」今天就是好的；坏的只是对方讲德语（ASR 输入侧）。
  * 四语双向放行候选=按语种分 ASR 车道（MiniMax ASR 四语 24/24 满分，但它是
  * VAD 切段伪流式无热词，见 2026-10-03 评估）——独立评估票，未开。 */
@@ -47,20 +47,20 @@ export default function InterpretPage() {
   const toast = useToast();
   const [myLang, setMyLang] = useState("zh");
   const [otherLang, setOtherLang] = useState("en");
-  // 会话级音色(2026-10-09 回滚口径, Ethan 拍板)：我方/对方各选一把 MiniMax
+  // 会话级音色(2026-10-09 回滚口径, Ethan 拍板)：我方/对方各选一把云端
   // 音色（与人设页同源目录——静态目录按槽位语言过滤 + 云端克隆全语言可选），
   // 空=跟随设置。不做人设级绑定（2026-10-08 配音语义版作废）。映射=老口径：
   // voices[myLang]=我方音色（我听到的译文声——译员耳语）、
   // voices[otherLang]=对方音色（对方听到的译文声），两槽各自独立。
   const [myVoice, setMyVoice] = useState("");
   const [otherVoice, setOtherVoice] = useState("");
-  // 试听只播已物化缓存（apps/web/public/minimax-auditions/*.mp3，seed 脚本
+  // 试听只播已物化缓存（apps/web/public/voice-auditions/*.mp3，seed 脚本
   // 全量真合成落盘），不现场合成烧云——缓存缺席=toast 提示，不回落 live。
   const [previewing, setPreviewing] = useState<"" | "my" | "other">("");
-  // MiniMax 云端克隆音色：全语言槽可选（克隆音色无语言绑定）。
+  // 云端克隆音色：全语言槽可选（克隆音色无语言绑定）。
   const [cloneVoices, setCloneVoices] = useState<Array<{ voice_id: string; label?: string }>>([]);
   useEffect(() => {
-    api.listMinimaxVoices()
+    api.listCloudVoices()
       .then((rows) => setCloneVoices(rows.map((r) => ({ voice_id: String(r.voice_id ?? ""), label: r.label ? String(r.label) : undefined }))))
       .catch(() => setCloneVoices([]));
   }, []);
@@ -74,9 +74,9 @@ export default function InterpretPage() {
    *  lib/voice-options.buildVoiceSelectOptions，目录源与人设页同源。 */
   function voiceOptions(lang: string) {
     return buildVoiceSelectOptions({
-      catalog: MINIMAX_VOICE_ENTRIES,
+      catalog: VOICE_CATALOG_ENTRIES,
       slotLang: lang,
-      minimaxClones: cloneVoices,
+      cloudClones: cloneVoices,
       firstOption: { value: "", label: "（默认，跟随设置）" },
     });
   }
@@ -245,7 +245,7 @@ export default function InterpretPage() {
           <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声 + 对方译文的译员耳语</strong>
           （译员耳语默认开，进房后控制台「译员耳语」开关可关）；我方译文播报时自动暂让对方麦克风防串译。
           说话中按句出译文（不必等停嘴）。语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
-          音色与人设页同源（MiniMax 目录按语言过滤 + 云端克隆），试听只播本地缓存；不选则用设置页「分语言音色」&gt; 默认。
+          音色与人设页同源（云端目录按语言过滤 + 云端克隆），试听只播本地缓存；不选则用设置页「分语言音色」&gt; 默认。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话

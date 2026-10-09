@@ -25,6 +25,9 @@ export function registryBase(): string {
 }
 
 async function toError(res: Response): Promise<Error> {
+  // W②（2026-10-09）会话中账号到期：CP identity_gate 403 + X-Bok-Code 头 →
+  // 硬刷新走 me()（豁免端点）重取会话，app-shell 渲染整站续费页。
+  handleAccountExpired(res);
   // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
   // detail 三形态：string / 数组（CP graph 校验 400 {"error":…,"detail":[…]}）/
   // 嵌套对象（steps 分支校验 400 {"detail":{"error":"invalid_branch_text","detail":[…]}}）
@@ -72,6 +75,19 @@ function handleUnauthorized(path: string) {
   if (window.location.pathname.startsWith("/login")) return;
   window.localStorage.removeItem("bok_token");
   window.location.href = "/login/";
+}
+
+/** W② 到期重载去重旗（多请求并发 403 只触发一次 reload）。 */
+let _expiredReloading = false;
+
+/** W②（2026-10-09）会话中账号到期：X-Bok-Code: account_expired → 硬刷新。
+ * me() 是豁免端点，刷新后 session-context 拿到 account_expired=true → app-shell
+ * ExpiredGate 渲染整站续费页（闸在服务端逐请求重估，这里只是显示层切换）。 */
+function handleAccountExpired(res: Response) {
+  if (_expiredReloading || typeof window === "undefined") return;
+  if (res.headers.get("X-Bok-Code") !== "account_expired") return;
+  _expiredReloading = true;
+  window.location.reload();
 }
 
 async function request<T>(path: string, init?: RequestInit, base?: string): Promise<T> {
@@ -139,15 +155,15 @@ export const api = {
       if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
-  // ---- MiniMax 云端声音克隆（路线 B）：清单存 tts.minimax_clones_json ----
-  listMinimaxVoices: () => request<Record<string, unknown>[]>("/api/tts/minimax-voices"),
-  registerMinimaxVoice: (body: FormData) =>
-    fetch(`${apiBase()}/api/tts/minimax-voices`, { method: "POST", body, headers: authHeaders() }).then(async (res) => {
+  // ---- 云端克隆音色（路线 B；W④ 2026-10-09 端点与函数名中性化）：清单存设置 ----
+  listCloudVoices: () => request<Record<string, unknown>[]>("/api/tts/cloud-voices"),
+  registerCloudVoice: (body: FormData) =>
+    fetch(`${apiBase()}/api/tts/cloud-voices`, { method: "POST", body, headers: authHeaders() }).then(async (res) => {
       if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
-  deleteMinimaxVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/minimax-voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
-  previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
+  deleteCloudVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/cloud-voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
+  previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number }) => {
     const res = await fetch(`${apiBase()}/api/tts/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -178,6 +194,14 @@ export const api = {
     request<UserRow>("/api/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser: (id: string, body: { password?: string; status?: string; display_name?: string; permissions?: string[] }) =>
     request<UserRow>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  // ---- SaaS 客户生命周期（W① 2026-10-09；端点恒 root 专属）----
+  listAccounts: () => request<AccountRow[]>("/api/accounts"),
+  createAccount: (body: { display_name?: string; admin_username: string; admin_password: string; duration_days?: number }) =>
+    request<AccountRow>("/api/accounts", { method: "POST", body: JSON.stringify(body) }),
+  renewAccount: (id: string, days: number) =>
+    request<AccountRow>(`/api/accounts/${encodeURIComponent(id)}/renew`, { method: "POST", body: JSON.stringify({ days }) }),
+  patchAccount: (id: string, body: { display_name?: string; expires_at?: string }) =>
+    request<AccountRow>(`/api/accounts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   // 快答库管理 CRUD（B3 owner 语义：user 只改自己的，共享=admin/root；hit 走 agent 通道不在此）。
   listQaAll: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/qa-entries?account_id=${encodeURIComponent(accountId)}`),
@@ -798,6 +822,9 @@ export type SessionInfo = {
   account_id: string;
   /** 有效权限键（页面 8 键+管理 6 键，下发制见 permissions.py；root=全量，admin='' 存量=全量） */
   permissions: string[];
+  /** W② 账号订阅态（root/匿名/账号行缺失恒 false）；ISO 串空=永久 */
+  account_expired?: boolean;
+  account_expires_at?: string;
 };
 
 export type UserRow = {
@@ -810,6 +837,18 @@ export type UserRow = {
   /** 出仓有效集（user=admin 勾选；admin=下发集含管理键） */
   permissions?: string[];
   created_at?: string;
+};
+
+// ---- SaaS 客户生命周期（W① 2026-10-09；与 CP _account_public 对齐） ----
+export type AccountRow = {
+  id: string;
+  display_name: string;
+  admin_username: string;
+  user_count: number;
+  /** ISO 串；空=永久 */
+  expires_at: string;
+  expired: boolean;
+  created_at: string;
 };
 
 // ---- 节点注册表（P1，root 平台面；与 CP nodes_store.list_nodes 输出对齐） ----

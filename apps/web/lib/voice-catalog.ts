@@ -1,47 +1,40 @@
 /**
- * MiniMax 云端音色目录（人设页与设置页共享的唯一数据源，避免两处硬编码漂移）。
+ * 云端音色目录（人设页与平台设置页共享的唯一数据源，避免两处硬编码漂移）。
  *
- * 2026-10-02 换血（用户拍板新清单）：预置音色按语言分组整体重排——粤语 5 只、
- * 普通话 5 只（含 moss 男声 A/B）、英语 6 只；组内女性在前、男性在后。
- * 旧预置条目（Cantonese_crisp_reporter_vv2 / male-qn-* / English_magnetic_voiced_man 等）
- * 整体撤下；**克隆资产保留**：克隆系 / moss_audio 系 / 曾标注为克隆的条目即使不在
- * 新清单也留在 CLONE_ASSETS 组（物化过的资产删条会丢账），按原语言（zh）归组。
+ * 命名纪律（W④ 2026-10-09）：本文件进客户 bundle——标识符/注释零厂商名，
+ * 音色 id 是不透明标识符（值域由平台维护，语义勿从字面推断）。
  *
- * 2026-10-06 W2 四语扩容（demo-quality-wave §0.2/§W2，Ethan 拍板）：新增德/法/日/葡
- * 四组（马来语/阿拉伯语裁定出局不加）；`MinimaxVoiceEntry` 加 `gender: "f"|"m"`
- * （既有三语组分组注释转正为 VOICE_GENDER 数据表，缺标=模块加载即抛错）；
- * 日语组收编用户克隆两枚（moss_audio c373f8c3=女 / 10297aea=男，按 CLONE_ASSETS
- * 语义不过期、归入日语组标 clone）； audition 真合成验证（scripts/seed/
- * cache_minimax_auditions.py 全量物化到 apps/web/public/minimax-auditions/）：
- * 四个候选 ID
- * `Japanese_efficient_reporter_vv1`/`Japanese_rebellious_youth_vv2`/
- * `Portuguese_Optimisticyouth`/`Portuguese_FunnyGuy` 全部存活入目录（近邻替换
- * 备胎 EnergeticBoy/Jovialman/DependableWoman/OptimisticYouth 未动用）；
- * `French_Female_News Anchor` ID 含空格系官方原样，勿"修"。
- *
- * MiniMax 大部分音色是多语模型：粤语播报音色念普通话/英语也自然（按新闻主播腔），
- * 普通话音色念粤语文字会带普通话腔。因此「全场始终同一个音色」模式下建议优先选
- * 粤语播报音色（香港客户场景粤/普/英都够地道）；下方 label 已按语言分组便于辨认。
+ * 数据说明（平台侧维护档案，勿改语法）：
+ * - 预置音色按语言分组整体重排（2026-10-02）——粤语 5、普通话 5（含 moss 男声
+ *   A/B）、英语 6；组内女性在前男性在后。旧预置条目整体撤下；**克隆资产保留**：
+ *   克隆系 / moss_audio 系 / 曾标注为克隆的条目即使不在新清单也留在 CLONE_ASSETS
+ *   组（物化过的资产删条会丢账），按原语言（zh）归组。
+ * - 2026-10-06 W2 四语扩容：新增德/法/日/葡四组；`VoiceCatalogEntry` 带
+ *   `gender: "f"|"m"`（VOICE_GENDER 数据表，缺标=模块加载即抛错）；日语组收编
+ *   用户克隆两枚（按 CLONE_ASSETS 语义不过期）；audition 真合成验证（scripts/
+ *   seed/cache_cloud_auditions.py 全量物化到 apps/web/public/voice-auditions/）。
+ *   官方 ID 含空格（如 French_Female_News Anchor）系原样，勿"修"。
+ * - 多语音色特性：粤语播报音色念普通话/英语也自然（按新闻主播腔）；「全场始终
+ *   同一个音色」模式下建议优先选粤语播报音色（香港客户场景粤/普/英都够地道）。
  *
  * 维护提示：
- * - 新增音色 ID 先跑 scripts/seed/cache_minimax_auditions.py 批量试听（对官方 t2a_v2
- *   真合成落 apps/web/public/minimax-auditions/，2054 voice-not-exist 当场现形）；该脚本
- *   正则解析本文件的数组组（`const X: Array<[string, string]> = [` + `["id", "label"],`）
- *   与导出块的 group→lang 映射（`...组.map(([id, label]) => ({ id, label, lang: "xx" as const })),`）
+ * - 新增音色 ID 先跑 scripts/seed/cache_cloud_auditions.py 批量试听（真合成落
+ *   apps/web/public/voice-auditions/，无效 id 当场现形）；该脚本正则解析本文件
+ *   的数组组（`const X: Array<[string, string]> = [` + `["id", "label"],`）与
+ *   导出块的 group→lang 映射（`...组.map(([id, label]) => ({ id, label, lang: "xx" as const })),`）
  *   ——改这里的语法两处必须同步；gender 标注补进 VOICE_GENDER 表。
- * - 全角括号等特殊字符的 voice_id（如 Cantonese_ProfessionalHost（F)）会 2054
- *   voice-not-exist，勿回填。
+ * - 全角括号等特殊字符的 voice_id 历史上会 voice-not-exist，勿回填。
  */
 
-export type MinimaxVoiceLang = "cantonese" | "zh" | "en" | "de" | "fr" | "ja" | "pt";
+export type VoiceLang = "cantonese" | "zh" | "en" | "de" | "fr" | "ja" | "pt";
 
-export type MinimaxVoiceGender = "f" | "m";
+export type VoiceGender = "f" | "m";
 
-export interface MinimaxVoiceEntry {
+export interface VoiceCatalogEntry {
   id: string;
   label: string;
-  lang: MinimaxVoiceLang;
-  gender: MinimaxVoiceGender;
+  lang: VoiceLang;
+  gender: VoiceGender;
 }
 
 /** [voice_id, label]——ID 原样保留（含空格），label 只作下拉短标。 */
@@ -60,14 +53,14 @@ const ZH: Array<[string, string]> = [
   ["Chinese (Mandarin)_Soft_Girl", "软妹"],
   ["Chinese (Mandarin)_Warm_Bestie", "暖闺蜜"],
   ["Chinese_wenrounvxing", "温柔女星"],
-  // 普通话男（moss 克隆系）
-  ["moss_audio_ce44fc67-7ce3-11f0-8de5-96e35d26fb85", "moss 男声 A"],
-  ["moss_audio_9c223de9-7ce1-11f0-9b9f-463feaa3106a", "moss 男声 B"],
+  // 普通话男（克隆系）
+  ["moss_audio_ce44fc67-7ce3-11f0-8de5-96e35d26fb85", "男声 A"],
+  ["moss_audio_9c223de9-7ce1-11f0-9b9f-463feaa3106a", "男声 B"],
 ];
 
 /** 克隆资产（不在新清单仍保留，按换血前语言归属=zh）：A 线普通话默认克隆。 */
 const CLONE_ASSETS: Array<[string, string]> = [
-  ["moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d", "克隆音色 moss（默认）"],
+  ["moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d", "克隆音色（默认）"],
 ];
 
 const EN: Array<[string, string]> = [
@@ -90,7 +83,7 @@ const DE: Array<[string, string]> = [
 ];
 
 const FR: Array<[string, string]> = [
-  // 法语女（Female_News Anchor 官方 ID 含空格，原样保留）
+  // 法语女（官方 ID 含空格，原样保留）
   ["French_Female_News Anchor", "法语·新闻女主播"],
   ["French_FemaleAnchor", "法语·女主持"],
   // 法语男
@@ -99,7 +92,7 @@ const FR: Array<[string, string]> = [
 ];
 
 const JA: Array<[string, string]> = [
-  // 日语女（moss 克隆=用户自有资产，不过期）
+  // 日语女（克隆=用户自有资产，不过期）
   ["moss_audio_c373f8c3-7c24-11f0-8417-7e9cf3e02f36", "日语·克隆女声"],
   ["Japanese_efficient_reporter_vv1", "日语·干练记者"],
   // 日语男
@@ -120,22 +113,22 @@ const PT: Array<[string, string]> = [
   ["Portuguese_FunnyGuy", "葡语·幽默男声"],
 ];
 
-/** gender 标注表（2026-10-06 W2：分组注释转正为数据；voice_id → f/m。新条目漏标
- *  =下方组装时模块加载即抛错，目录错误在 dev/build 当场现形而非上线后哑选）。 */
-const VOICE_GENDER: Record<string, MinimaxVoiceGender> = {
+/** gender 标注表（分组注释转正为数据；voice_id → f/m。新条目漏标=下方组装时
+ *  模块加载即抛错，目录错误在 dev/build 当场现形而非上线后哑选）。 */
+const VOICE_GENDER: Record<string, VoiceGender> = {
   // 粤语：女三男二
   Cantonese_news_anchor_vv2: "f",
   Cantonese_crisp_news_anchor_vv2: "f",
   Cantonese_GentleLady: "f",
   Cantonese_objective_narrator_vv2: "m",
   Cantonese_Male_news_anchor_vv2: "m",
-  // 普通话：女三男二（moss 两枚=男）
+  // 普通话：女三男二（克隆两枚=男）
   "Chinese (Mandarin)_Soft_Girl": "f",
   "Chinese (Mandarin)_Warm_Bestie": "f",
   Chinese_wenrounvxing: "f",
   "moss_audio_ce44fc67-7ce3-11f0-8de5-96e35d26fb85": "m",
   "moss_audio_9c223de9-7ce1-11f0-9b9f-463feaa3106a": "m",
-  // 克隆资产：moss=男
+  // 克隆资产：男
   "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d": "m",
   // 英语：男三女三
   English_Trustworth_Man: "m",
@@ -169,9 +162,9 @@ const VOICE_GENDER: Record<string, MinimaxVoiceGender> = {
 };
 
 /** 组装基底。语法契约：`...组.map(([id, label]) => ({ id, label, lang: "xx" as const })),`
- *  逐行形态勿改——scripts/seed/cache_minimax_auditions.py _EXPORT_RE 逐行扫本块收
+ *  逐行形态勿改——scripts/seed/cache_cloud_auditions.py _EXPORT_RE 逐行扫本块收
  *  group→lang 映射；gender 统一在下方导出组装时按 VOICE_GENDER 表补。 */
-const CATALOG_BASE: Array<{ id: string; label: string; lang: MinimaxVoiceLang }> = [
+const CATALOG_BASE: Array<{ id: string; label: string; lang: VoiceLang }> = [
   ...CANTONESE.map(([id, label]) => ({ id, label, lang: "cantonese" as const })),
   ...ZH.map(([id, label]) => ({ id, label, lang: "zh" as const })),
   ...CLONE_ASSETS.map(([id, label]) => ({ id, label, lang: "zh" as const })),
@@ -182,13 +175,13 @@ const CATALOG_BASE: Array<{ id: string; label: string; lang: MinimaxVoiceLang }>
   ...PT.map(([id, label]) => ({ id, label, lang: "pt" as const })),
 ];
 
-export const MINIMAX_VOICE_ENTRIES: MinimaxVoiceEntry[] = CATALOG_BASE.map((e) => {
+export const VOICE_CATALOG_ENTRIES: VoiceCatalogEntry[] = CATALOG_BASE.map((e) => {
   const gender = VOICE_GENDER[e.id];
-  if (!gender) throw new Error(`minimax-voices: 音色缺 gender 标注: ${e.id}`);
+  if (!gender) throw new Error(`voice-catalog: 音色缺 gender 标注: ${e.id}`);
   return { ...e, gender };
 });
 
-export const MINIMAX_VOICE_LANG_LABEL: Record<MinimaxVoiceLang, string> = {
+export const VOICE_LANG_LABEL: Record<VoiceLang, string> = {
   cantonese: "粤语",
   zh: "普通话",
   en: "英语",
@@ -201,6 +194,6 @@ export const MINIMAX_VOICE_LANG_LABEL: Record<MinimaxVoiceLang, string> = {
 /** 按语言筛可选音色（返回 {value,label}，符合设置页 FieldMeta options）。
  *  下拉装配/试听语言已统一收编到 lib/voice-options.ts（W5-T2）：多来源合并用
  *  buildVoiceSelectOptions、试听语言用 resolvePreviewLang——本文件只留目录本体。 */
-export function minimaxVoiceOptionsFor(lang: MinimaxVoiceLang | string) {
-  return MINIMAX_VOICE_ENTRIES.filter((v) => v.lang === lang).map((v) => ({ value: v.id, label: v.label }));
+export function voiceOptionsFor(lang: VoiceLang | string) {
+  return VOICE_CATALOG_ENTRIES.filter((v) => v.lang === lang).map((v) => ({ value: v.id, label: v.label }));
 }

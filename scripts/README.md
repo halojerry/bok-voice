@@ -139,7 +139,7 @@
 | `scripts/seed/build_asr_variants.py` | 离线构建 ASR 音近变体词表资产(2026-09-27)。 | asr_polish.py | 否 | 2026-10-04 |
 | `scripts/seed/merge_asr_variants_extra.py` | curated 变体幂等并进吸附资产(2026-10-08 B 线 P0;builder 重建后须重跑回填,extra=asr_variants_extra_bline.json)。 | asr_polish.py / asr_variants.json | 否 | 2026-10-08 |
 | `scripts/seed/export_ecapa_onnx.py` | v2 认人票：官方 speechbrain ECAPA ckpt 自导出单文件 ONNX（临时 venv 跑，torch 懒导入非生产依赖；parity 断言+sha256 存档）。 | speaker_lock.py ECAPA 档 | 否 | 2026-10-07 |
-| `scripts/seed/cache_minimax_auditions.py` | MiniMax 官方试听缓存（2026-10-02，音色目录换血配套）。 | minimax-voices.ts | 是 | 2026-10-03 |
+| `scripts/seed/cache_cloud_auditions.py` | 云端音色官方试听缓存（2026-10-02 音色目录换血配套；2026-10-09 W④ 更名+目录 voice-auditions）。 | voice-catalog.ts | 是 | 2026-10-09 |
 | `scripts/seed/gen_filler_assets.py` | 垫话音频资产生成器(2026-09-10 拍板,spec 讨论见会话)。 | agent fillers.py / test_speed_unification.py | 是 | 2026-10-04 |
 | `scripts/seed/gen_ambience.py` | W6 场景底噪资产生成器(2026-10-06):三场景无缝循环 wav+manifest,种子化确定性合成。 | agent ambience.py / test_ambience.py | 是 | 2026-10-06 |
 | `scripts/seed/gen_route_gates.py` | 生成 security/route-gates.json：枚举 CP 全部 FastAPI 路由 + 源码闸标记提取。 | test_route_gate_coverage.py | 否 | 2026-09-23 |
@@ -151,5 +151,5 @@
 | `scripts/seed/prep_tts_dataset.py` | 原始客服录音 → Qwen3-TTS SFT 数据集流水线（docs/TTS-SFT-DATA-PREP.md 阶段 C 数据先行）。 | test_prep_tts_dataset.py import / test_prep_tts_dataset.py | 否 | 2026-10-04 |
 | `scripts/seed/prepare_csc_data.py` | 粤语/普通话 CSC（拼写纠错）自训数据挖掘管道（2026-09-27）。 | test_probe_stimulus_tools.py import / CP hotword_mining.py | 否 | 2026-10-04 |
 | `scripts/seed/render_asr_corpus_v2.py` | ASR 评测语料 v2：粤语条目重渲（好音频版，2026-10-03）。 | AGENTS.md | 否 | 2026-10-03 |
-| `scripts/seed/render_asr_corpus_4lang.py` | 四语（de/fr/ja/pt）豆包 ASR 实测语料渲染（W2c，2026-10-06）：MiniMax 云 TTS×客服六句型/语→16k wav+manifest（reports/asr-4lang-corpus，gitignored），供 probe_cloud_asr --corpus 放行/限缩判定。 | probe_cloud_asr.py / cache_minimax_auditions.py（护栏+目录单源 import） | 是 | 2026-10-06 |
+| `scripts/seed/render_asr_corpus_4lang.py` | 四语（de/fr/ja/pt）豆包 ASR 实测语料渲染（W2c，2026-10-06）：MiniMax 云 TTS×客服六句型/语→16k wav+manifest（reports/asr-4lang-corpus，gitignored），供 probe_cloud_asr --corpus 放行/限缩判定。 | probe_cloud_asr.py / cache_cloud_auditions.py（护栏+目录单源 import） | 是 | 2026-10-06 |
 | `scripts/seed/seed_invite_templates.py` | 三语「客服邀约」话术种子（2026-09-24 精炼版）。 | test_branch_syntax_parity.py / prepare_csc_data.py | 是 | 2026-09-26 |

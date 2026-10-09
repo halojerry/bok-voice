@@ -37,7 +37,6 @@ export async function playAudioBlob(
 }
 
 export interface PreviewVoiceSpec {
-  provider?: string;
   voice?: string;
   language?: string;
   text: string;
@@ -49,13 +48,13 @@ export interface PreviewVoiceSpec {
 }
 
 /** 本地物化试听（2026-10-06 W2e；2026-10-07 CI 修正=真文件直发）：
- *  scripts/seed/cache_minimax_auditions.py 对目录全量真合成落
- *  apps/web/public/minimax-auditions/<voice_id 安全化>.mp3（与脚本 safe_name
+ *  scripts/seed/cache_cloud_auditions.py 对目录全量真合成落
+ *  apps/web/public/voice-auditions/<voice_id 安全化>.mp3（与脚本 safe_name
  *  同规则：非 [A-Za-z0-9._-] 折叠 _、剥首尾 _），UI 同源静态托管——命中即零云费
  *  零延迟；未命中（云端克隆/本地 Qwen 音色/未物化部署）静默回落 /api/tts/preview
  *  现场合成，行为与旧版逐字节一致。（历史：曾用根 assets/ 目录+public 符号链接，
  *  CP Docker web-build stage 只 COPY apps/web → symlink 悬空 ENOENT，已改真文件。） */
-const AUDITION_BASE = "/minimax-auditions";
+const AUDITION_BASE = "/voice-auditions";
 
 function auditionFileName(voice: string): string {
   const safe = String(voice).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
@@ -87,8 +86,9 @@ export async function previewVoice(spec: PreviewVoiceSpec): Promise<Blob> {
     }
   }
   if (!allowLive) throw new Error("需要主管权限现场合成");
+  // W④（2026-10-09）：不传 provider——CP 服务端按 voice_id 前缀解析引擎
+  // （请求体/抓包面零厂商名）。
   return api.previewTts({
-    provider: spec.provider,
     voice: spec.voice,
     language: spec.language,
     text: spec.text,

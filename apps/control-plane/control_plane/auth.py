@@ -23,6 +23,7 @@ import hmac
 import os
 import secrets
 import datetime
+import time
 from dataclasses import dataclass
 
 import jwt as pyjwt
@@ -33,6 +34,61 @@ from bok_voice_obs.context import Correlation, get_correlation, set_correlation
 _JWT_ALGO = "HS256"
 JWT_TTL_S = 8 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
+
+# ---- SaaS 账号订阅到期（W①/W② 2026-10-09）----
+# 判定=TTL 缓存逐请求重估（缓存只省 DB 查询，不缓存「放行结论」跨 renew——
+# 续费端点清缓存，最坏滞后 60s，方向良性：多拦 60s 而非多放 60s）。
+_ACCOUNT_EXPIRY_TTL_S = 60.0
+_ACCOUNT_EXPIRY_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def clear_account_expiry_cache(account_id: str = "") -> None:
+    """续费/改期/建号后清缓存（account_id 空=全清；单进程 CP，代价可忽略）。"""
+    if account_id:
+        _ACCOUNT_EXPIRY_CACHE.pop(account_id, None)
+    else:
+        _ACCOUNT_EXPIRY_CACHE.clear()
+
+
+def parse_expires_at(value) -> datetime.datetime | None:
+    """expires_at 出仓形态（ISO 串/datetime/None）→ aware datetime；坏值=None（=永久）。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def account_expired_lookup(request: Request, account_id: str) -> bool:
+    """账号订阅是否已到期（W② identity_gate 消费）。
+
+    语义：account 行缺失或 expires_at NULL → False（存量/开发形态零执法）；
+    查询经 ``app.state.account_lookup`` 注入（与 user_lookup 同模式，deps 建库
+    后接线）——auth 层不直接 import 仓库，保持分层。
+    """
+    if not account_id:
+        return False
+    now = time.monotonic()
+    hit = _ACCOUNT_EXPIRY_CACHE.get(account_id)
+    if hit is not None and now - hit[0] < _ACCOUNT_EXPIRY_TTL_S:
+        return hit[1]
+    state = getattr(getattr(request, "app", None), "state", None)
+    lookup = getattr(state, "account_lookup", None) if state is not None else None
+    expired = False
+    if lookup is not None:
+        row = lookup(account_id) or {}
+        exp = parse_expires_at(row.get("expires_at"))
+        if exp is not None:
+            expired = datetime.datetime.now(datetime.timezone.utc) >= exp
+    _ACCOUNT_EXPIRY_CACHE[account_id] = (now, expired)
+    return expired
 
 # 豁免路径：健康检查 / 登录本身 / 节点心跳与注册自鉴权 / 节点日志上报自鉴权 /
 # LiveKit 服务端 webhook
@@ -256,6 +312,23 @@ def _unauthorized() -> Response:
     return Response(status_code=401, content=b'{"detail":"unauthorized"}', media_type="application/json")
 
 
+# W② 到期闸豁免（登录已在 _EXEMPT_PATHS，到不了身份段）：me 是前端渲染
+# 整站续费页的数据源，必须放行；登出走客户端弃 token（无服务端端点）。
+_EXPIRY_EXEMPT_PATHS = frozenset({"/api/auth/me"})
+
+
+def _account_expired_response() -> Response:
+    """403 + X-Bok-Code: account_expired——web 侧据此切整站续费页（W②）。"""
+    import json as _json
+
+    return Response(
+        status_code=403,
+        content=_json.dumps({"detail": "订阅已到期，请联系平台管理员续费"}, ensure_ascii=False),
+        media_type="application/json",
+        headers={"X-Bok-Code": "account_expired"},
+    )
+
+
 def _override_correlation_user(request: Request, user_id: str) -> None:
     """无验证身份的通道（机器/豁免/静态）覆写 correlation.user_id——审计 actor
     不可被客户端 X-User-ID 头伪造（2026-09-16 深测 P2：机器通道曾可自带
@@ -310,6 +383,14 @@ async def identity_gate(request: Request, call_next):
             return _unauthorized()
         # 角色以库为准：降权（admin→user）即时生效，require_role 不再信过期 claim。
         identity.role = str(row.get("role") or identity.role)
+    # W②（2026-10-09）账号订阅到期闸：admin/user 按账号状态**逐请求重估**
+    # （TTL 缓存 account_expired_lookup；续费端点清缓存，最坏滞后 60s 且方向
+    # 良性=多拦不多放）。与 JWT 签名/角色正交——偷来的有效 token 同拦。root
+    # 与机器通道不进本闸；豁免=/api/auth/me（前端靠它渲染整站续费页）。
+    # 登录本身在 _EXEMPT_PATHS 里，到不了这里（到期客户仍可登录看续费提示）。
+    if identity.role in ("admin", "user") and path not in _EXPIRY_EXEMPT_PATHS:
+        if account_expired_lookup(request, identity.account_id):
+            return _account_expired_response()
     request.state.identity = identity
     # 覆写 correlation.user_id（保留 CorrelationMiddleware 已设的其余字段）——
     # 审计 to_dict 的 actor 由此自动落成已验证身份。

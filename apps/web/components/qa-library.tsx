@@ -299,7 +299,6 @@ export default function QaLibrary(props: {
     void (async () => {
       try {
         const blob = await previewVoice({
-          provider: "minimax",
           text: String(r.answer_text ?? ""),
           voice: "",
           language: String(r.lang ?? props.lang),
@@ -308,7 +307,7 @@ export default function QaLibrary(props: {
         });
         const el = audioRef.current;
         if (!el || !blob) {
-          setNote("合成失败：请确认已在设置页配置 MiniMax API Key。");
+          setNote("合成失败：语音服务未配置，请联系平台管理员。");
           return;
         }
         el.pause();
