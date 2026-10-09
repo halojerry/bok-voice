@@ -37,10 +37,13 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import probe_brand_words as pb  # noqa: E402  复用 CP_HEADERS/tts_pcm/push_pcm/silence_pcm/frame_rms
+
+# CP 出站走共享单点（2026-10-09 收编）：urlopen/httpx 唯一 sink 在
+# scripts/lib/cp_outbound（guard_url 环回白名单档+sink 就地三验），
+# 探针文件不再持有直接出站调用。
+from cp_outbound import httpx_send  # noqa: E402
 
 CONTROL_PLANE_URL = pb.CONTROL_PLANE_URL
 BG_TRACK_NAME = "background_audio"  # 官方组件 _TRACK_NAME,升级时同步
@@ -87,25 +90,25 @@ async def wait_speech_then_quiet(buf: bytearray, *, need_speech_s: float = 0.5,
 
 async def run_leg(mode: str) -> tuple[bool, str]:
     ts = int(time.time() * 1000) % 100000
-    obj = httpx.post(
+    obj = httpx_send("POST", 
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         json={"display_name": f"probe-键盘音{ts}", "role_template": "buyer",
               "language": "zh", "background": "probe", "courier": "顺丰物流"},
         timeout=10, headers=pb.CP_HEADERS,
     ).json()
-    persona = httpx.post(
+    persona = httpx_send("POST", 
         f"{CONTROL_PLANE_URL}/api/personas",
         json={"name": f"probe-客服键盘音{ts}", "language": "zh", "tone": "礼貌专业"},
         timeout=10, headers=pb.CP_HEADERS,
     ).json()
-    call = httpx.post(
+    call = httpx_send("POST", 
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
               "mode": "live", "direction": "webrtc", "language": "zh"},
         timeout=10, headers=pb.CP_HEADERS,
     ).json()
     call_id = call["id"]
-    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token",
+    data = httpx_send("POST", f"{CONTROL_PLANE_URL}/api/token",
                       json={"account_id": "acc-001", "call_id": call_id}, timeout=10,
                       headers=pb.CP_HEADERS).json()
     from livekit import rtc

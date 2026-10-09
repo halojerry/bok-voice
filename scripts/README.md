@@ -50,6 +50,7 @@
 | `scripts/lib/mm_voice.py` | MiniMax 云合成 16k PCM 探针话音线(2026-09-13)。 | probe_stimulus.py import / test_cantonese_terminology.py | 是 | 2026-10-04 |
 | `scripts/lib/probe_stimulus.py` | 探针/E2E 客户话音刺激源单点开关(2026-09-21)。 | 13 脚本 import / test_probe_stimulus.py | 是 | 2026-10-02 |
 | `scripts/lib/urlguard_gate.py` | 脚本面出站守卫单点（Mimosa SSRF 修复；被大量脚本 import）。 | 24 脚本 import / e2e_edge_cases.py | 否 | 2026-09-23 |
+| `scripts/lib/cp_outbound.py` | 诊断脚本 CP 出站共享单点（发送期闸 guard_url + urllib/httpx 唯一 sink + 两个 CP 便捷面；Mimosa L3 收敛 2026-10-09）。 | mine_qa/import_xkt_qa/load_intent_catalog/e2e_real_customer(+probe 族经 erc) import / test_cp_outbound.py | 否 | 2026-10-09 |
 | `scripts/ops/check_doc_paths.py` | 活文档仓内路径断链检查（G1a 治理，2026-10-04）。 | 无(手动) | 否 | 2026-10-04 |
 | `scripts/ops/check_doc_anchors.py` | 活文档 `.py:行号` 锚计数棘轮（G3b 治理，2026-10-05）：总量只准降不准升，降基线/放行新增锚须显式 `--update`；基线 `doc_anchor_baseline.json`。 | tests/test_doc_hygiene.py | 否 | 2026-10-05 |
 | `scripts/ops/check_schema_drift.py` | Supabase schema 漂移门禁:scripts/artifacts/.p0_supabase_schema.sql 产物 ≡ build_engine() 代码? | CI schema-drift.yml / test_schema_reverse_parity.py | 否 | 2026-10-04 |

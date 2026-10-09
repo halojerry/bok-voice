@@ -38,7 +38,6 @@ import struct
 import time
 from pathlib import Path
 
-import httpx
 from livekit import rtc
 
 
@@ -74,6 +73,11 @@ from urlguard_gate import gate  # noqa: E402
 
 gate(CONTROL_PLANE_URL, TTS_URL)
 
+# 发送期出站 sink 单点（2026-10-09 L3 收敛）：urlopen/httpx 出站调用唯一持有者
+# = scripts/lib/cp_outbound——本模块的 CP 请求族（cp_request 及其调用点）全部
+# 经它出站，本文件不再有直接出站调用。
+from cp_outbound import httpx_send  # noqa: E402
+
 # 机器通道鉴权（e2e_barge_in 同款惯例）：auth-on 栈/隔离 CP 必须带，未设 env 时
 # 头为空=与旧 auth-off 栈逐字节同行为。soak 族（offscript/latency）共享本底座。
 # `_CP_HEADERS` 是旧名（origin/main 侧探针 erc._CP_HEADERS 引用）——同一 dict 别名，
@@ -83,28 +87,41 @@ _CP_HEADERS = CP_HEADERS
 
 def cp_request(method: str, path: str, *, params=None, json=None, data=None,
                timeout: float = 15.0, headers=None):
-    """探针族共享 CP 请求单点（erc 既有 httpx 直连形状的模块级出口）。
+    """探针族共享 CP 请求单点（httpx.Response 原生面的模块级出口）。
 
-    branch_action / qa_phonetic / e2e_campaign 委托此函数：底座 import 期
-    urlguard 闸 + 本函数就地 scheme/host/userinfo 校验。返回 httpx.Response
-    原生面对象。
+    branch_action / qa_phonetic / e2e_campaign 委托此函数。出站闸与 httpx sink
+    在共享单点 cp_outbound.httpx_send（userinfo 拒 + 环回白名单档，
+    拒=PermissionError「出站 URL 未过护栏（拒发）」与旧就地校验逐字节同）；
+    本函数只做 URL 拼装与机器通道头合并。返回 httpx.Response 原生面对象。
     """
-    import urllib.parse as _up
-
-    _parts = _up.urlsplit(f"{CONTROL_PLANE_URL}{path}")
-    _host = (_parts.hostname or "").lower()
-    if not (
-        _parts.scheme in ("http", "https")
-        and (_host in ("127.0.0.1", "localhost", "::1") or bool(_host))
-        and not _parts.username
-        and not _parts.password
-    ):
-        raise PermissionError(f"出站 URL 未过护栏（拒发）: {CONTROL_PLANE_URL}{path}")
     merged = dict(_CP_HEADERS)
     if headers:
         merged.update(headers)
-    return httpx.request(method, f"{CONTROL_PLANE_URL}{path}", params=params,
-                         json=json, data=data, timeout=timeout, headers=merged)
+    # 出站三验·调用点就地展开（2026-10-09）：协议/目标主机/解析后 IP 边界在
+    # 出站点显式判定——与 cp_outbound 内部三验同源（本地诊断档：白名单 host
+    # 放行、其余解析后须落环回、DNS 失败 fail-closed）；就地展开是给静态污点
+    # 引擎可见的调用点校验形状（引擎不跨文件跟随 httpx_send 内部守卫）。
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    _url = f"{CONTROL_PLANE_URL}{path}"
+    _parts = urlsplit(_url)
+    if _parts.scheme not in ("http", "https") or not _parts.hostname:
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {_url}")
+    _allowed = set(h for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "")
+                   .replace(",", " ").split() if h)
+    if _parts.hostname not in _allowed:
+        _port = _parts.port or (443 if _parts.scheme == "https" else 80)
+        try:
+            _infos = socket.getaddrinfo(_parts.hostname, _port, proto=socket.IPPROTO_TCP)
+        except OSError:
+            raise PermissionError(f"出站 URL 未过护栏（拒发）: {_url}") from None
+        for _info in _infos:
+            if not ipaddress.ip_address(_info[4][0]).is_loopback:
+                raise PermissionError(f"出站 URL 未过护栏（拒发）: {_url}")
+    return httpx_send(method, _url, params=params,
+                      json=json, data=data, timeout=timeout, headers=merged)
 
 
 # 答完判定：出现过语音后，连续静默 ≥2.5s 视为答完；30s 无声=哑轮。
@@ -348,10 +365,7 @@ def create_call(lang: str, persona_id: str | None, voice: str = "",
     # 字段——/api/calls 不读请求体直传，模板跟对象走（对象→话术是产品绑定设计）。
     if not template_id:
         try:
-            tpls = httpx.get(
-                f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10,
-                headers=CP_HEADERS,
-            ).json()
+            tpls = cp_request("GET", "/api/templates?account_id=acc-001", timeout=10).json()
             tpls = tpls.get("items", tpls) if isinstance(tpls, dict) else tpls
             tpl = next(
                 (
@@ -367,7 +381,7 @@ def create_call(lang: str, persona_id: str | None, voice: str = "",
         except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
             template_id = ""
     def _post(path: str, **kw) -> dict:
-        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, headers=CP_HEADERS, **kw)
+        resp = cp_request("POST", path, timeout=10, **kw)
         resp.raise_for_status()
         return resp.json()
 
@@ -383,7 +397,7 @@ def create_call(lang: str, persona_id: str | None, voice: str = "",
         },
     )
     if persona_id:
-        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10, headers=CP_HEADERS)
+        resp = cp_request("GET", f"/api/personas/{persona_id}", timeout=10)
         resp.raise_for_status()
         persona = resp.json()
         voice = str(persona.get("reference_audio") or "")
@@ -467,7 +481,7 @@ async def fetch_turns(call_id: str, settle_s: float = 12.0) -> list[dict]:
     stable = 0
     deadline = time.perf_counter() + settle_s
     while time.perf_counter() < deadline:
-        rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10, headers=CP_HEADERS).json()
+        rows = cp_request("GET", f"/api/calls/{call_id}/turns", timeout=10).json()
         if rows and len(rows) == len(last):
             stable += 1
             if stable >= 2:
@@ -544,11 +558,10 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
     measures: list[dict] = []
     setup_ok = False
     try:
-        data = httpx.post(
-            f"{CONTROL_PLANE_URL}/api/token",
+        data = cp_request(
+            "POST", "/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
-            headers=CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -572,7 +585,9 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
                 f"    轮{i} 「{text}」 话音{m['user_dur_s']:.1f}s → 首声 {first} · 语音 {m['speech_s']:.1f}s · {flag}",
                 flush=True,
             )
-            await asyncio.sleep(random.uniform(0.8, 1.5))  # 人味停顿
+            # 人味停顿：SystemRandom（非确定性场景随机，无复现需求——确定性
+            # 采样族见 probes/pipeline 各自的 random.Random(fixed seed)）。
+            await asyncio.sleep(random.SystemRandom().uniform(0.8, 1.5))
     except Exception as exc:
         print(f"[real-customer] 场景 {key} 异常中断: {exc!r}", flush=True)
     finally:
@@ -583,8 +598,8 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
         for t in read_tasks:
             t.cancel()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=CP_HEADERS)
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=CP_HEADERS)
+            cp_request("POST", f"/api/calls/{call_id}/hangup", timeout=10)
+            cp_request("POST", f"/api/calls/{call_id}/settle", timeout=30)
         except Exception:
             pass
 
