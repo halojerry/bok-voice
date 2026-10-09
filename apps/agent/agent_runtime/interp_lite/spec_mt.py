@@ -128,13 +128,16 @@ def build(pipeline, *, tts_provider, run_mt, stats: dict | None = None, log=prin
         return busy
 
     def _say_cached(final_src: str, text: str, pcm: bytes) -> None:
-        """HIT 入队（不跳队——FIFO 保序）：held PCM 包装为预合成单元入 FIFO，
-        播放顺序由队列保证（2026-10-09 乱序修复：call-452f135e 实弹 HIT 跳队
-        在前序单元之前播出）。零合成优势保留（mt_ms=0），只是排队等播。"""
-        from ..tts_cache import pcm_to_frames
+        """HIT 入队（FIFO 保序 + 框架 speech queue 保序——call-d1cf9dc3 乱序修复）。
 
-        frames = pcm_to_frames(pcm, tts_provider.sample_rate)
-        pipeline.enqueue_precomputed(final_src, pipeline._final_text(text), frames)
+        2026-10-09 两轮乱序修复：
+        ①call-452f135e: say(audio=frames) 跳 FIFO → 改 enqueue_precomputed
+        ②call-d1cf9dc3: say(audio=) 与 say(text=) 框架内不保跨类型播放序
+          （audio 零合成先出，text 待合成后出=第二段先播）→ **彻底放弃
+          audio 直播通道**，改为预计算译文文本入 FIFO 走正常 TTS 合成管线
+          （省 MT 时间 first_ms=0 ✓，TTS 照常合成保播放序 ✓）。
+        held PCM 仅供未来 say(text+audio=) 同型播放入队时复用。"""
+        pipeline.enqueue_precomputed_text(final_src, pipeline._final_text(text))
         pipeline.last_ms["ms"] = 0
         pipeline.lag.note_src(final_src)
         pipeline.lag.done_mt(0)

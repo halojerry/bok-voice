@@ -176,15 +176,16 @@ class InterpPipeline:
         self._enq.append(time.perf_counter())
         self.lag.note_src(text)
 
-    def enqueue_precomputed(self, src: str, text: str, frames) -> None:
-        """spec HIT 预合成单元入队（FIFO 保序——2026-10-09 乱序修复）。
+    def enqueue_precomputed_text(self, src: str, text: str) -> None:
+        """spec HIT 预计算译文文本入队（FIFO 保序——call-d1cf9dc3 乱序修复终版）。
 
-        held PCM 已合成、不需要再跑 MT——但**必须排队等播**（不跳队），
-        否则前序单元还在播时 HIT 单元突然插到前面=乱序（call-452f135e 实弹）。
-        内部形状=队列里放 (text, frames) 二元组而非裸 str；run 循环识别
-        二元组时跳过 MT 直播 frames。"""
+        2026-10-09 两轮修复收敛：HIT 不再走 say(audio=) 通道（与 say(text=)
+        在框架 speech queue 内不保跨类型播放序——audio 零合成先出声=第二段
+        先播）。改为预计算译文**文本**入 FIFO，run 循环跳过 MT 直接 say(text)
+        走正常 TTS 合成管线——省 MT 时间（first_ms=0）+ 保播放序（同类型 say）。
+        """
         try:
-            self.q.put_nowait((text, frames))
+            self.q.put_nowait(("__precomputed__", text))
         except asyncio.QueueFull:
             print("[interp-lite] precomputed queue overflow, dropped(摘译)", flush=True)
             return
@@ -235,13 +236,11 @@ class InterpPipeline:
                     self.session.say(_mt_fail_line(self.target_lang))
                     self._done(0)
                     continue
-                # spec HIT 预合成单元（二元组）：跳过 MT 直播 frames（FIFO 保序到达）。
-                if isinstance(item, tuple):
-                    text, frames = item
-                    from ..tts_cache import frames_aiter
-
-                    self.session.say(text, audio=frames_aiter(frames))
-                    self.pairs.append((text, text))
+                # spec HIT 预计算文本（跳 MT 直走 TTS 合成保播放序——同类型 say 串行）。
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__precomputed__":
+                    _, pre_text = item
+                    self.session.say(pre_text)
+                    self.pairs.append((pre_text, pre_text))
                     continue
                 text = item
                 self.mt_busy["flag"] = True

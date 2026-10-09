@@ -232,10 +232,11 @@ def test_pipeline_final_hit_skips_queue(monkeypatch):
         assert ctl.hold.text == "好的，马上帮您处理，"  # 投机 MT 已落地（held 文本=MT 译文）
         assert ctl.hold.pcm  # TTS 排干 PCM 在槽
         p.enqueue("好的，马上帮您处理，好的")  # final：span+余段
-        # W8 乱序修复：HIT 走 enqueue_precomputed 入 FIFO（二元组），余段照旧入队
-        assert p.q.qsize() == 2  # HIT 预合成 + 余段
+        # W8 乱序修复终版：HIT 走 enqueue_precomputed_text 入 FIFO（标记二元组），
+        # 余段照旧入队——播放序由同类型 say(text) 保证
+        assert p.q.qsize() == 2  # HIT 预计算 + 余段
         qitems = list(p.q._queue)
-        assert isinstance(qitems[0], tuple)  # HIT=（text, frames）二元组（FIFO 保序）
+        assert isinstance(qitems[0], tuple) and qitems[0][0] == "__precomputed__"  # HIT 标记
         assert qitems[1] == "好的"  # 余段
         assert p.lag.dones == [0]  # 投机轮 mt_ms=0（旧线同口径）
 
