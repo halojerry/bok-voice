@@ -67,7 +67,7 @@ def test_right_ctx_chars_pure(monkeypatch):
     assert spec_mt.spec_right_ctx_chars() == 0  # 0=关
 
 
-def _ctl(busy: bool = False):
+def _ctl(busy: bool = False, **kw):
     said: list[tuple] = []
     enq: list[str] = []
 
@@ -78,11 +78,12 @@ def _ctl(busy: bool = False):
         enabled=True,
         detector=spec_mt._SpecMtDetector(),
         hold=spec_mt._SpecMtHold(),
-        run_spec=_run_spec,
-        busy_gate=lambda: busy,
-        say_cached=lambda s, t, p: said.append((s, t, p)),
-        enqueue=enq.append,
-        log=lambda *_a, **_k: None,
+        run_spec=kw.pop("run_spec", _run_spec),
+        busy_gate=kw.pop("busy_gate", lambda: busy),
+        say_cached=kw.pop("say_cached", lambda s, t, p: said.append((s, t, p))),
+        enqueue=kw.pop("enqueue", enq.append),
+        log=kw.pop("log", lambda *_a, **_k: None),
+        **kw,
     )
     return ctl, said, enq
 
@@ -157,6 +158,92 @@ def test_confirm_final_shorter_than_span_misses():
     ctl.hold.pcm = b"\x02" * 8
     assert ctl.on_final("我想请") is False
     assert said == []
+
+
+# ---- S2 defer 自适应续窗/再投机（2026-10-09，call-4322e14d 六发零中） ------------
+# 机器件单源旧线（interpret._SpecMtController）——lite 面钉「旋钮同源 + 继承生效 +
+# 右上下文门不拦增长 interim」三件事；行为矩阵（①续窗②停滞③替槽④硬帽⑤kill）在
+# tests/test_interp_spec_mt.py 单源面全量覆盖，此处不复制第二份。
+
+
+def test_spec_defer_adaptive_knobs_single_source(monkeypatch):
+    """续窗硬帽/再投机门槛=旧线同读数（缺省装配零私调，env 同键）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_DEFER_MAX_S", raising=False)
+    monkeypatch.delenv("BOK_INTERP_SPEC_REFIRE_CHARS", raising=False)
+    assert interpret_old._SPEC_DEFER_MAX_ENV == "BOK_INTERP_SPEC_DEFER_MAX_S"
+    assert interpret_old._SPEC_REFIRE_ENV == "BOK_INTERP_SPEC_REFIRE_CHARS"
+    assert interpret_old._spec_defer_max_s() == 8.0
+    assert interpret_old._spec_refire_chars() == 6
+    ctl, _said, _enq = _ctl()
+    assert ctl._defer_max_s == 8.0 and ctl._refire_chars == 6  # 缺省装配吃同读数
+
+
+def test_lite_defer_window_renews_on_growth_and_hits():
+    """lite 面①：说话中 interim 持续增长→窗口滚动不 defer-fallback→落地 HIT。
+
+    固定窗 0.15s 早于任务落地 0.45s（旧行为此处必 fallback）；增长 interim 经
+    右上下文门（门后恒有 ≥2 字尾巴）到单源续窗——每拍重置到 now+wait。"""
+
+    async def slow_run(span):
+        await asyncio.sleep(0.45)
+        return ("TR:HELD", b"\x02" * 8)
+
+    ctl, said, enq = _ctl(run_spec=slow_run, spec_wait_s=0.15, defer_max_s=5.0,
+                          refire_chars=6)
+    final = "我想请问一下你们那边怎么收费"
+
+    async def scenario():
+        ctl.on_interim("我想请问一下，你们")
+        ctl.on_interim("我想请问一下，你们")  # 2 目击开火（右上下文门 2 字过）
+        for _ in range(50):
+            if ctl.hold.src:
+                break
+            await asyncio.sleep(0.01)
+        assert ctl.hold.src == "我想请问一下，"
+        assert ctl.on_final(final) is True  # 必中在途→defer 武装
+        # 增长 interim（无新边界标点→候选不前进→只续窗不替槽）。
+        for txt in (
+            "我想请问一下，你们那边",
+            "我想请问一下，你们那边怎么",
+            "我想请问一下，你们那边怎么收",
+            "我想请问一下，你们那边怎么收费",
+            "我想请问一下，你们那边怎么收费标准",
+        ):
+            await asyncio.sleep(0.07)  # 末拍 0.35s 已过固定窗——续窗救活（末窗 0.50s>落地 0.45s）
+            ctl.on_interim(txt)
+        await asyncio.sleep(0.3)  # 过 0.45s 落地点
+        assert said and said[0][0] == final and said[0][1] == "TR:HELD"
+        assert enq == ["你们那边怎么收费"]  # 余段照排
+        assert ctl._deferred is None
+
+    asyncio.run(scenario())
+
+
+def test_lite_defer_growth_stall_keeps_old_fallback():
+    """lite 面②：增长停滞→固定窗照旧 fallback（S2 关掉时逐字节旧行为的回归钉）。"""
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, said, enq = _ctl(run_spec=never_run, spec_wait_s=0.08, defer_max_s=8.0,
+                          refire_chars=6)
+    final = "我想请问一下你们那边怎么收费"
+
+    async def scenario():
+        ctl.on_interim("我想请问一下，你们")
+        ctl.on_interim("我想请问一下，你们")
+        for _ in range(50):
+            if ctl.hold.src:
+                break
+            await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        ctl.on_interim("全新的另一句话呀，你们看")  # 不以 held 前缀开头=不续窗
+        await asyncio.sleep(0.3)  # 过 0.08s 兜底点
+        assert said == [] and enq == [final]  # 兜底正常入队（含 note_src 由闭包补）
+        assert ctl._deferred is None
+
+    asyncio.run(scenario())
 
 
 # ---- busy 闸：FIFO 深度 / 真 MT 在途 / 死道 ------------------------------------

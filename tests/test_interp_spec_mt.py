@@ -25,9 +25,11 @@ sys.path.insert(0, str(ROOT / "apps" / "agent"))
 from agent_runtime.interpret import (  # noqa: E402
     _spec_clause_prefix,
     _spec_content_chars,
+    _spec_defer_max_s,
     _spec_mt_enabled,
     _spec_norm,
     _spec_prefix_split,
+    _spec_refire_chars,
     _SpecMtController,
     _SpecMtDetector,
     _SpecMtHold,
@@ -37,6 +39,9 @@ INTERP_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_t
     encoding="utf-8"
 )
 ENV_SRC = (ROOT / "tools" / "bokctl" / "env.py").read_text(encoding="utf-8")
+AGENT_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
+    encoding="utf-8"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,8 @@ def _mk_controller(
     enqueue_calls=None,
     detector=None,
     spec_wait_s=None,
+    defer_max_s=None,
+    refire_chars=None,
 ):
     loop = _FakeLoop()
     hold = _SpecMtHold()
@@ -244,6 +251,8 @@ def _mk_controller(
         enqueue=lambda rest: enqueue_calls.append(rest),
         log=loop.log,
         spec_wait_s=spec_wait_s,
+        defer_max_s=defer_max_s,
+        refire_chars=refire_chars,
     )
     return ctl, hold, loop
 
@@ -446,6 +455,306 @@ def test_controller_defer_blocks_new_fires_till_settled():
     asyncio.run(main())
 
 
+# ---- S2: defer 窗口自适应续窗+增 prefix 再投机(2026-10-09,call-4322e14d) ----
+
+
+def test_spec_defer_max_s_reader(monkeypatch):
+    """硬帽秒读数:缺省 8.0;坏值回缺省;负数钳 0(=续窗关)。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_DEFER_MAX_S", raising=False)
+    assert _spec_defer_max_s() == 8.0
+    monkeypatch.setenv("BOK_INTERP_SPEC_DEFER_MAX_S", "5")
+    assert _spec_defer_max_s() == 5.0
+    monkeypatch.setenv("BOK_INTERP_SPEC_DEFER_MAX_S", "abc")
+    assert _spec_defer_max_s() == 8.0
+    monkeypatch.setenv("BOK_INTERP_SPEC_DEFER_MAX_S", "-1")
+    assert _spec_defer_max_s() == 0.0
+    monkeypatch.setenv("BOK_INTERP_SPEC_DEFER_MAX_S", "0")
+    assert _spec_defer_max_s() == 0.0
+
+
+def test_spec_refire_chars_reader(monkeypatch):
+    """再投机门槛读数:缺省 6(镜像 detector REFIRE_GROWTH_CHARS);坏值回缺省;负数钳 0。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_REFIRE_CHARS", raising=False)
+    assert _spec_refire_chars() == 6
+    monkeypatch.setenv("BOK_INTERP_SPEC_REFIRE_CHARS", "3")
+    assert _spec_refire_chars() == 3
+    monkeypatch.setenv("BOK_INTERP_SPEC_REFIRE_CHARS", "abc")
+    assert _spec_refire_chars() == 6
+    monkeypatch.setenv("BOK_INTERP_SPEC_REFIRE_CHARS", "-2")
+    assert _spec_refire_chars() == 0
+
+
+def test_controller_defer_window_renews_on_prefix_growth():
+    """①说话中 interim 持续增长→窗口滚动不 defer-fallback→任务落地 HIT。
+
+    固定窗(0.15s)远早于任务落地(0.45s)——旧行为此处必 defer-fallback;续窗
+    每次增长重置到 now+wait,必中体等满落地=零合成直播。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def slow_run(span):
+        await asyncio.sleep(0.45)  # 落地晚于固定窗
+        return ("hello there", b"PCM")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=slow_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=0.15, defer_max_s=5.0, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True  # defer 已武装
+        # 增长 interim(无新边界标点→候选不前进→只续窗不替槽)。
+        growth = [
+            "你好呀我想问一下，请问你们",
+            "你好呀我想问一下，请问你们的",
+            "你好呀我想问一下，请问你们的这个",
+            "你好呀我想问一下，请问你们的这个集运",
+            "你好呀我想问一下，请问你们的这个集运怎么",
+        ]
+        for txt in growth:
+            await asyncio.sleep(0.07)  # 末拍 0.35s 落在 0.15s 固定窗之外——续窗救活
+            ctl.on_interim(txt)
+        await asyncio.sleep(0.2)  # 过 0.45s 落地点
+        assert say_calls and say_calls[0][1] == "hello there"
+        assert say_calls[0][0] == final
+        assert enqueue_calls == ["请问你们这个集运怎么收费的"]  # 余段照排
+        assert ctl._deferred is None
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC hit" in x and "deferred=1" in x for x in loop.logs)
+    assert not any("defer-fallback" in x for x in loop.logs)
+    assert not any("refire" in x for x in loop.logs)  # 候选未长进:只续窗
+
+
+def test_controller_defer_growth_stall_falls_back_with_expire_row():
+    """②增长停滞无 final→照旧 defer-fallback,且打 defer-expire(grew=0=final 真丢)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=never_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=0.08, defer_max_s=8.0, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        # 停滞期 interim(新句起步,不以 held 前缀开头)=不续窗,窗口照旧节奏。
+        ctl.on_interim("全新的另一句话呀，")
+        await asyncio.sleep(0.3)  # 过 0.08s 兜底点
+        assert say_calls == []
+        assert enqueue_calls == [final]
+        assert ctl._deferred is None
+        assert hold.task is None
+
+    asyncio.run(main())
+    expire_rows = [x for x in loop.logs if "INTERP_SPEC defer-expire" in x]
+    assert len(expire_rows) == 1 and "grew=0" in expire_rows[0]
+    assert any("INTERP_SPEC defer-fallback" in x for x in loop.logs)
+
+
+def test_controller_defer_growth_refires_and_replaces_slot():
+    """③增长 ≥6 内容字触发再投机替槽:旧任务 cancel(身份守卫不结账)、新 span
+    接管 slot;新任务落地=HIT 播新译文(旧前缀译文相似度风险消除)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+    spans: list[str] = []
+
+    async def scripted_run(span):
+        spans.append(span)
+        if len(spans) == 1:
+            await asyncio.sleep(0.5)  # 首投机:慢(将被再投机顶掉)
+            return ("T[旧]", b"OLD")
+        await asyncio.sleep(0.03)  # 再投机:快落地
+        return ("T[新]", b"NEW")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=scripted_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=0.6, defer_max_s=10.0, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        await asyncio.sleep(0.02)
+        # 增长 ≥6 内容字且带新边界标点:候选前进→替槽。
+        ctl.on_interim("你好呀我想问一下，请问你们这个集运怎么收费，帮我看看")
+        assert hold.src == "你好呀我想问一下，请问你们这个集运怎么收费，"
+        await asyncio.sleep(0.02)  # 让新投机任务起跑(scripted_run 记录 span)
+        assert spans == ["你好呀我想问一下，", "你好呀我想问一下，请问你们这个集运怎么收费，"]
+        await asyncio.sleep(0.25)  # 新任务(0.03s)落地
+        assert say_calls and say_calls[0][1] == "T[新]" and say_calls[0][2] == b"NEW"
+        assert say_calls[0][0] == final  # 播出锚仍是 defer 时的 final(配对不换)
+        assert enqueue_calls == ["请问你们这个集运怎么收费的"]
+        assert ctl._deferred is None
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC refire" in x for x in loop.logs)
+    assert any("INTERP_SPEC hit" in x and "deferred=1" in x for x in loop.logs)
+    assert not any("defer-fallback" in x for x in loop.logs)
+    assert any("INTERP_SPEC abort" in x for x in loop.logs)  # 旧投机被顶掉(cancel)
+
+
+def test_controller_defer_hard_cap_expires_with_grew_row():
+    """④续窗到硬帽→fallback(defer-expire 带 grew>0=说话没停等到帽)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=never_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=0.5, defer_max_s=0.25, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        await asyncio.sleep(0.1)  # age 0.1 < cap 0.25:续窗 remaining=min(0.5, 0.15)
+        ctl.on_interim("你好呀我想问一下，请问你们")  # grew=4(归一差)
+        await asyncio.sleep(0.4)  # 过 cap(0.25)兜底点——固定窗(0.5)还没到
+        assert enqueue_calls == [final]  # 硬帽到期兜底(非固定窗到期)
+        assert ctl._deferred is None
+
+    asyncio.run(main())
+    expire_rows = [x for x in loop.logs if "INTERP_SPEC defer-expire" in x]
+    assert len(expire_rows) == 1 and "grew=4" in expire_rows[0]
+    assert any("INTERP_SPEC defer-fallback" in x for x in loop.logs)
+
+
+def test_controller_defer_growth_past_cap_expires_immediately():
+    """④b 增长事件到来时已过硬帽(计时器竞态窗):就地过期同步结账,不等下一拍。
+
+    正常节奏下硬帽计时器先响(首窗/续窗都被 cap 封顶),本支只在「增长事件与
+    帽点同拍竞态」时可达——白盒拨 born 模拟,钉的是同步结账不挂下一拍。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=never_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=5.0, defer_max_s=0.2, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        ctl._deferred["born"] -= 1.0  # 竞态姿势:增长事件到时龄已过硬帽(计时器未及处理)
+        ctl.on_interim("你好呀我想问一下，请问你们")
+        assert enqueue_calls == [final]  # 增长事件当场过期(零额外等待)
+        assert ctl._deferred is None
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC defer-expire" in x and "grew=4" in x for x in loop.logs)
+
+
+def test_controller_defer_max_zero_disables_renewal_family():
+    """DEFER_MAX_S=0=续窗整族关:增长事件不续窗不替槽,回 C2 固定窗(旧行为逐字节)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=never_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=0.1, defer_max_s=0.0, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        ctl.on_interim("你好呀我想问一下，请问你们这个集运怎么收费，帮我看看")  # 增长也被无视
+        assert hold.src == ""  # 不替槽
+        await asyncio.sleep(0.3)  # 固定窗 0.1s 到期
+        assert enqueue_calls == [final]
+
+    asyncio.run(main())
+    assert not any("refire" in x for x in loop.logs)
+    assert any("INTERP_SPEC defer-fallback" in x for x in loop.logs)
+    assert any("INTERP_SPEC defer-expire" in x and "grew=0" in x for x in loop.logs)
+
+
+def test_controller_defer_initial_window_capped_by_defer_max():
+    """硬帽同时封顶首窗:cap < wait 时首到期=cap(总 defer 龄恒有界)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+
+    async def never_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=never_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=1.0, defer_max_s=0.15, refire_chars=6,
+    )
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        await asyncio.sleep(0.35)  # 过 cap 0.15(未及固定窗 1.0)
+        assert enqueue_calls == [final]
+
+    asyncio.run(main())
+    assert any("INTERP_SPEC defer-expire" in x for x in loop.logs)
+
+
+def test_controller_refire_stats_counted_when_stats_present():
+    """再投机计入 stats.fired(与 fire 同账面——busy 行的 fired/blocked 口径一致)。"""
+    say_calls: list = []
+    enqueue_calls: list = []
+    stats = {"fired": 0, "blocked": 0, "was": False}
+
+    async def slow_run(span):
+        await asyncio.sleep(30)
+        return ("x", b"y")
+
+    ctl, hold, loop = _mk_controller(
+        run_spec=slow_run, say_calls=say_calls, enqueue_calls=enqueue_calls,
+        spec_wait_s=1.0, defer_max_s=8.0, refire_chars=6,
+    )
+    ctl._stats = stats
+    final = "你好呀我想问一下，请问你们这个集运怎么收费的"
+
+    async def main():
+        _fire_ctl(ctl)
+        assert stats["fired"] == 1
+        await asyncio.sleep(0.01)
+        assert ctl.on_final(final) is True
+        ctl.on_interim("你好呀我想问一下，请问你们这个集运怎么收费，帮我看看")
+        assert stats["fired"] == 2  # 再投机同账
+        assert hold.src == "你好呀我想问一下，请问你们这个集运怎么收费，"
+        ctl.cancel("shutdown")  # 收线卫生:单据+在途任务就地终结
+
+    asyncio.run(main())
+    assert any("refire" in x and "fired=2" in x for x in loop.logs)
+
+
 def test_controller_miss_similarity_discards_ready_slot():
     """就绪 slot 但 final 与 span 前缀比对不过 0.85 → MISS:弃 PCM,零播放。"""
     say_calls: list = []
@@ -587,6 +896,16 @@ def test_spec_env_registered_in_forward_env_and_interp_env():
     """立法双面:_FORWARD_ENV 表 + _interp_env B 线透传白名单同键。"""
     assert '"BOK_INTERP_SPEC_MT",' in ENV_SRC
     assert ENV_SRC.count('"BOK_INTERP_SPEC_MT"') >= 2
+    # S2 defer 自适应两键同姿势(读键=模块常量,静态扫描不认字面量——登记即立法)。
+    for key in ("BOK_INTERP_SPEC_DEFER_MAX_S", "BOK_INTERP_SPEC_REFIRE_CHARS"):
+        assert f'"{key}",' in ENV_SRC
+        assert ENV_SRC.count(f'"{key}"') >= 2  # _FORWARD_ENV + _interp_env 双面
+
+
+def test_spec_machine_never_wired_into_a_line():
+    """A 线零影响钉:agent.py 全文无 spec 机器件引用(控制器只服务 B 线双装配)。"""
+    assert "_SpecMt" not in AGENT_SRC
+    assert "BOK_INTERP_SPEC" not in AGENT_SRC
 
 
 def test_spec_arm_banner_source_pinned():

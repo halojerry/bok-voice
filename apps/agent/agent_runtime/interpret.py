@@ -1672,6 +1672,51 @@ def _interp_spec_wait_s() -> float:
     return min(max(v, 0.0), _SPEC_WAIT_MAX_S)
 
 
+# —— S2·defer 窗口自适应续窗+增 prefix 再投机(2026-10-09,call-4322e14d 六发零中) --
+# 实弹:6 fire/0 hit/5 defer-fallback/1 abort=100% 浪费——C2 固定窗(2.0s)从 final
+# 起算,而投机 MT+TTS 从 fire 起算常要 1.5-3.5s(DeepSeek 假流式首 token 542-2131ms
+# +TTS 排干 +0.5-1s);子句提交坐标系里 fire 与 final 几乎同刻,固定窗结构性必超时
+# (必中体白做,final 付全价 MT)。两刀(拍板方向):
+# ①自适应续窗:defer 期内 interim 仍以 held 前缀开头且更长(说话未完)→ 窗口滚动
+#   重置;硬帽 ``BOK_INTERP_SPEC_DEFER_MAX_S``(缺省 8;0=关回 C2 固定窗=旧行为
+#   逐字节)防无限等——前缀停止增长(新句起步/ASR 修订)=窗口照旧节奏走。
+# ②增 prefix 再投机:候选子句前缀新增内容字 ≥ ``BOK_INTERP_SPEC_REFIRE_CHARS``
+#   (缺省 6,镜像 detector REFIRE_GROWTH_CHARS 口径)→ 更长前缀重发投机替槽
+#   (单飞顶替语义保持——旧任务 cancel 由任务身份守卫豁免结账),让 held 译文与
+#   最终转写同源,避免旧前缀译文在最终确认时相似度不过。
+# 观测:defer-fallback 时打 ``INTERP_SPEC defer-expire age=<实际等待s> grew=<期内
+# 前缀增长字数>``——grew>0=说话没停等到硬帽,grew=0=final 真丢。
+# 不变量:prewarm-and-confirm 绝不提前播;MISS=cancel 在途零错误播出(续窗过期
+# 同样 cancel 在途任务,写回 slot 的值已无人消费);busy 闸 FIFO 深度语义零改;
+# kill-switch ``BOK_INTERP_SPEC_MT`` 不动。两键 _FORWARD_ENV+_interp_env 双面登记。
+_SPEC_DEFER_MAX_ENV = "BOK_INTERP_SPEC_DEFER_MAX_S"
+_SPEC_DEFER_MAX_DEFAULT_S = 8.0
+
+
+def _spec_defer_max_s() -> float:
+    """defer 续窗硬帽秒(纯函数,单测直喂):坏值回缺省 8.0;负数钳 0(=续窗关)。"""
+    raw = os.environ.get(_SPEC_DEFER_MAX_ENV, "")
+    try:
+        v = float(raw) if raw else _SPEC_DEFER_MAX_DEFAULT_S
+    except ValueError:
+        return _SPEC_DEFER_MAX_DEFAULT_S
+    return max(0.0, v)
+
+
+_SPEC_REFIRE_ENV = "BOK_INTERP_SPEC_REFIRE_CHARS"
+_SPEC_REFIRE_DEFAULT = 6
+
+
+def _spec_refire_chars() -> int:
+    """defer 期再投机增长门槛(纯函数,单测直喂):坏值回缺省 6;负数钳 0(=再投机关)。"""
+    raw = os.environ.get(_SPEC_REFIRE_ENV, "")
+    try:
+        v = int(raw) if raw else _SPEC_REFIRE_DEFAULT
+    except ValueError:
+        return _SPEC_REFIRE_DEFAULT
+    return max(0, v)
+
+
 # —— W3b·spec busy 闸放宽(2026-10-08,spec 命中率 4/108 主刀) ---------------------
 # 架构体检实证:busy 闸=FIFO 非空∨MT 在途∨摘译 pending 任一真即封——连续说话时
 # FIFO 常非空+frag hold 期 _mt_busy 恒真,整通只开出 4/108 次投机。两刀:
@@ -2090,6 +2135,8 @@ class _SpecMtController:
         log: Callable[[str], None] = print,
         note_src: Callable[[str], None] | None = None,
         spec_wait_s: float | None = None,
+        defer_max_s: float | None = None,
+        refire_chars: int | None = None,
         stats: dict | None = None,
     ) -> None:
         self._enabled = enabled
@@ -2110,14 +2157,28 @@ class _SpecMtController:
         self._spec_wait_s = (
             _interp_spec_wait_s() if spec_wait_s is None else max(0.0, float(spec_wait_s))
         )
+        # S2(2026-10-09,call-4322e14d):续窗硬帽+再投机门槛(注入 None=env 读数;
+        # 单测可注入定值)。defer_max_s<=0=续窗整族关(回 C2 固定窗旧行为);
+        # refire_chars<=0=只续窗不替槽。
+        self._defer_max_s = (
+            _spec_defer_max_s() if defer_max_s is None else max(0.0, float(defer_max_s))
+        )
+        self._refire_chars = (
+            _spec_refire_chars() if refire_chars is None else max(0, int(refire_chars))
+        )
         self._deferred: dict | None = None  # 在途延迟交付单据(单槽)
 
     # ---- interim 入口 -----------------------------------------------------
     def on_interim(self, text: str) -> None:
         if not self._enabled or self._busy_gate():
             return
-        if self._deferred is not None:
-            return  # C2:延迟交付在途——不再开火(防 hold 被新 span 顶掉竞态)
+        d = self._deferred
+        if d is not None:
+            # S2:延迟交付在途不再开火,但增长中的前缀要吃——滚动续窗/增字再投机。
+            growth = d.get("growth")
+            if growth is not None:
+                growth(str(text or ""))
+            return  # 防 hold 被新 span 顶掉竞态(开火路径不达)
         span = self._detector.feed(text)
         if not span:
             return
@@ -2186,7 +2247,7 @@ class _SpecMtController:
             # 落地再 HIT(零合成直播);兜底/超时=正常入队(_enqueue 自带 note_src
             # 保配对)。sim 先判把「必不中」的 cancel 路前置,只对必中体付等待。
             if task is not None and not task.done() and self._spec_wait_s > 0:
-                return self._defer_hit(final_text, rest, task)
+                return self._defer_hit(final_text, rest, task, span)
             if task is not None and not task.done():
                 task.cancel()
             self._log(f"[interp] INTERP_SPEC miss chars={len(span)} reason=not_ready")
@@ -2203,14 +2264,23 @@ class _SpecMtController:
             self._enqueue(rest)
         return True
 
-    def _defer_hit(self, final_text: str, rest: str, task: asyncio.Task) -> bool:
+    def _defer_hit(self, final_text: str, rest: str, task: asyncio.Task, span: str = "") -> bool:
         """C2:必中在途的有界延迟交付(on_final 是同步回调,等=done_callback+定时)。
 
-        单据 ``_deferred`` 在途时 on_interim 不开火(防 hold 被新 span 顶掉);
-        兜底/超时/失败=``_enqueue(final_text)`` 正常管线(该闭包自带 note_src,
-        与 HIT 余段同源——on_final 已回 True,调用方跳过的记账由它补)。
+        S2(2026-10-09):单据带上 born/grew/span0 三件——defer 期内 on_interim 经
+        ``_growth`` 吃「held 前缀仍在增长」信号滚动续窗(硬帽封顶)+增字再投机
+        替槽;增长停滞=窗口照旧节奏走(旧行为),到期=``_enqueue(final_text)``
+        正常管线兜底(该闭包自带 note_src,与 HIT 余段同源——on_final 已回
+        True,调用方跳过的记账由它补)。
         """
-        state: dict = {"done": False, "timer": None}
+        state: dict = {
+            "done": False,
+            "timer": None,
+            "born": time.monotonic(),
+            "grew": 0,  # defer 期内前缀增长字数(defer-expire 区分「说话没停」vs「final 真丢」)
+            "task": task,
+            "span0": _spec_norm(span),  # defer 时刻 held 前缀(增长/再投机基线)
+        }
         self._deferred = state
         self._log(
             f"[interp] INTERP_SPEC defer chars={len(final_text)} wait_s={self._spec_wait_s:g}"
@@ -2227,8 +2297,15 @@ class _SpecMtController:
                 timer.cancel()
             text = "" if from_cancel else self.hold.text
             pcm = b"" if from_cancel else self.hold.pcm
+            self.hold.src = ""  # S2 再投机可能回填过 src:结账一律清
+            self.hold.task = None
             self.hold.text = ""
             self.hold.pcm = b""
+            inflight = state.get("task")
+            if inflight is not None and not inflight.done():
+                # MISS=cancel 在途(续窗过期同档):写回 slot 的译文已无人消费,
+                # 留着只会白烧 MT/TTS 并在下一发开火前污染 slot。
+                inflight.cancel()
             if text and pcm:
                 try:
                     self._say_cached(final_text, text, pcm)
@@ -2239,22 +2316,96 @@ class _SpecMtController:
                 except Exception as exc:  # noqa: BLE001 - 播放失败走兜底入队
                     self._log(f"[interp] INTERP_SPEC say failed: {exc!r}")
             self._enqueue(final_text)
+            self._log(
+                f"[interp] INTERP_SPEC defer-expire age={time.monotonic() - state['born']:.2f}s "
+                f"grew={state['grew']}"
+            )
             self._log(f"[interp] INTERP_SPEC defer-fallback chars={len(final_text)}")
 
         def _on_task_done(t: asyncio.Task) -> None:
+            if state.get("task") is not t:
+                return  # S2 再投机顶替:旧任务退场不再结账(单据已归新任务)
             try:
                 exc = t.exception()
             except asyncio.CancelledError:
                 exc = RuntimeError("cancelled")
             _settle(exc is not None)
 
+        def _expire() -> None:
+            _settle(False)
+
+        def _growth(text: str) -> None:
+            """S2:held 前缀仍在增长(说话未完)→ 窗口滚动重置+增字再投机替槽。
+
+            interim 归一不再以 held 前缀开头(新句起步/ASR 修订)=零动作(窗口照
+            旧节奏走=旧行为);硬帽到顶=就地过期。refire 单飞顶替:旧任务 cancel
+            由 ``_on_task_done`` 身份守卫豁免结账,新任务接管单据与 slot。"""
+            if state["done"]:
+                return
+            cap = self._defer_max_s
+            if cap <= 0:
+                return  # 续窗整族关:回 C2 固定窗(旧行为逐字节)
+            n = _spec_norm(text)
+            s0 = state["span0"]
+            if not n or not n.startswith(s0) or len(n) <= len(s0):
+                return
+            state["grew"] = max(state["grew"], len(n) - len(s0))
+            now = time.monotonic()
+            if now - state["born"] >= cap:
+                _expire()  # 硬帽到顶:停止等待(防无限等)
+                return
+            remaining = min(self._spec_wait_s, state["born"] + cap - now)
+            if remaining <= 0:
+                _expire()
+                return
+            timer = state.get("timer")
+            if timer is not None:
+                timer.cancel()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # 无 loop(理论不可达,事件回调必在 loop 线程):让旧窗照走
+                return
+            state["timer"] = loop.call_later(remaining, _expire)
+            if self._refire_chars <= 0:
+                return  # 再投机关:只续窗不替槽
+            cand = _spec_clause_prefix(text)
+            if cand is None:
+                return
+            s2 = _spec_norm(cand)
+            grew_span = len(s2) - len(s0)
+            if grew_span <= 0 or grew_span < self._refire_chars:
+                return  # 候选没长够(边界未前进/增幅不足):照旧等原投机
+            old = state.get("task")
+            state["task"] = None
+            if old is not None and not old.done():
+                old.cancel()  # 单飞顶替(身份守卫:旧任务退场不再结账)
+            hold = self.hold
+            hold.src = cand
+            hold.text = ""
+            hold.pcm = b""
+            new_task = asyncio.create_task(self._fire(cand))
+            hold.task = new_task
+            state["task"] = new_task
+            new_task.add_done_callback(_on_task_done)
+            if self._stats is not None:
+                self._stats["fired"] = self._stats.get("fired", 0) + 1
+                self._log(
+                    f"[interp] INTERP_SPEC refire chars={len(cand)} grew={grew_span} "
+                    f"fired={self._stats['fired']} blocked={self._stats.get('blocked', 0)}"
+                )
+            else:
+                self._log(f"[interp] INTERP_SPEC refire chars={len(cand)} grew={grew_span}")
+
+        state["growth"] = _growth
         task.add_done_callback(_on_task_done)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # 理论不可达(事件回调必在 loop 线程)——防御直兜底
             _settle(True)
             return True
-        state["timer"] = loop.call_later(self._spec_wait_s, lambda: _settle(False))
+        cap = self._defer_max_s
+        total = self._spec_wait_s if cap <= 0 else min(self._spec_wait_s, cap)
+        state["timer"] = loop.call_later(total, _expire)
         return True
 
     # ---- 生命周期 ---------------------------------------------------------
