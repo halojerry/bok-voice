@@ -393,6 +393,9 @@ def _turn_handling_opts() -> dict:
             # 同传语义:manual 模式下框架不再自动回复,此开关只余「音频活动打断
             # 译文」一条路,恒关。字段保留为显式声明+防未来框架行为变化。
             "enabled": False,
+            # 2026-10-09 Ethan 挖出总根因:框架缺省 True=播放期麦克风帧被静音替换
+            # 后喂 STT——同传全双工必须 False(播放期用户语音继续进 ASR)。
+            "discard_audio_if_uninterruptible": False,
             "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "0.6")),
             "min_words": 0,
             "resume_false_interruption": os.environ.get("RESUME_FALSE_INTERRUPTION", "1") == "1",

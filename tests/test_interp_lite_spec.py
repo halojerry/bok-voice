@@ -544,3 +544,469 @@ class FakeTTS:
     def synthesize(self, text):
         self.synth_calls.append(text)
         return _FakeSynthStream(b"\x07" * 32)
+
+
+# ---- W8-B 播放解耦（pump 排干即推进：播放时间=准备时间） -------------------------
+#
+# 病灶（HEAD 基线）：run 等 gen 排干=等框架播完本句才推进 FIFO——上一段播报期间
+# 下一单元 MT 结构性不起跑（实弹尾巴单元 first_ms 6-7.8s=上一段播报时长）。
+# 前兵 stash 版改法三处致死（本组测试逐条钉死回归）：
+# ① run `wait_for(pump_task)`：gen 收尾 cancel 泵时 CancelledError 抬进 run=
+#    整条 FIFO 死（进行性断流根因）——cancel 必须终结在泵内（test_..._barge_in）。
+# ② say 前串行闸（prev.wait_for_playout 90s）：提交时点回退=解耦白做。
+# ③ 催尾挂 SpeechHandle 回调+闸读 `self._last_say`：竞态下提前 task_flush 毒化
+#    bidi flushed 握手（sentences=0 族）——催尾安全时点=playout 落地，触发器=
+#    本地句柄观察者+newest 护栏（test_..._watcher_*）。
+
+
+class _LazySession:
+    """gen 只登记不消费：say 未被框架拉取=「正在播放/排队」姿势（解耦靶形）。"""
+
+    def __init__(self):
+        self.gens: list = []
+        self.texts: list[str] = []
+
+    def say(self, x, audio=None):
+        if hasattr(x, "__aiter__"):
+            self.gens.append(x)
+        else:
+            self.texts.append(str(x))
+        return x
+
+
+class _FakeHandle:
+    """真 SpeechHandle 最小面：wait_for_playout（事件放行）+ interrupted。"""
+
+    def __init__(self):
+        self._done = asyncio.Event()
+        self.interrupted = False
+
+    async def wait_for_playout(self):
+        await self._done.wait()
+
+    def release(self):
+        self._done.set()
+
+
+class _HandleSession:
+    """say 返回 _FakeHandle；gen 不消费（排队/播放中由测试控制何时落地）。"""
+
+    def __init__(self):
+        self.handles: list[_FakeHandle] = []
+        self.gens: list = []
+        self.texts: list[str] = []
+
+    def say(self, x, audio=None):
+        h = _FakeHandle()
+        self.handles.append(h)
+        if hasattr(x, "__aiter__"):
+            self.gens.append(x)
+        else:
+            self.texts.append(str(x))
+        return h
+
+
+class _SlowMT:
+    """脚本化 MT：calls[i] = {"pieces": [...], "gap": s, "hold": s}。
+
+    pieces 逐片吐（片间可 gap）；hold=吐完后挂死 N 秒（流悬挂靶形）。
+    closed[i] 记录每条流终结（自然完/aclose 都算——挂死流只能经 cancel→
+    finally→aclose 收场）。"""
+
+    def __init__(self, calls):
+        self._calls = list(calls)
+        self.started: list[int] = []
+        self.closed: list[int] = []
+        self.last_metrics: dict = {}
+
+    async def stream(self, msgs):
+        self.started.append(len(self.started))
+        idx = len(self.started) - 1
+        item = self._calls.pop(0)
+        try:
+            for d in item["pieces"]:
+                yield d
+                if item.get("gap"):
+                    await asyncio.sleep(item["gap"])
+            if item.get("hold"):
+                await asyncio.sleep(item["hold"])
+        finally:
+            self.closed.append(idx)
+
+
+def test_w8b_run_advances_while_say_unpulled(monkeypatch):
+    """解耦核心：上一句 gen 永不被拉取（播放中/排队姿势）时，后续单元 MT 照常
+    起跑、排干、配对入账——run 不等播放（旧码 done-wait 此处结构性卡死）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    trans = ["你好世界今天。", "第二句译文好。", "第三句也完成。"]
+    mt = FakeMT([iter([t]) for t in trans])
+    lag = FakeLag()
+    p = InterpPipeline(
+        _LazySession(), mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=lag, first_ms={"ms": 0},
+    )
+
+    async def scenario():
+        for u in ("第一句", "第二句", "第三句"):
+            p.enqueue_raw(u)
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if p.q.empty() and len(lag.dones) >= 3 and len(p.session.gens) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    assert len(p.session.gens) == 3  # 三个流式 say 全部提交（播放次序由框架保序）
+    assert p.session.texts == []  # ≥4 字全走流式路（零整句直念）
+    assert [t for _s, t in p.pairs] == trans
+    assert len(lag.dones) == 3 and lag.notes == ["第一句", "第二句", "第三句"]
+    assert p.mt_busy["flag"] is False  # run 已空转（busy 旗复位）
+
+
+def test_w8b_fifo_submission_order_uneven_mt(monkeypatch):
+    """首句 MT 慢、后续快：run 串行推进，gen 提交序与配对序严格=FIFO 序
+    （保序铁律—— uneven MT 不换序、不重排）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+
+    class _StaggerMT:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, msgs):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(0.15)  # 首句 MT 显著慢于后续
+                yield "第一句译文够长。"
+            else:
+                yield f"第{self.calls}句译文够长。"
+
+    lag = FakeLag()
+    p = InterpPipeline(
+        _LazySession(), _StaggerMT(), "SYS", target_lang="zh", voice_tags=True,
+        lag=lag, first_ms={"ms": 0},
+    )
+
+    async def scenario():
+        for u in ("a", "b", "c"):
+            p.enqueue_raw(u)
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if len(lag.dones) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    assert [t for _s, t in p.pairs] == [
+        "第一句译文够长。", "第2句译文够长。", "第3句译文够长。",
+    ]
+    assert len(p.session.gens) == 3  # 提交序=配对序=FIFO 序
+
+
+def test_w8b_pairing_exactly_once_mixed_paths(monkeypatch):
+    """正常/空译/异常重试/语言门违约四形状混跑：每句恰好一次 done|drop（RC-8
+    配对纪律解耦后不破），无重复配对、无吞账。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    mt = FakeMT([
+        iter(["你好世界今天。"]),          # 正常流式
+        iter([]),                          # 空译 → drop
+        RuntimeError("mt boom"),           # 泵捕获 → error_pre → 整句重试
+        iter(["好的马上帮您处理。"]),      # 异常句的重试流
+        iter(["hello world english out"]),  # 语言门违约（默认开）→ gate → 重试
+        iter(["这是回退中文译文。"]),      # gate 句的重试流
+    ])
+    lag = FakeLag()
+    p = InterpPipeline(
+        _LazySession(), mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=lag, first_ms={"ms": 0},
+    )
+
+    async def scenario():
+        for u in ("正常句", "空译句", "异常句", "外语句"):
+            p.enqueue_raw(u)
+        task = asyncio.create_task(p.run())
+        for _ in range(500):
+            if p.q.empty() and len(lag.dones) + len(lag.drops) >= 4:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+    assert len(lag.notes) == 4  # 每句恰好一次 note_src
+    assert len(lag.dones) == 3 and len(lag.drops) == 1  # 恰好一次 done|drop
+    assert [t for _s, t in p.pairs] == [
+        "你好世界今天。", "好的马上帮您处理。", "这是回退中文译文。",
+    ]
+
+
+def test_w8b_barge_in_gen_cancel_does_not_kill_run(monkeypatch):
+    """断流复现回归（前兵 stash 版死法）：播放端 gen 被 cancel（框架 barge-in
+    姿势）连带 cancel 在途泵——cancel 必须终结在泵内（哨兵/事件由 finally 兜），
+    run 循环继续消化后续单元。stash 版 run `await pump_task`，泵 cancel 的
+    CancelledError 抬进 run=整条翻译链死亡（进行性断流根因）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    mt = _SlowMT([
+        {"pieces": ["你好世界", "今天很好"], "gap": 0.05},  # 慢流：拉一片后被打断
+        {"pieces": ["第二句译文完整。"]},
+        {"pieces": ["第三句译文完整。"]},
+    ])
+    lag = FakeLag()
+
+    class _BargeInSession:
+        """首句 gen 吐第一片后 cancel 拉取任务（框架打断姿势），其余只登记。"""
+
+        def __init__(self):
+            self.gens: list = []
+            self.pulled: list[list[str]] = []
+            self.first_task = None
+
+        def say(self, x, audio=None):
+            self.gens.append(x)
+            if len(self.gens) == 1 and hasattr(x, "__aiter__"):
+                bucket: list[str] = []
+                self.pulled.append(bucket)
+
+                async def _pull():
+                    async for piece in x:
+                        bucket.append(piece)
+
+                self.first_task = asyncio.get_running_loop().create_task(_pull())
+            return x
+
+    sess = _BargeInSession()
+    p = InterpPipeline(
+        sess, mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=lag, first_ms={"ms": 0},
+    )
+
+    async def scenario():
+        for u in ("一", "二", "三"):
+            p.enqueue_raw(u)
+        task = asyncio.create_task(p.run())
+        for _ in range(200):  # 等首句 gen 吐出第一片（此刻泵仍在飞）
+            if sess.pulled and sess.pulled[0]:
+                break
+            await asyncio.sleep(0.01)
+        assert sess.pulled and sess.pulled[0][:1] == ["你好世界"]
+        sess.first_task.cancel()  # 打断：gen 收尾 → 泵被连带 cancel
+        with _suppress_cancel():
+            await sess.first_task
+        for _ in range(500):  # run 必须存活并消化完后续两单元
+            if len(lag.dones) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+    assert len(lag.notes) == 3
+    assert len(lag.dones) == 3  # run 存活：三句全部配对（stash 版此处=0，run 已死）
+    assert [t for _s, t in p.pairs][1:] == ["第二句译文完整。", "第三句译文完整。"]
+
+
+def test_w8b_stalled_mt_stream_deadline_recovers(monkeypatch):
+    """MT 流挂死（吐一片后永不再增量）：run 超时兜底 cancel 泵 → 整句回退 →
+    后续单元照常——FIFO 永不因单句流挂死停摆；挂死流被 aclose（无僵尸解码）。"""
+    import agent_runtime.interp_lite.pipeline as pipeline_mod
+
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    monkeypatch.setattr(pipeline_mod, "_SENT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(pipeline_mod, "_SENT_TIMEOUT_GRACE_S", 0.05)
+    mt = _SlowMT([
+        {"pieces": ["你"], "hold": 30.0},        # 一片（<4 字=零 yield）后挂死
+        {"pieces": ["好的这是兜底回退译文。"]},  # 挂死句的整句重试流
+        {"pieces": ["下一句译文完整过关。"]},
+    ])
+    lag = FakeLag()
+    p = InterpPipeline(
+        _LazySession(), mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=lag, first_ms={"ms": 0},
+    )
+
+    async def scenario():
+        p.enqueue_raw("挂死句")
+        p.enqueue_raw("后续句")
+        task = asyncio.create_task(p.run())
+        for _ in range(500):
+            if len(lag.dones) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+    assert len(lag.dones) == 2  # 挂死句走重试完成+后续句照常
+    assert 0 in mt.closed  # 挂死流被 cancel→finally→aclose 收场（无僵尸）
+    assert [t for _s, t in p.pairs] == ["好的这是兜底回退译文。", "下一句译文完整过关。"]
+
+
+def test_w8b_shutdown_cancels_pump_and_watchers(monkeypatch):
+    """shutdown 收线：在途泵+催尾观察者全部 cancel（不悬挂、不外抛）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
+    mt = _SlowMT([{"pieces": ["第一句译文够长。"], "gap": 0.05, "hold": 30.0}])
+    sess = _HandleSession()
+    p = InterpPipeline(
+        sess, mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=FakeLag(), first_ms={"ms": 0},
+    )
+    calls: list[int] = []
+
+    async def _flush():
+        calls.append(1)
+
+    p._tail_flush = _flush
+
+    async def scenario():
+        p.enqueue_raw("第一句")
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if sess.handles and not p.mt_busy["flag"]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert calls == [] and p._playout_watchers["n"] == 1  # 泵在途：观察者武装
+        task.cancel()  # 生产序：run 先收线（worker _shutdown 同序），再 pipeline.shutdown
+        with _suppress_cancel():
+            await task
+        p.shutdown()
+        await asyncio.sleep(0.05)
+        assert p._playout_watchers["n"] == 0  # 观察者被收线 cancel，计数回落
+        assert calls == []  # 未落地零催尾
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_w8b_tail_flush_watcher_fires_at_playout_done(monkeypatch):
+    """真 SpeechHandle 形状：催尾只在 playout 落地后发（泵排干≠文本推送完成，
+    提前催尾毒化 bidi flushed 握手）；run 循环位被观察者在途闸压制。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
+    mt = FakeMT([iter(["第一句译文够长。"])])
+    sess = _HandleSession()
+    p = InterpPipeline(
+        sess, mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=FakeLag(), first_ms={"ms": 0},
+    )
+    calls: list[int] = []
+
+    async def _flush():
+        calls.append(1)
+
+    p._tail_flush = _flush
+
+    async def scenario():
+        p.enqueue_raw("第一句")
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if sess.gens and p.q.empty() and not p.mt_busy["flag"]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert calls == []  # 泵已排干但 playout 未落地：不催（毒化窗口）
+        sess.handles[0].release()
+        for _ in range(100):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert calls == [1]  # playout 落地=恰一枚
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_w8b_tail_flush_newest_guard_and_interrupted(monkeypatch):
+    """旧句 playout 落地时已被新句接棒=让位不催；最新句被掐=不催；恒至多一枚
+    活催尾（前兵回调版竞态下会对错误句柄判闸=提前毒化）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
+    mt = FakeMT([iter(["第一句译文够长。"]), iter(["第二句译文够长。"])])
+    sess = _HandleSession()
+    p = InterpPipeline(
+        sess, mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=FakeLag(), first_ms={"ms": 0},
+    )
+    calls: list[int] = []
+
+    async def _flush():
+        calls.append(1)
+
+    p._tail_flush = _flush
+
+    async def scenario():
+        p.enqueue_raw("第一句")
+        p.enqueue_raw("第二句")
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if len(sess.gens) >= 2 and p.q.empty() and not p.mt_busy["flag"]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert calls == []
+        sess.handles[0].release()  # 旧句落地：已被新句接棒 → 让位
+        await asyncio.sleep(0.05)
+        assert calls == []
+        sess.handles[1].interrupted = True  # 最新句被掐：不催
+        sess.handles[1].release()
+        await asyncio.sleep(0.05)
+        assert calls == []
+        assert p._playout_watchers["n"] == 0  # 两观察者都已退场
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_w8b_tail_flush_zero_yield_text_say_takes_over(monkeypatch):
+    """零 yield 整句直念接棒：text 句柄成为 newest——gen 句柄先落地让位、text
+    句柄落地才催且恰一枚（重试/整句路同样接棒观察者）。"""
+    monkeypatch.delenv("BOK_INTERP_SPEC_MT", raising=False)
+    monkeypatch.delenv("BOK_INTERP_TAIL_FLUSH", raising=False)
+    mt = FakeMT([iter(["好。"])])  # 2 字 < 软证据窗 → 零 yield → 整句直念
+    sess = _HandleSession()
+    p = InterpPipeline(
+        sess, mt, "SYS", target_lang="zh", voice_tags=True,
+        lag=FakeLag(), first_ms={"ms": 0},
+    )
+    calls: list[int] = []
+
+    async def _flush():
+        calls.append(1)
+
+    p._tail_flush = _flush
+
+    async def scenario():
+        p.enqueue_raw("短句")
+        task = asyncio.create_task(p.run())
+        for _ in range(300):
+            if len(sess.handles) >= 2 and p.q.empty() and not p.mt_busy["flag"]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert calls == [] and p._playout_watchers["n"] == 2  # gen+text 双观察者
+        sess.handles[0].release()  # gen 句柄落地：已被 text 接棒 → 让位
+        await asyncio.sleep(0.05)
+        assert calls == []
+        sess.handles[1].release()  # text 句柄落地：催一枚
+        for _ in range(100):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert calls == [1]
+        task.cancel()
+        with _suppress_cancel():
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))

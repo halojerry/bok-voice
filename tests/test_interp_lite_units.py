@@ -186,8 +186,9 @@ def test_first_block_cut_pure():
     assert _first_block_cut("我想请你们帮我看", "我想请你们帮我看") == 8
     # 首次目击（prev_full 空=未稳定）不切。
     assert _first_block_cut("我想请问，你们", "") is None
-    # 数字 run 不被劈开（切点推到 run 结束后的边界，绝不落在 run 中间）。
-    assert _first_block_cut("单号AB12345，好的", "单号AB12345，好的") == 9
+    # W8-B 词计修订：数字 run 边界被 run 门拒绝后，词计下本形状仅 5 内容单位
+    # < 8 → 保险丝不火（余段有标点=「有标点优先等标点」）→ None（等标点稳定）。
+    assert _first_block_cut("单号AB12345，好的", "单号AB12345，好的") is None
 
 
 def test_first_block_wiring_lite_only(monkeypatch):
@@ -326,18 +327,25 @@ def test_server_definite_commits_stream():
 
 
 def test_len_fuse_cut_pure():
-    """长度保险丝切点纯函数：内容字计数/ASCII run 防劈/门槛不足 None。"""
+    """长度保险丝切点纯函数：内容字计数/ASCII run 防劈/门槛不足 None。
+
+    W8-B 词计修订（2026-10-09）：拉丁/数字连续 run 改计 1 词（原子消费=词界
+    铁闸，切点结构性不可能落 run 中间）——旧逐字计权让保险丝在「mini Max 开」
+    处硬剁（call-fa95543a）。"""
     from agent_runtime.providers.doubao_asr import _len_fuse_cut
 
     # 攒够 6 个内容字（标点/空白不计）→ 切点在其后。
     assert _len_fuse_cut("你好世界今天天气很好", 0, 6) == 6
     assert _len_fuse_cut("你好，世界。今天天气", 0, 6) == 8  # 标点占位不计内容字（第6内容字=今@7→切8）
-    # ASCII run 防劈：门槛落在 run 内 → 后移到 run 尾（单号 7890123 不劈）。
+    # ASCII run 防劈（W8-B 词界铁闸）：run 原子消费计 1 词，切点绝不落 run 内
+    # ——门槛落在 run 后的 CJK 时切点仍在 run 完整之后。
     s = "订单号是七八九零一二三四五六"  # 12 内容字无 ASCII run
     assert _len_fuse_cut(s, 0, 6) == 6  # 无 run：门槛即切
-    s2 = "单号 ABC12345 后面还有内容"
-    cut = _len_fuse_cut(s2, 0, 4)  # 门槛落在 ABC12 内 → 推到 run 尾
-    assert s2[:cut].endswith("ABC12345")
+    s2 = "单号 ABC12345 后面还有内容"  # 单1 号2 run=3 后=4 → 4 单位门槛切在「后」尾
+    cut = _len_fuse_cut(s2, 0, 4)
+    assert s2[cut - 1] == "后" and "ABC12345" in s2[:cut]  # run 完整在切点之前（不劈）
+    # 词界铁闸直接钉（W8-B）：切点只在 run 尾之后，永不落 run 中间（两 run 由空格分隔）。
+    assert _len_fuse_cut("abc 1234 efgh", 0, 2) == 8  # abc=1、1234=2 → 切第二 run 尾
     # 门槛不足 → None。
     assert _len_fuse_cut("太短", 0, 6) is None
     # start 偏移（已提交前缀之后）。

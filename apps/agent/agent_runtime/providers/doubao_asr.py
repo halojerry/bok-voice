@@ -26,6 +26,31 @@
   FINAL_TRANSCRIPT（说话中 MT 起跑）；committed-prefix 对齐剥已交前缀
   （partial 修订绝不回滚已发出的 FINAL：失配记日志+重置对齐）；VAD END 只补
   未提交尾巴。``clause_commit=False``（A 线缺省不传）=逐字节旧路。
+- **合并档（server_utt+clause_commit 同开，lite 缺省 2026-10-09 W8）**：服务端
+  definite 分句为主 + 本地意群档（逗号/长度保险丝/快启动）补连续语流句中切分
+  ——server-utt 单档实证（call-fb236e61）：连续语流 definite 只在停嘴出现
+  （72 字单段单 definite）＝「等说完才出声」。两源共享 ``_cc_committed_*``
+  坐标系，definite 消费做坐标协调+差量 FINAL（definite ⊆ 已提交=不重发；
+  ⊇=收口+只发尾巴；双失配=退累积）。``BOK_INTERP_SERVER_UTT=0`` 仍回本地闸档。
+- **段切换互斥（W8-A3 2026-10-09）**：在途收段（尾窗到期/端窗看门狗的
+  detached finalize）经 ``_fin_task`` 登记，新段 START 先
+  ``_await_inflight_finalize`` 等落地（含 ``_reset_segment``）再开新会话/喂帧
+  ——旧版竞态会把新段段缓冲/坐标连锅端（空 final/吞句根因）。
+- **互斥硬化（W8-B 2026-10-09，三通实弹「第 3 轮起翻译侧全哑」进行性断流）**：
+  ①END 内联收段包异常隔离（原版 ``_finalize_utterance`` 任一异常直接打死
+  ``_recognize``→整流永久哑=断流主根因）；②取消途中收段（``_wd_cancel`` 撞上
+  已进收段的看门狗任务放行不 cancel；两路 watcher 收段被 cancel 时复位
+  ``_finishing``+段坐标再重抛——悬挂 finish 旗会把后续 INFERENCE_DONE 喂帧全拦
+  =次根因）；③END 分支撞在途收段等落地让位（双 finalizer 并飞写花同一段状态）；
+  ④``_await_inflight_finalize`` 带 shield+超时兜底（收段楔死永不落地时本侧强制
+  复位，绝不带悬挂状态继续哑）。
+- **切口质量（W8-B 2026-10-09，call-fa95543a「mini Max 开」劈词）**：提交闸
+  字数门改内容单位计（``_clause_content_units``：CJK 逐字、拉丁/数字 run 计 1 词
+  ——拉丁逐字计权虚增让字数闸形同虚设）；``_len_fuse_cut`` 词界铁闸=ASCII run
+  原子消费（切点结构性不可能落 run 中间）；顿号（、）权重压到逗号之下
+  （攒满 ``_DUNHAO_COMMIT_MIN_UNITS`` 内容单位才切——顿号是列举符不是句界）；
+  长度保险丝降级为防饿死兜底（余段有真标点在望绝不硬剁，``_remainder_has_punct``
+  让位等标点档；缺省 20 单位不变）。
 
 总闸 ``BOK_DOUBAO_ASR``（缺省开，=0 时装配点回退本地 Qwen3-ASR；装配点读法见
 agent.py / interpret.py 的 provider 分支）。凭据/端点由设置面（asr 段）经装配点
@@ -64,6 +89,14 @@ _FINAL_TIMEOUT_S = 6.0
 # 单测 monkeypatch 本常量提速）。
 _END_WINDOW_WATCHDOG_S = 2.0
 _END_WINDOW_WATCHDOG_TICK_S = 0.25
+# 段切换互斥的等待兜底帽（W8-B）：合法收段最坏链=final 等待 6s+整段单发重试
+# ~10s（final_timeout+4）≈16s——20s 恒不误伤合法收段，只兜「永不落地」的楔死。
+# 常量不设 env（互斥是结构正确性不值得运营面；单测 monkeypatch 提速）。
+_FIN_AWAIT_TIMEOUT_S = 20.0
+# 顿号档（W8-B 切口质量）：顿号=列举符不是句界——与逗号同门槛会把「A、B、C、」
+# 列举切成机关枪碎片。攒满本档内容单位才在顿号处切（任务定档 12-16 取 12；
+# 与逗号档取 max=运营抬逗号档时顿号档跟随）。
+_DUNHAO_COMMIT_MIN_UNITS = 12
 
 # 火山 SAUC 二进制帧（V3 协议族；官方 demo protocol.py 语义）
 MSG_FULL_CLIENT_REQ = 0b0001
@@ -197,8 +230,12 @@ def _find_clause_cut(
     返回边界后坐标（排他）或 None。门（参数沿 A 线语义，缺一不可）：
     - 限速：距上次提交 < ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S``（B 线 worker
       env=1.0；A 线缺省 1.5——本闸只在 clause_commit 流生效）不提交；
-    - 字数：强句边界候选 ≥ ``_ASR_SENTENCE_MIN_CHARS``(6)；子句边界候选 ≥
-      ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS``（B 线 worker env=6）；
+    - 字数（W8-B 改内容单位计，``_clause_content_units``：CJK 逐字、拉丁/数字
+      run 计 1 词——拉丁逐字计权虚增让闸形同虚设，实弹切出「mini Max 开」劈词）：
+      强句边界候选 ≥ ``_ASR_SENTENCE_MIN_CHARS``(6)；逗号/分号类子句边界 ≥
+      ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS``（B 线 worker env=6）；**顿号（、）
+      权重低于逗号** ≥ max(逗号档, ``_DUNHAO_COMMIT_MIN_UNITS``)=12 单位起
+      （列举符不是句界，防机关枪碎片）；
     - 数字 run 保护：候选段含 ≥4 位连续 ASCII 字母/数字 run（单号/号码高危）
       → 该边界不切、继续往后扫同段必再败 → 整段留给 EOS 尾巴兜底；
     - 跨 interim 稳定：上一 interim 全文同坐标与当前逐字一致（首现不提交，
@@ -226,10 +263,16 @@ def _find_clause_cut(
             j = i + 1
             while j < len(text) and text[j] in punct:
                 j += 1
-            min_chars = _ASR_SENTENCE_MIN_CHARS if strong else _clause_commit_min_chars()
+            if strong:
+                min_chars: int = _ASR_SENTENCE_MIN_CHARS
+            elif text[i] == "、":
+                # 顿号档：列举符权重低于逗号——攒满 12 单位才切（W8-B）。
+                min_chars = max(_clause_commit_min_chars(), _DUNHAO_COMMIT_MIN_UNITS)
+            else:
+                min_chars = _clause_commit_min_chars()
             sentence = text[start:j]
             if (
-                len(sentence) >= min_chars
+                _clause_content_units(sentence) >= min_chars
                 and not _has_latin_or_digit_run(sentence, min_len=4)
                 and prev_full[start:j] == sentence
             ):
@@ -240,33 +283,93 @@ def _find_clause_cut(
     return None
 
 
+def _clause_content_units(text: str) -> int:
+    """提交闸的内容字权重（纯函数，W8-B 切口质量；单测直喂）。
+
+    CJK 逐字=1；连续 ASCII 字母/数字 run=**1 词**（``mini Max 开``=3 单位，
+    旧 len 口径=10——拉丁字母逐字计权让 12 字闸形同虚设，实弹切出
+    「mini Max 开」劈「开放平台」词，call-fa95543a）。标点/空白不计。"""
+    n = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isascii() and ch.isalnum():
+            n += 1
+            while i < len(text) and text[i].isascii() and text[i].isalnum():
+                i += 1
+            continue
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P"):
+            n += 1
+        i += 1
+    return n
+
+
+def _remainder_has_punct(text: str, start: int) -> bool:
+    """未提交余段是否存在「够得着」的标点边界（纯函数，W8-B「有标点优先等标点」）。
+
+    够得着=边界前已攒够对应档的内容单位（强句 ≥``_ASR_SENTENCE_MIN_CHARS``、
+    逗号/分号 ≥逗号档、顿号 ≥``_DUNHAO_COMMIT_MIN_UNITS``）——只对这些边界让
+    位：真标点在望时绝不在无标点处硬剁（长度保险丝降级为防饿死兜底；实弹靶形
+    「Mini Max 开放平台 API 接口能力概览，」逗号前 21 单位够格却被 10 字硬剁）。
+    门槛之下的早标点（「好的，」2 单位）结构性永远过不了标点档、不算在望——
+    否则保险丝被永久废掉=防饿死本职失守（无标点长流重新饿死）。"""
+    from .livekit_plugins import (  # noqa: PLC0415 - 懒 import：保持轻导入面
+        _ASR_SENTENCE_MIN_CHARS,
+        _SENTENCE_STRONG_PUNCT,
+        _SENTENCE_WEAK_PUNCT,
+        _clause_commit_min_chars,
+    )
+
+    comma_min = _clause_commit_min_chars()
+    dunhao_min = max(comma_min, _DUNHAO_COMMIT_MIN_UNITS)
+    n = 0
+    for ch in text[start:]:
+        if ch in _SENTENCE_STRONG_PUNCT:
+            if n >= _ASR_SENTENCE_MIN_CHARS:
+                return True
+        elif ch == "、":
+            if n >= dunhao_min:
+                return True
+        elif ch in _SENTENCE_WEAK_PUNCT:
+            if n >= comma_min:
+                return True
+        elif not ch.isspace() and not unicodedata.category(ch).startswith("P"):
+            n += 1
+    return False
+
+
 def _len_fuse_cut(text: str, start: int, min_chars: int) -> int | None:
     """长度保险丝切点（纯函数，2026-10-09 W6×interp-lite 合流；单测直喂）。
 
     标点档（``_find_clause_cut``）只在标点边界提交——无标点连续语流（长句/
     地址/一气呵成形）结构性等句号/EOS，句档下两句并成一单=译文轨饿出巨型
     天窗（实弹 call-d6704474：26.3s 窗，根因 119 字单 commit）。本函数在
-    ``[start:]`` 攒够 ``min_chars`` **内容字**（非空白/标点）后找安全切点：
-    切位后一个字符不得是 ASCII 字母数字（防劈单号/号码 run——``_find_clause_cut``
-    的数字 run 纪律同源）；攒不够/只在 run 内= None（等下轮 interim）。
+    ``[start:]`` 攒够 ``min_chars`` **内容单位**（CJK 逐字、拉丁/数字 run 计
+    1 词——拉丁逐字计权虚增让保险丝在「mini Max 开」处硬剁，call-fa95543a）
+    后找安全切点。**词界铁闸**：连续 ASCII 字母/数字 run 原子消费，切点只准
+    落在 run 尾之后——结构性不可能劈开单号/英文词（CJK 分支切点两侧至多是
+    「CJK|run 首」，同样不出 run）。攒不够= None（等下轮 interim）。
     稳定性与限速由调用方门控（与标点档同判据）。
     """
     n = 0
     i = start
     while i < len(text):
         ch = text[i]
+        if ch.isascii() and ch.isalnum():
+            j = i
+            while j < len(text) and text[j].isascii() and text[j].isalnum():
+                j += 1
+            n += 1  # 连续 ASCII 字母/数字 run 计 1 词（原子消费=词界铁闸）
+            if n >= min_chars:
+                return j  # 切点在 run 尾之后（绝不落 run 中间）
+            i = j
+            continue
         if not ch.isspace() and not unicodedata.category(ch).startswith("P"):
             n += 1
             if n >= min_chars:
-                j = i + 1
-                if (
-                    j < len(text)
-                    and ch.isascii() and ch.isalnum()
-                    and text[j].isascii() and text[j].isalnum()
-                ):
-                    pass  # 切点两侧都在 ASCII 字母数字 run 内：后移到 run 尾（防劈单号）
-                else:
-                    return j
+                # ch 非 ASCII 字母数字 → 切点 i+1 至多落在下一 run 的前沿之前
+                # （CJK|run 首边界=词界安全），不劈 run。
+                return i + 1
         i += 1
     return None
 
@@ -302,7 +405,14 @@ def _first_block_cut(text: str, prev_full: str) -> int | None:
                 return j
         i += 1
     fuse = _len_fuse_cut(text, 0, 8)
-    if fuse is not None and prev_full[:fuse] == text[:fuse]:
+    if (
+        fuse is not None
+        and prev_full[:fuse] == text[:fuse]
+        # 有标点优先等标点（W8-B）：余段存在真标点边界时绝不在无标点处硬剁
+        # ——首块小门槛让位于标点档（稳定一拍后自然接手），防「mini Max 开」
+        # 形状的词中间硬切。
+        and not _remainder_has_punct(text, 0)
+    ):
         return fuse
     return None
 
@@ -627,6 +737,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # stt_._server_utterances=False（缺省）=本地闸档=旧线逐字节零变化。
         self._server_utt = bool(getattr(stt_, "_server_utterances", False))
         self._su_emitted = 0  # 已发 FINAL 的 definite 分句计数（按序单调）
+        self._su_text = ""  # 服务端 definite 合计文本（服务端侧坐标视图，W8 合并档协调用）
         # R4-C 端窗看门狗（W8-A2；stt_._end_window_watchdog=False=零行为）：
         # 段内 definite 计数/锚钟与 definite 合计文本（冻结判据=全文不再超出该
         # 合计——definite 常与全文增长同帧到达，钟面比较会假阳，按内容比）。
@@ -635,6 +746,13 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._wd_definite = 0
         self._wd_definite_at = 0.0
         self._wd_definite_text = ""
+        # W8-A3 段切换互斥（2026-10-09）：在途收段（尾窗到期/端窗看门狗两路
+        # detached finalize）的任务句柄。旧版 START 在 finalize 飞行中（
+        # _tail_finalizing=True 而 _tail_task 已被 _tail_watch 置 None）不等收段
+        # 直接开新段——收段的 _reset_segment 会把新段的段缓冲/committed 坐标连锅
+        # 端（空 final/吞句根因），喂帧还会进 sender 已退场的死队列。新段 START
+        # 先经 :meth:`_await_inflight_finalize` 等收段落地。
+        self._fin_task: asyncio.Task | None = None
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
@@ -774,10 +892,16 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._wd_task = asyncio.create_task(self._end_window_watch())
 
     def _wd_cancel(self) -> None:
-        """收看门狗任务（END/收线窗/声纹丢段/流关闭共用；未启/已停=无害 noop）。"""
+        """收看门狗任务（END/收线窗/声纹丢段/流关闭共用；未启/已停=无害 noop）。
+
+        已进收段（任务=``_fin_task`` 本尊）的看门狗**绝不拦腰 cancel**（W8-B）：
+        收段中途的取消会跳过 ``_reset_segment`` 留下悬挂 ``_finishing``/旧坐标
+        ——悬挂 finish 旗把后续 INFERENCE_DONE 喂帧全拦=进行性断流次根因。
+        此时调用方（END 分支）改走「等落地让位」路（见 ``_run``）。"""
         t, self._wd_task = self._wd_task, None
-        if t is not None and not t.done():
-            t.cancel()
+        if t is None or t.done() or t is self._fin_task:
+            return
+        t.cancel()
 
     async def _end_window_watch(self) -> None:
         """端窗看门狗循环（R4-C「VAD 卡死」病理兜底，2026-10-09 W8-A2）。
@@ -809,51 +933,157 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 单一收段者：若 VAD END 恰在此刻落地武装了尾窗，取消之（残留由本次
         # 收段一并负 seq 定稿，双 finalizer 不会同时飞行）。
         self._cancel_tail()
+        self._fin_task = asyncio.current_task()
         self._finishing = True
         try:
             await self._finalize_utterance()
         except asyncio.CancelledError:
+            # W8-B：收段途中被取消（流关闭等）——finish 旗与段坐标必须复位再
+            # 重抛。悬挂 _finishing 会把后续 INFERENCE_DONE 喂帧全拦（进行性
+            # 断流次根因），旧 committed 坐标会把新段吞字。
+            self._finishing = False
+            self._reset_segment()
             raise
         except Exception as exc:  # noqa: BLE001 - 看门狗收段失败不阻后续段
             print(f"DOUBAO_END_WINDOW_WATCH_ERROR {exc!r}", flush=True)
             self._finishing = False
             self._reset_segment()
+        finally:
+            if self._fin_task is asyncio.current_task():
+                self._fin_task = None
+
+    async def _await_inflight_finalize(self) -> None:
+        """等在途收段落地（协程；W8-A3 段切换互斥 + W8-B 楔死兜底）。
+
+        新段 START/END 必须等旧段的 finalize（含 ``_reset_segment`` 坐标/段缓冲
+        清零）完成再开新会话/喂帧/再收——否则新段状态被收段连锅端、帧进死队列。
+        调用方（``_run`` 的 START/END 分支）与 detached 收段任务不同 task，恒真
+        等；收段任务自身（current_task 命中）与已落地（done）=零等待。收段任务
+        异常已在各 watcher 内部记账，这里吞掉不阻新段。
+
+        **超时兜底（W8-B）**：``shield`` 包住 fin——超时绝不 cancel 收段任务
+        （拦腰 cancel 收段=旧竞态的坐标连锅端，宁可放它飞完）；超过
+        ``_FIN_AWAIT_TIMEOUT_S``（>合法收段最坏 ~16s 链）仍未落地=楔死，本侧
+        强制复位段状态放行新段——绝不带悬挂 finish 旗/旧坐标继续哑下去
+        （进行性断流保险丝）。"""
+        fin = self._fin_task
+        if fin is None or fin is asyncio.current_task() or fin.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(fin), timeout=_FIN_AWAIT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            print(
+                f"DOUBAO_FIN_AWAIT_TIMEOUT cap={_FIN_AWAIT_TIMEOUT_S:.0f}s "
+                "reset_segment_for_new_segment",
+                flush=True,
+            )
+            self._fin_task = None  # 登记位让位（楔死任务迟到的 finally 不再认领）
+            self._finishing = False
+            self._reset_segment()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 收段异常已由 watcher 记账
+            pass
 
     def _server_definite_commits(self, res: dict) -> None:
         """服务端 definite 分句消费（官方优先翻案 2026-10-09）。
 
         ``show_utterances`` 响应里 ``utterances[].definite=True`` 即服务端已定稿
         的语义分句（其 VAD+语义模型决定边界，``end_window_size`` 调灵敏度）——
-        见新 definite 即发 FINAL 进翻译；committed 记账沿 ``_cc_committed_*``
-        （display 剥除与 EOS 尾巴共用既有对齐梯）。本地三层闸（标点/保险丝/
-        快启动）在此档全部不跑——那是手工重建厂商能力的三层劣化补丁。"""
+        见新 definite 即发 FINAL 进翻译。
+
+        **合并档（2026-10-09 W8，server_utt+clause_commit 同开=lite 缺省）**：
+        本地意群档（``_maybe_clause_commit``）可能已在同一全文坐标系上切在
+        definite 之前/之后——本函数沿 ``_su_text``（服务端 definite 合计视图，
+        一帧多 definite 全量重发形态下逐个累积）对 committed 做**坐标协调 +
+        差量 FINAL**（61a2ff3 契约）：
+        - 服务端合计 ⊆ 已提交（本地切点更远）→ 不重复出 FINAL（防同文双译）；
+        - 服务端合计 ⊇ 已提交（服务端边界覆盖本地切点）→ committed 收口到
+          服务端合计，FINAL 只发差量尾巴（已交前缀不重发）；
+        - 双失配（服务端改写跨边界，罕见）→ 退累积（纯服务端档原语义）。
+        本地切点缺席（committed 为空）时逐字节旧行为。"""
         utts = res.get("utterances") or []
         definite = [u for u in utts if u.get("definite") and str(u.get("text") or "").strip()]
         new = definite[self._su_emitted:]
-        if not new:
-            return
+        if not new and len(definite) == self._su_emitted:
+            # 枚数没涨：末枚 definite 仍可能被服务端加固扩写（nonstream 二遍
+            # 重识别改写已计 definite）——由下方 cum 对比兜（同数变长=差量出）。
+            pass
         self._su_emitted = len(definite)
         for u in new:
             utext = str(u.get("text") or "").strip()
             if not utext:
                 continue
-            self._cc_committed_text = (self._cc_committed_text or "") + utext
+            server_cum = self._su_text + utext
+            base = self._cc_committed_text or ""
+            if base.startswith(server_cum):
+                # 本地意群档已提交覆盖该 definite（服务端合计⊆本地）：只对齐
+                # 服务端视图，绝不重发 FINAL（同文双译=译文轨重复）。
+                self._su_text = server_cum
+                print(
+                    f"[doubao] UTTERANCE definite covered chars={len(utext)} "
+                    f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
+                    flush=True,
+                )
+                continue
+            if server_cum.startswith(base):
+                # 服务端边界覆盖/等于本地切点：committed 收口到服务端合计，
+                # FINAL 只发差量尾巴（61a2ff3：跨段对齐不吞不重）。
+                self._cc_committed_text = server_cum
+                tail = server_cum[len(base):]
+            else:
+                # 双失配（罕见）：纯服务端档原语义=累积。
+                self._cc_committed_text = server_cum
+                tail = utext
+            self._su_text = server_cum
             self._cc_committed_len = len(self._cc_committed_text)
             self._cc_commits += 1
-            try:
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                        alternatives=[stt.SpeechData(language=self._stt_._lang(), text=utext)],
+            if tail:
+                try:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[
+                                stt.SpeechData(language=self._stt_._lang(), text=tail)
+                            ],
+                        )
                     )
-                )
-            except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
-                continue
+                except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
+                    continue
             print(
                 f"[doubao] UTTERANCE definite chars={len(utext)} "
                 f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
                 flush=True,
             )
+        # 同数加固兜（nonstream 二遍把已计 definite 扩写）：合计视图变长=超出
+        # 部分按同一坐标梯差量出 FINAL；变短/改写=视图重锚（对齐梯兜底）。
+        cum = "".join(str(u.get("text") or "").strip() for u in definite)
+        if cum != self._su_text:
+            base = self._cc_committed_text or ""
+            if base.startswith(cum):
+                pass  # 已提交域内：只对齐视图
+            elif cum.startswith(base) and cum[len(base):]:
+                tail = cum[len(base):]
+                self._cc_committed_text = cum
+                self._cc_committed_len = len(cum)
+                self._cc_commits += 1
+                try:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[
+                                stt.SpeechData(language=self._stt_._lang(), text=tail)
+                            ],
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
+                    pass
+                print(
+                    f"[doubao] UTTERANCE definite revised chars={len(tail)} "
+                    f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
+                    flush=True,
+                )
+            self._su_text = cum
 
     def _maybe_interim(self, text: str) -> None:
         if not text or text == self._last_interim_emitted:
@@ -884,10 +1114,26 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 那个 interim 可见(会话级 display 已剥走),而后续 interim 的 spec 视角
         # 自动回到「下一 FINAL 同坐标系」(余段视角),不会对已提交子句重复开火。
         _spec_feed = text
-        if self._server_utt:
-            # 服务端分句档：commit 由 _server_definite_commits 驱动（definite 即 FINAL），
-            # 本地三层闸不跑；display=全文剥已发 definite 前缀（startswith 主路，
-            # 失配显示全文——服务端驱动下罕见，对齐兜底在 EOS 路径）。
+        if self._server_utt and self._clause_commit:
+            # 合并档（2026-10-09 W8，lite 缺省）：服务端 definite 分句为主 +
+            # 本地意群档（逗号/长度保险丝/快启动）补连续语流的句中切分。
+            # server-utt 单档实证（call-fb236e61）：连续语流下服务端 definite
+            # 只在停嘴/段末出现（72 字单段单 definite）＝「等说完才出声」——
+            # W6 意群档 env（逗号 12 字/保险丝 15 字/限速 1.2s，bokctl
+            # interp_lite_commit_env 注入）在本地闸道上继续生效。两源共享
+            # ``_cc_committed_*`` 坐标系：definite 由 _server_definite_commits
+            # 先收口（_on_payload 序），本闸只切未提交余段，FINAL 恒差量。
+            _spec_base = self._cc_committed_len
+            self._maybe_clause_commit(text, _prev)
+            display = self._clause_tail(text)
+            _spec_feed = text[_spec_base:]
+            if not display:
+                _emit_spec_feed(self._stt_, _spec_feed)
+                return  # 已见文本全部提交/对齐重置吞显：本轮无剩余可出
+        elif self._server_utt:
+            # 服务端分句单档（本地闸关）：commit 由 _server_definite_commits 驱动
+            # （definite 即 FINAL）；display=全文剥已发 definite 前缀（startswith
+            # 主路，失配显示全文——服务端驱动下罕见，对齐兜底在 EOS 路径）。
             if self._cc_committed_text and text.startswith(self._cc_committed_text):
                 display = text[self._cc_committed_len:]
             else:
@@ -940,6 +1186,10 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             # 长度保险丝（标点档未命中才问；限速/跨窗稳定与标点档同判据；稳定
             # 判据=**归一化**比较——ASR 回溯改标点不再废稳定性，call-ed6326a5
             # 实弹：raw 比较下保险丝在首火后即被标点改写持续打哑）。
+            # W8-B 防饿死化：余段有真标点在望（``_remainder_has_punct``）绝不
+            # 在无标点处硬剁——「有标点优先等标点」，标点档稳定一拍后自然接手
+            # （实弹「Mini Max 开放平台 API 接口能力概览，」22 字处有逗号却被
+            # 10 字硬剁=本闸旧病）。保险丝只兜无标点长流的饿死天窗。
             from .livekit_plugins import (  # noqa: PLC0415
                 _sentence_commit_min_interval_s,
                 _strip_punct_space,
@@ -952,6 +1202,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             fuse = _len_fuse_cut(text, self._cc_committed_len, max(1, min_chars))
             if (
                 fuse is not None
+                and not _remainder_has_punct(text, self._cc_committed_len)
                 and now - self._cc_last_commit_at >= _sentence_commit_min_interval_s()
                 and _strip_punct_space(prev_full[self._cc_committed_len:fuse])
                 == _strip_punct_space(text[self._cc_committed_len:fuse])
@@ -1106,6 +1357,7 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._cc_seg_t0 = 0.0
         self._cc_commits = 0
         self._su_emitted = 0  # 服务端分句计数随段清（新 utterance 从头数）
+        self._su_text = ""  # 服务端 definite 合计视图随段清（新会话=新坐标宇宙）
         # 暴露位随段清零；FINAL 发出点按 pre-reset 快照重贴（与 Qwen3 版契约一致）。
         self._stt_._turn_partial_text = ""
 
@@ -1162,15 +1414,23 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._tail_finalizing = True
         self._tail_task = None
         self._tailing = False
+        self._fin_task = asyncio.current_task()
         self._finishing = True
         try:
             await self._finalize_utterance()
         except asyncio.CancelledError:
+            # W8-B：收段途中被取消（收线窗/丢段/流关闭）——finish 旗与段坐标
+            # 必须复位再重抛（悬挂 _finishing 拦死后续喂帧=进行性断流次根因）。
+            self._finishing = False
+            self._reset_segment()
             raise
         except Exception as exc:  # noqa: BLE001 - 尾窗定稿失败不阻后续段
             print(f"DOUBAO_UTT_TAIL_ERROR {exc!r}", flush=True)
             self._finishing = False
             self._reset_segment()
+        finally:
+            if self._fin_task is asyncio.current_task():
+                self._fin_task = None
 
     # ---- 主循环（VAD 双任务骨架，与 _Qwen3ASRLiveStream 同构）----
     async def _run(self) -> None:
@@ -1215,6 +1475,11 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                             self._tailing = False
                             self._utt_merges += 1
                             print("DOUBAO_UTT_MERGE resume", flush=True)
+                    # W8-A3 段切换互斥：在途收段（尾窗到期/看门狗 detached finalize）
+                    # 先落地再开新段——否则本段帧进死 sender 队列、收段的
+                    # _reset_segment 把本段段缓冲/committed 坐标连锅端（空 final/
+                    # 吞句根因）。通常零等待（无在途收段）；撞上时限速≈final 响应。
+                    await self._await_inflight_finalize()
                     started = True
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH)
@@ -1242,8 +1507,27 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:
                         continue
-                    # R4-C 端窗看门狗：本地 END 先到=段正常收口，看门狗下岗。
+                    # R4-C 端窗看门狗：本地 END 先到=段正常收口，看门狗下岗
+                    # （仍在循环相=取消；已进收段=放行，见 _wd_cancel）。
                     self._wd_cancel()
+                    # W8-B 双 finalizer 协调：看门狗已进收段（上文放行未取消）
+                    # → 先照常出 END 信号（时序不漂），等它落地（尾巴 FINAL+
+                    # 复位全责已负）后本侧收段让位——两路 finalize 并飞会把
+                    # 同一段状态写花（空 final/吞字）。
+                    if self._fin_task is not None and not self._fin_task.done():
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.END_OF_SPEECH,
+                                speech_end_time=(
+                                    time.time()
+                                    - event.silence_duration
+                                    - event.inference_duration
+                                ),
+                            )
+                        )
+                        await self._await_inflight_finalize()
+                        started = False
+                        continue
                     # 收线/告别直念窗：整段丢弃（不发 EOS/FINAL，把告别说完）。
                     if bool(getattr(self._stt_, "_closing_say", False)):
                         started = False
@@ -1281,7 +1565,17 @@ class _DoubaoLiveStream(stt.RecognizeStream):
                         started = False
                         self._tail_task = asyncio.create_task(self._tail_watch())
                         continue
-                    await self._finalize_utterance()
+                    # W8-B 异常隔离：内联收段任一异常绝不外抛——原版直接打死
+                    # ``_recognize``→整流永久哑（进行性断流主根因，第 3 轮起
+                    # 翻译侧全哑与此同族）；捕获后复位段状态，下一语音照常成段。
+                    try:
+                        await self._finalize_utterance()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - 收段失败不阻后续段
+                        print(f"DOUBAO_UTT_FINALIZE_ERROR {exc!r}", flush=True)
+                        self._finishing = False
+                        self._reset_segment()
                     started = False
 
         try:

@@ -47,10 +47,13 @@ class LiteDoubaoSTT(DoubaoSTT):
 
     def __init__(self, **kwargs):
         # 官方优先翻案（2026-10-09，Ethan 拍板「让 ASR 自己切分然后给 LLM」）：
-        # **服务端分句消费为主档**——show_utterances 的 definite 分句即厂商卖的
-        # 语义分段，见新 definite 即发 FINAL；本地三层闸（标点/保险丝/快启动，
-        # 今天一天手工重建厂商能力的补丁，碎片/大块/吞字三病全由此生）全部让位，
-        # 仅作 kill-switch 回退档（BOK_INTERP_SERVER_UTT=0 回本地闸）。
+        # 服务端分句消费为主档——show_utterances 的 definite 分句即厂商卖的
+        # 语义分段，见新 definite 即发 FINAL。**W8 合并档修订（2026-10-09，
+        # call-fb236e61 实弹：连续语流 72 字单段单 definite=「等说完才出声」，
+        # 服务端 definite 只在停嘴/段末出现）**：本地意群档（逗号/长度保险丝/
+        # 快启动）不再让位——与 definite 同坐标系互补，专切连续语流的句中边界；
+        # 闸参数沿 W6 意群档 env（bokctl interp_lite_commit_env 注入 12/15/1.2）。
+        # kill-switch 保留：BOK_INTERP_SERVER_UTT=0 回纯本地闸档。
         kwargs.setdefault("server_utterances", os.environ.get("BOK_INTERP_SERVER_UTT", "1") != "0")
         # 本地闸旗保留（server_utterances=0 时生效=回退档）。
         kwargs.setdefault("clause_commit", True)
