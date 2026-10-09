@@ -373,11 +373,7 @@ def test_forward_env_key_set_matches_frozen_snapshot():
         f"_FORWARD_ENV 键面漂移：新增 {added}，删除 {removed} ——"
         "更新表必须同步更新 tests/test_bok_module_contract.py 快照（显式立法动作）"
     )
-<<<<<<< HEAD
     assert len(current) == 305
-=======
-    assert len(current) == 305
->>>>>>> session-20261009-s2defer
 
 
 def test_control_plane_env_def_is_unique_in_tools():
