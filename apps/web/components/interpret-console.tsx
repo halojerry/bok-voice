@@ -1422,40 +1422,56 @@ function SubBubble({
 }
 
 /** 双栏字幕单列(W4a):列头承担归属(我方/对方 + 语言短名),栏内按 pairSubtitles
- * 的组序渲染——原文在上、其翻译紧随;空栏画占位,不藏列(列的存在感=归属锚)。 */
+ * 的组序渲染——原文在上、其翻译紧随;空栏画占位,不藏列(列的存在感=归属锚)。
+ * playingIdx(2026-10-09)=正在播放的组序(agent 出声信标锚组,-1=无)。 */
 function SubColumn({
   title,
   langShort,
   groups,
   mine,
+  playingIdx = -1,
 }: {
   title: string;
   langShort: string;
   groups: SubGroup[];
   mine: boolean;
+  playingIdx?: number;
 }) {
+  const playing = playingIdx >= 0;
   return (
     <section className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center gap-1.5 px-1">
-        <span className="font-mono text-[11px] font-bold uppercase tracking-wide text-muted-foreground">{title}</span>
+        <span className={`font-mono text-[11px] font-bold uppercase tracking-wide ${playing ? "text-(--live)" : "text-muted-foreground"}`}>{title}</span>
         <span className="rounded-full border border-(--card-border) px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
           {langShort}
         </span>
+        {playing && (
+          <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-(--live-soft) px-2 py-0.5 text-[10px] font-medium text-(--live-ink)">
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-(--live) opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-(--live)" />
+            </span>
+            正在播放
+          </span>
+        )}
       </div>
       {groups.length === 0 && (
         <div className="rounded-2xl border border-dashed border-(--card-border) px-3 py-3 text-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
           —
         </div>
       )}
-      {groups.map((g) => (
-        <div key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`} className="flex flex-col gap-2">
+      {groups.map((g, gi) => (
+        <div
+          key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`}
+          className={`flex flex-col gap-2 rounded-2xl transition-colors ${gi === playingIdx ? "bg-(--live-soft)/40 p-2" : ""}`}
+        >
           {g.src && (
             <SubBubble label="原文" mine={mine}>
               {g.src.text}
             </SubBubble>
           )}
           {g.dsts.map((d) => (
-            <SubBubble key={`d${d.idx}`} label="翻译" mine={mine} accent>
+            <SubBubble key={`d${d.idx}`} label={gi === playingIdx ? "翻译 · 播放中" : "翻译"} mine={mine} accent>
               {d.text}
             </SubBubble>
           ))}
@@ -1506,11 +1522,15 @@ function ConsoleLive(p: LiveProps) {
       else p.setError(`试听失败(${e instanceof Error ? e.message : String(e)})——请确认本地 TTS 服务在跑。`);
     }
   }, [p.setError]);
-  const listRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null); // 兼容位（旧单列表；见 myListRef/othListRef）
+  const myListRef = useRef<HTMLDivElement | null>(null); // 我方卡滚动体（双卡 2026-10-09）
+  const othListRef = useRef<HTMLDivElement | null>(null); // 对方卡滚动体
   // 译员视角(2026-09-16 对齐 Windows 版字幕窗语义):默认只看「对方→我」流
   // (对方说的 + 我方语译文)——我方说了什么自己知道,译文播给对方听;字幕区
   // 是给译员读的,不是聊天记录。「我→对方」流与全部仍可切。
-  const [filter, setFilter] = useState<"rev" | "fwd" | "both">("rev");
+  // 2026-10-09 双卡改版(Ethan 拍板):缺省 both=双卡并排(左我方右对方,
+  // 各带「正在播放」)——左右分卡后全看不再是信息过载。
+  const [filter, setFilter] = useState<"rev" | "fwd" | "both">("both");
   const [clearedCount, setClearedCount] = useState(0);
   // 字幕源裁剪(2026-10-02 刀3):useTranscriptions 历史无界增长,下游 memo 原来全量
   // 重扫。派生单点 trimmed(近 300 条)供所有下游 memo 消费;渲染窗仍 80 条不变。
@@ -1612,6 +1632,51 @@ function ConsoleLive(p: LiveProps) {
   const subGroups = useMemo(() => pairSubtitles(subRows), [subRows]);
   const myGroups = useMemo(() => subGroups.filter((g) => g.side === "right"), [subGroups]);
   const otherGroups = useMemo(() => subGroups.filter((g) => g.side === "left"), [subGroups]);
+  // ---- 「正在播放」指示（2026-10-09）：agent 侧每句出声起点广播一枚不可靠
+  // 小数据报 {"ev":"interp_play","flow","text","chars"}——按 flow 标对应列，
+  // 文本前缀锚组（锚不中回退该列最新组），按字数估时长自灭（75ms/字 ÷1.2 语速
+  // +800ms 宽限）；下一枚信标自然接棒。信标丢失不影响正确性（指示器纯增益）。
+  const [playMark, setPlayMark] = useState<{ fwd: { text: string; until: number } | null; rev: { text: string; until: number } | null }>({ fwd: null, rev: null });
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const on_data = (payload: Uint8Array) => {
+      try {
+        const m = JSON.parse(new TextDecoder().decode(payload)) as { ev?: string; flow?: string; text?: string; chars?: number };
+        if (m?.ev !== "interp_play" || (m.flow !== "fwd" && m.flow !== "rev")) return;
+        const chars = Math.max(4, Number(m.chars) || 16);
+        const until = Date.now() + Math.min(12_000, chars * 75 + 800);
+        setPlayMark((v) => ({ ...v, [m.flow as "fwd" | "rev"]: { text: String(m.text ?? ""), until } }));
+      } catch {
+        /* 非 JSON 数据报(其它组件/探针)静默忽略 */
+      }
+    };
+    p.room.on(RoomEvent.DataReceived, on_data);
+    return () => {
+      p.room.off(RoomEvent.DataReceived, on_data);
+    };
+  }, [p.room]);
+  useEffect(() => {
+    if (!playMark.fwd && !playMark.rev) return;
+    const t = window.setInterval(() => {
+      setNowMs(Date.now());
+      setPlayMark((v) => {
+        const fwd = v.fwd && v.fwd.until > Date.now() ? v.fwd : null;
+        const rev = v.rev && v.rev.until > Date.now() ? v.rev : null;
+        return fwd === v.fwd && rev === v.rev ? v : { fwd, rev };
+      });
+    }, 500);
+    return () => window.clearInterval(t);
+  }, [playMark.fwd, playMark.rev]);
+  /** 组级播放锚：dst 文本前缀命中（空格归一）→组序；锚不中=列内最新组。 */
+  const playingIdx = useCallback((groups: SubGroup[], mark: { text: string; until: number } | null): number => {
+    if (!mark || nowMs >= mark.until || groups.length === 0) return -1;
+    const key = mark.text.replace(/\s+/g, "").slice(0, 12);
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const d = groups[i].dsts[groups[i].dsts.length - 1];
+      if (d && d.text.replace(/\s+/g, "").startsWith(key)) return i;
+    }
+    return groups.length - 1; // 信标先到/字幕未上屏：先亮最新组
+  }, [nowMs]);
   // ---- 翻译状态滚动窗(2026-10-02 刀3,R2 状态说真话) ----
   // 旧「同传服务=出译中」由累计 dstCount>0 驱动=第一次出译后闩死、永不再回待命。
   // 新口径:近 30s 到达的译文字幕 >0(或正在出声)才算「出译中」,30s 无新译文回「待命」。
@@ -1710,12 +1775,12 @@ function ConsoleLive(p: LiveProps) {
     return () => window.clearTimeout(timer);
   }, [p.interpOn, meSrcCount]);
   useEffect(() => {
-    const el = listRef.current;
-    if (!el) return;
-    // useLayoutEffect 时机（DOM 已更新但未绘制）+ rAF 双保险——字幕双栏
-    // 任一列新增内容都滚到最新行（Ethan 2026-10-09 反馈「字幕应该实时滚到最新」）
+    // 双卡各自滚到最新行（2026-10-09 双卡改版）：rAF 双保险——DOM 更新后、
+    // 绘制前锚底；单卡筛选下缺席的 ref 为 null 自动跳过。
     const raf = requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
+      for (const el of [myListRef.current, othListRef.current]) {
+        if (el) el.scrollTop = el.scrollHeight;
+      }
     });
     return () => cancelAnimationFrame(raf);
   }, [items]);
@@ -2038,90 +2103,101 @@ function ConsoleLive(p: LiveProps) {
         </section>
       </div>
 
-      {/* ④ 双语字幕卡 */}
-      <section className="card flex min-h-[320px] flex-1 flex-col gap-2 overflow-hidden">
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
-          <span className="label">一体台 · 双语字幕</span>
-          <div className="flex items-center gap-1.5">
-            {([
-              ["rev", "对方→我"],
-              ["fwd", "我→对方"],
-              ["both", "全部"],
-            ] as const).map(([v, label]) => (
-              <button
-                key={v}
-                onClick={() => setFilter(v)}
-                className={`rounded-full px-2.5 py-1 text-[11px] ${
-                  filter === v
-                    ? "bg-(--live-soft) font-medium text-(--live-ink)"
-                    : "border border-(--card-border) text-muted-foreground"
-                }`}
-              >
-                {label}
-              </button>
-            ))}
+      {/* ④ 双语字幕：左右两张独立卡（2026-10-09 Ethan 拍板，参考 jinxi 字幕区）——
+          左=我方（我说的话+给对方的译文）、右=对方（对方说的话+给我的译文）；
+          每卡独立滚动、独立「正在播放」指示（agent 出声信标按流锚组）。
+          流向筛选=选卡（rev=只看对方卡,fwd=只看我方卡,both=双卡并排,缺省 both）。 */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          {([
+            ["both", "双卡"],
+            ["fwd", "只看我方"],
+            ["rev", "只看对方"],
+          ] as const).map(([v, label]) => (
             <button
-              onClick={() => setPopOpen(true)}
-              className="rounded-full border border-(--card-border) px-2.5 py-1 text-[11px] text-muted-foreground hover:text-(--foreground)"
-              title="大字幕窗:置顶大字号,可拖动/全屏,投屏用"
+              key={v}
+              onClick={() => setFilter(v)}
+              className={`rounded-full px-2.5 py-1 text-[11px] ${
+                filter === v
+                  ? "bg-(--live-soft) font-medium text-(--live-ink)"
+                  : "border border-(--card-border) text-muted-foreground"
+              }`}
             >
-              大字幕
+              {label}
             </button>
-          </div>
+          ))}
         </div>
-        <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
-          {subGroups.length === 0 && (
-            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-              等说话…开口即译
+        <button
+          onClick={() => setPopOpen(true)}
+          className="rounded-full border border-(--card-border) px-2.5 py-1 text-[11px] text-muted-foreground hover:text-(--foreground)"
+          title="大字幕窗:置顶大字号,可拖动/全屏,投屏用"
+        >
+          大字幕
+        </button>
+      </div>
+      <div className={`grid min-h-[320px] flex-1 gap-4 ${filter === "both" ? "md:grid-cols-2" : ""}`}>
+        {filter !== "rev" && (
+          <section className="card flex min-h-0 flex-col gap-2 overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
+              <span className="label">我方 · {LANG_SHORT[p.myLang] ?? p.myLang}→{LANG_SHORT[p.otherLang] ?? p.otherLang}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">我说的话 + 给对方的译文</span>
             </div>
-          )}
-          {/* W4a 双栏成组(2026-10-07)/W4c 列=说话方(2026-10-08):我方列=我说的
-              原文+其译文,对方列=对方说的原文+其译文——原文与译文永不分家;列头
-              语言对=该侧的 源→译。流向筛选=选列(rev=对方列,fwd=我方列,both=双栏);
-              每栏内「原文气泡 + 其翻译气泡」成组,在途原文/孤儿译文单独渲染不丢。 */}
-          <div
-            className={
-              filter === "both"
-                ? "grid flex-1 items-start gap-4 md:grid-cols-2"
-                : "mx-auto flex w-full flex-1 flex-col gap-4 xl:max-w-3xl"
-            }
-          >
-            {filter !== "fwd" && (
-              <SubColumn
-                title="对方"
-                langShort={`${LANG_SHORT[p.otherLang] ?? p.otherLang}→${LANG_SHORT[p.myLang] ?? p.myLang}`}
-                groups={otherGroups}
-                mine={false}
-              />
-            )}
-            {filter !== "rev" && (
+            <div ref={myListRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
+              {myGroups.length === 0 && (
+                <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                  等你开口…
+                </div>
+              )}
               <SubColumn
                 title="我方"
                 langShort={`${LANG_SHORT[p.myLang] ?? p.myLang}→${LANG_SHORT[p.otherLang] ?? p.otherLang}`}
                 groups={myGroups}
                 mine
+                playingIdx={playingIdx(myGroups, playMark.fwd)}
               />
-            )}
-          </div>
-        </div>
-        {holdBusy && (
-          <p className="shrink-0 text-[11px] text-amber-700">
-            {p.othHeld ? "我方译文播报中 · 对方麦克风暂让" : "对方译文播报中 · 我方麦克风暂让"}
-          </p>
+            </div>
+          </section>
         )}
-        {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-700">{p.sameDeviceWarning}</p>}
-        {(p.micSilent.me || p.micSilent.oth) && (
-          <p className="shrink-0 text-[11px] leading-relaxed text-amber-700">
-            {p.micSilent.me && p.micSilent.oth ? "两侧麦克风" : p.micSilent.me ? "我方麦克风" : "对方麦克风"}
-            连续 5 秒没有电平——这支设备可能被别的页面/程序占用（蓝牙麦同一时刻只能给一个程序用），或它根本没在拾音。换一支设备，
-            或关掉占用它的窗口/程序再试。
-          </p>
+        {filter !== "fwd" && (
+          <section className="card flex min-h-0 flex-col gap-2 overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
+              <span className="label">对方 · {LANG_SHORT[p.otherLang] ?? p.otherLang}→{LANG_SHORT[p.myLang] ?? p.myLang}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">对方说的话 + 给我的译文</span>
+            </div>
+            <div ref={othListRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
+              {otherGroups.length === 0 && (
+                <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                  等对方开口…
+                </div>
+              )}
+              <SubColumn
+                title="对方"
+                langShort={`${LANG_SHORT[p.otherLang] ?? p.otherLang}→${LANG_SHORT[p.myLang] ?? p.myLang}`}
+                groups={otherGroups}
+                mine={false}
+                playingIdx={playingIdx(otherGroups, playMark.rev)}
+              />
+            </div>
+          </section>
         )}
-        {p.sinkNotice && (
-          <p className="shrink-0 text-[11px] leading-relaxed text-muted-foreground">{p.sinkNotice}</p>
-        )}
-        {p.error && <p className="shrink-0 text-xs text-red-600">{p.error}</p>}
-      </section>
+      </div>
+      {holdBusy && (
+        <p className="shrink-0 text-[11px] text-amber-700">
+          {p.othHeld ? "我方译文播报中 · 对方麦克风暂让" : "对方译文播报中 · 我方麦克风暂让"}
+        </p>
+      )}
+      {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-700">{p.sameDeviceWarning}</p>}
+      {(p.micSilent.me || p.micSilent.oth) && (
+        <p className="shrink-0 text-[11px] leading-relaxed text-amber-700">
+          {p.micSilent.me && p.micSilent.oth ? "两侧麦克风" : p.micSilent.me ? "我方麦克风" : "对方麦克风"}
+          连续 5 秒没有电平——这支设备可能被别的页面/程序占用（蓝牙麦同一时刻只能给一个程序用），或它根本没在拾音。换一支设备，
+          或关掉占用它的窗口/程序再试。
+        </p>
+      )}
+      {p.sinkNotice && (
+        <p className="shrink-0 text-[11px] leading-relaxed text-muted-foreground">{p.sinkNotice}</p>
+      )}
+      {p.error && <p className="shrink-0 text-xs text-red-600">{p.error}</p>}
 
       {/* 大字幕窗(Windows 版 SubtitleWindow 的浏览器形态):置顶浮动、可拖动、
           三档字号、scope 切换、全屏;黑底白字是字幕机本色,与主题无关。 */}
@@ -2184,7 +2260,17 @@ function ConsoleLive(p: LiveProps) {
             )}
             {/* W4a 同构成组:原文行(白/50 标)+其翻译行(标按流向配色),与主字幕卡
                 同一 pairSubtitles 数据形状;黑底字幕机本色不变。 */}
-            {popGroups.map((g) => (
+            {popGroups.map((g) => {
+              const mark = g.flow === "fwd" ? playMark.fwd : playMark.rev;
+              const gPlaying =
+                mark !== null &&
+                nowMs < mark.until &&
+                (() => {
+                  const key = mark.text.replace(/\s+/g, "").slice(0, 12);
+                  const d = g.dsts[g.dsts.length - 1];
+                  return d ? d.text.replace(/\s+/g, "").startsWith(key) : false;
+                })();
+              return (
               <div key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`} className="leading-snug">
                 {g.src && (
                   <div style={{ fontSize: popFont }}>
@@ -2195,13 +2281,14 @@ function ConsoleLive(p: LiveProps) {
                 {g.dsts.map((d) => (
                   <div key={`d${d.idx}`} style={{ fontSize: popFont }}>
                     <span className={`mr-2 font-mono text-sm ${g.flow === "rev" ? "text-sky-300" : "text-emerald-300"}`}>
-                      翻译
+                      {gPlaying ? "▶ 翻译" : "翻译"}
                     </span>
                     {d.text}
                   </div>
                 ))}
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

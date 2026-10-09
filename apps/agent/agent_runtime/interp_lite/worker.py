@@ -215,6 +215,19 @@ async def entrypoint(ctx) -> None:
         except Exception as exc:  # noqa: BLE001 - 落库失败不阻翻译
             print(f"[interp-lite] add_turn failed: {exc!r}", flush=True)
 
+    _flow = "fwd" if speaker_role == "me" else "rev"
+
+    async def _publish_play(caption: str) -> None:
+        """「正在播放」信标（不可靠小数据报）：payload 只带 flow+文本前缀，
+        web 侧按字数估时长自灭——丢了也不影响正确性（下一枚信标自会覆盖）。"""
+        try:
+            payload = json.dumps(
+                {"ev": "interp_play", "flow": _flow, "text": caption[:32], "chars": len(caption)}
+            ).encode()
+            await room.local_participant.publish_data(payload, reliable=False)
+        except Exception:  # noqa: BLE001 - 指示器纯增益
+            pass
+
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -222,6 +235,18 @@ async def entrypoint(ctx) -> None:
         if not text or role != "assistant":
             return
         own_translations.append(text)  # echo-dedup self-heard 参考料（本向近期译文）
+        # 播放态信标（2026-10-09 字幕「正在播放」指示）：assistant 项加入≈本句
+        # 出声起点——向房间广播一枚不可靠小数据报（web 按 flow 标对应列、按
+        # 文本前缀锚组、按字数估时长自灭）。text-only 档（无 TTS）不发——没有
+        # 「正在播放」这回事。发失败纯 no-op（指示器纯增益）。
+        if dir_audio:
+            cap = _caption_text(text, target_lang)
+            if cap:
+                _spawn_pooled_task(
+                    _publish_play(cap),
+                    _ledger_tasks,
+                    "PLAY_PING_ERR",
+                )
         latency = int(pipeline.last_ms.get("ms") or 0)  # 逐句 MT 时长（done_mt 时覆写）
         rec = _lag.pop_pending()
         if rec is not None:
