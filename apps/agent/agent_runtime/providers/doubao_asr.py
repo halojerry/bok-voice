@@ -746,8 +746,13 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             now=now,
         )
         if cut is None and self._stt_._len_fuse:
-            # 长度保险丝（标点档未命中才问；限速/跨窗稳定与标点档同判据）。
-            from .livekit_plugins import _sentence_commit_min_interval_s  # noqa: PLC0415
+            # 长度保险丝（标点档未命中才问；限速/跨窗稳定与标点档同判据；稳定
+            # 判据=**归一化**比较——ASR 回溯改标点不再废稳定性，call-ed6326a5
+            # 实弹：raw 比较下保险丝在首火后即被标点改写持续打哑）。
+            from .livekit_plugins import (  # noqa: PLC0415
+                _sentence_commit_min_interval_s,
+                _strip_punct_space,
+            )
 
             try:
                 min_chars = int(os.environ.get("QWEN3_ASR_CLAUSE_LEN_CHARS", "20") or 20)
@@ -757,7 +762,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             if (
                 fuse is not None
                 and now - self._cc_last_commit_at >= _sentence_commit_min_interval_s()
-                and prev_full[self._cc_committed_len:fuse] == text[self._cc_committed_len:fuse]
+                and _strip_punct_space(prev_full[self._cc_committed_len:fuse])
+                == _strip_punct_space(text[self._cc_committed_len:fuse])
             ):
                 cut = fuse
         if cut is None:
@@ -792,9 +798,11 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         ——partial 修订**绝不回滚已发出的 FINAL**）：
         ① 严格前缀 startswith（主路径：单调累积极少改写已稳定头）；
         ② 归一化前缀（去标点/空白逐字对齐——服务端标点改写不算新内容）；
-        ③ 双失配 → 记 ``DOUBAO_CLAUSE_ALIGN_RESET`` + 重置对齐：把已见全文认作
-           已主张领地（committed=全文）。宁可漏掉修订 delta，绝不重发已交内容
-           （重发=下游 MT 重复烧一整句，比漏一两个字更糟）。
+        ③ 双失配 → **交差量再重置**（2026-10-09 修订，call-ed6326a5 实弹：旧版
+           静默吞字——句档/保险丝下 ASR 回溯改字使双失配必现，每句吞 20-35 字）：
+           找最长公共归一前缀 p，把 p 之后的新内容当尾巴交出去（发 FINAL 落账），
+           然后重置领地 committed=全文。旧取舍「宁漏勿重」作废——同传漏句不可
+           接受；修订重叠处的极小重复可接受且有观测行。
         """
         if not self._cc_committed_text:
             return text
@@ -822,8 +830,39 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             f"text={text[:40]!r}",
             flush=True,
         )
+        # 交差量：p=最长公共归一前缀；norm_t[p:] 是未交过的新内容 → **直接发
+        # FINAL**（差量只在 INTERIM 显示=MT 仍吃不到，吞字没修透）；然后重置
+        # 领地 committed=全文、display 空。旧取舍「宁漏勿重」作废——同传漏句
+        # 不可接受；修订重叠处的极小重复可接受且有 DELTA 观测行。
+        p = 0
+        while p < min(len(norm_c), len(norm_t)) and norm_c[p] == norm_t[p]:
+            p += 1
+        delta = ""
+        if p < len(norm_t):
+            need = p
+            raw_p = None
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                if need == 0:
+                    raw_p = i
+                    break
+                need -= 1
+            if raw_p is not None and raw_p < len(text):
+                delta = text[raw_p:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
         self._cc_committed_text = text
         self._cc_committed_len = len(text)
+        if delta:
+            print(f"DOUBAO_CLAUSE_ALIGN_DELTA chars={len(delta)}", flush=True)
+            try:
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        alternatives=[stt.SpeechData(language=self._stt_._lang(), text=delta)],
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 流已关：差量丢弃（下轮 EOS 兜底整段）
+                pass
         return ""
 
     def _feed(self, pcm: bytes) -> None:
