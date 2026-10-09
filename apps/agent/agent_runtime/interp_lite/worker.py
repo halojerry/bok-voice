@@ -123,7 +123,7 @@ async def entrypoint(ctx) -> None:
     asr_ls = LanguageState()
     asr_ls.lang = source_lang
     from ..agent import asr_hotword_context
-    from ..doubao_asr import doubao_asr_enabled
+    from ..providers.doubao_asr import doubao_asr_enabled
 
     provider_name = str(asr_cfg.get("provider") or "").strip().lower()
     hot_terms = _parse_vocab_terms(
