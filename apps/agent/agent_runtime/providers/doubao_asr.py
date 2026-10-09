@@ -616,6 +616,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # stt_._server_utterances=False（缺省）=本地闸档=旧线逐字节零变化。
         self._server_utt = bool(getattr(stt_, "_server_utterances", False))
         self._su_emitted = 0  # 已发 FINAL 的 definite 分句计数（按序单调）
+        self._su_concat = ""  # 服务端 definite 累积文本（与本地闸前缀坐标合并用）
+        self._cc_starve_t0 = 0.0  # 饥饿钟（server_utt 档：definite 未到的连续语流计时）
 
     # ---- 会话管理 ----
     async def _open_session(self) -> None:
@@ -729,13 +731,17 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             self._maybe_interim(text)
 
     def _server_definite_commits(self, res: dict) -> None:
-        """服务端 definite 分句消费（官方优先翻案 2026-10-09）。
+        """服务端 definite 分句消费 + 本地闸混合档（2026-10-09 call-72cf9f49 翻案二折）。
 
-        ``show_utterances`` 响应里 ``utterances[].definite=True`` 即服务端已定稿
-        的语义分句（其 VAD+语义模型决定边界，``end_window_size`` 调灵敏度）——
-        见新 definite 即发 FINAL 进翻译；committed 记账沿 ``_cc_committed_*``
-        （display 剥除与 EOS 尾巴共用既有对齐梯）。本地三层闸（标点/保险丝/
-        快启动）在此档全部不跑——那是手工重建厂商能力的三层劣化补丁。"""
+        第一折（官方优先）：``utterances[].definite`` 即服务端定稿分句——准（二遍
+        识别、语义边界）。**但 call-72cf9f49 实弹定案：definite 需要 ≥end_window_size
+        连续静音——连续长讲无静音窗=零 definite=LLM 空等到说完**（49 字三句攒一坨）。
+        官方这个参数解决的是"准"不是"快"；跟人类译员相反（译员恰在连续语流跟读）。
+
+        第二折（混合）：interim 路上并行跑本地意群闸（标点+稳定性判据，不吃静音
+        窗）——服务端 definite 管停顿边界，本地闸管连续语流，共享 ``_cc_committed_*``
+        前缀坐标。定稿到达时按前缀合并：definite 累积文本与已提交前缀都是全文单调
+        前缀，只发增量（`SU_MERGE delta=` 观测行），不重发。"""
         utts = res.get("utterances") or []
         definite = [u for u in utts if u.get("definite") and str(u.get("text") or "").strip()]
         new = definite[self._su_emitted:]
@@ -746,23 +752,37 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             utext = str(u.get("text") or "").strip()
             if not utext:
                 continue
-            self._cc_committed_text = (self._cc_committed_text or "") + utext
-            self._cc_committed_len = len(self._cc_committed_text)
-            self._cc_commits += 1
-            try:
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                        alternatives=[stt.SpeechData(language=self._stt_._lang(), text=utext)],
+            new_concat = self._su_concat + utext
+            committed = self._cc_committed_text or ""
+            # 前缀合并：两者都是全文单调前缀——只发已提交前缀之外的增量。
+            if new_concat.startswith(committed) and len(new_concat) > len(committed):
+                delta = new_concat[len(committed):]
+                self._su_concat = new_concat
+                self._cc_committed_text = new_concat
+                self._cc_committed_len = len(new_concat)
+                self._cc_commits += 1
+                self._cc_starve_t0 = 0.0  # definite 到达：饥饿钟清零
+                try:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(language=self._stt_._lang(), text=delta)],
+                        )
                     )
+                except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
+                    continue
+                tag = "UTTERANCE definite" if delta == utext else "SU_MERGE delta"
+                print(
+                    f"[doubao] {tag} chars={len(delta)} "
+                    f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
+                    flush=True,
                 )
-            except Exception:  # noqa: BLE001 - 流已关：迟到分句丢弃
-                continue
-            print(
-                f"[doubao] UTTERANCE definite chars={len(utext)} "
-                f"prefix_len={self._cc_committed_len} total={self._su_emitted}",
-                flush=True,
-            )
+            elif committed.startswith(new_concat):
+                self._su_concat = new_concat  # 本地闸已越过：记账对齐、零增量
+            else:
+                # 坐标失配（罕见：ASR 改写跨 definite 边界）——保守跳过，EOS 对齐梯兜底。
+                self._su_concat = new_concat
+                print(f"DOUBAO_SU_MISMATCH committed={committed[:30]!r} concat={new_concat[:30]!r}", flush=True)
 
     def _maybe_interim(self, text: str) -> None:
         if not text or text == self._last_interim_emitted:
@@ -794,9 +814,17 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         # 自动回到「下一 FINAL 同坐标系」(余段视角),不会对已提交子句重复开火。
         _spec_feed = text
         if self._server_utt:
-            # 服务端分句档：commit 由 _server_definite_commits 驱动（definite 即 FINAL），
-            # 本地三层闸不跑；display=全文剥已发 definite 前缀（startswith 主路，
-            # 失配显示全文——服务端驱动下罕见，对齐兜底在 EOS 路径）。
+            # 混合档（call-72cf9f49 翻案二折）：服务端 definite 管停顿边界（准），
+            # 本地意群闸管连续语流（快——definite 需要 ≥end_window 静音窗，连续
+            # 长讲零 definite=LLM 空等，49 字三句攒一坨实弹定案）。
+            # 前缀坐标共享：definite 到达时按前缀合并只发增量（_server_definite_commits）。
+            now = time.monotonic()
+            uncommitted = text[self._cc_committed_len:] if text.startswith(self._cc_committed_text or "\x00") else text
+            if self._cc_starve_t0 <= 0.0 and len(uncommitted.strip()) >= 4:
+                self._cc_starve_t0 = now  # 未提交文本开始积了：饥饿钟起跑
+            if self._cc_starve_t0 > 0.0 and now - self._cc_starve_t0 >= 1.2:
+                # 连续语流 ≥1.2s 无 definite → 本地闸接管（意群档 12/15/1.2 env）
+                self._maybe_clause_commit(text, _prev)
             if self._cc_committed_text and text.startswith(self._cc_committed_text):
                 display = text[self._cc_committed_len:]
             else:
@@ -1015,6 +1043,8 @@ class _DoubaoLiveStream(stt.RecognizeStream):
         self._cc_seg_t0 = 0.0
         self._cc_commits = 0
         self._su_emitted = 0  # 服务端分句计数随段清（新 utterance 从头数）
+        self._su_concat = ""  # definite 累积文本随段清（前缀合并坐标）
+        self._cc_starve_t0 = 0.0  # 饥饿钟随段清
         # 暴露位随段清零；FINAL 发出点按 pre-reset 快照重贴（与 Qwen3 版契约一致）。
         self._stt_._turn_partial_text = ""
 

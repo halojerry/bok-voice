@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 
 import pytest
 from agent_runtime.interp_lite.config import build_instructions
@@ -255,6 +256,10 @@ def test_server_definite_commits_stream():
         events: list[tuple[str, str]] = []
 
         class _FakeCh:
+            @staticmethod
+            def close():
+                pass
+
             def send_nowait(self, ev):
                 t = ev.alternatives[0].text if ev.alternatives else ""
                 events.append((str(ev.type).split(".")[-1], t))
@@ -284,6 +289,77 @@ def test_server_definite_commits_stream():
     assert finals == ["你好，", "今天天气怎么样？"]  # 按序、无重复
     interims = [t for n, t in events if n == "INTERIM_TRANSCRIPT"]
     assert all("你好" not in i or i.endswith("怎么样") or i == "你好，今天天气怎么样" for i in interims)
+
+
+def test_server_hybrid_starve_and_merge(monkeypatch):
+    """混合档：连续语流饥饿→本地闸接管；definite 后到→前缀合并只发增量不重发。"""
+    import asyncio
+
+    from agent_runtime.providers import doubao_asr as da
+    from agent_runtime.providers.doubao_asr import DoubaoSTT, _DoubaoLiveStream
+
+    async def scenario():
+        stt = DoubaoSTT(api_key="k", clause_commit=True, server_utterances=True, len_fuse=True)
+        stream = _DoubaoLiveStream(stt, conn_options=da.APIConnectOptions())
+        events: list[tuple[str, str]] = []
+
+        class _FakeCh:
+            @staticmethod
+            def close():
+                pass
+
+            def send_nowait(self, ev):
+                t = ev.alternatives[0].text if ev.alternatives else ""
+                events.append((str(ev.type).split(".")[-1], t))
+
+        stream._event_ch = _FakeCh()
+        monkeypatch.setenv("QWEN3_ASR_COMMIT_MIN_INTERVAL_S", "0")
+        monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "8")
+        # 连续语流：无 definite，本地闸意群档接管（饥饿 ≥1.2s + 标点稳定）。
+        stream._maybe_interim("我今天想去")
+        stream._cc_starve_t0 -= 2.0  # 模拟饥饿钟已跑 2s
+        # 跨 interim 稳定（闸的判据：候选段在上一 interim 同坐标一致）——三连喂
+        stream._maybe_interim("我今天想去酒店那边，你")
+        stream._maybe_interim("我今天想去酒店那边，你知")  # 稳定后 → 本地闸切
+        await stream.aclose()
+        return events, stream
+
+    events, stream = asyncio.run(scenario())
+    finals = [t for n, t in events if n == "FINAL_TRANSCRIPT"]
+    assert any("酒店那边" in t for t in finals)  # 饥饿接管出了本地闸 FINAL
+
+    # definite 后到（覆盖已提交前缀）→ 前缀合并只发增量。
+    async def scenario2():
+        committed = stream._cc_committed_text
+        stream2 = _DoubaoLiveStream(
+            DoubaoSTT(api_key="k", clause_commit=True, server_utterances=True), conn_options=da.APIConnectOptions()
+        )
+        ev2: list[str] = []
+
+        class _Ch2:
+            @staticmethod
+            def close():
+                pass
+
+            def send_nowait(_, ev):
+                ev2.append(ev.alternatives[0].text if ev.alternatives else "")
+
+        stream2._event_ch = _Ch2()
+        # 本地闸已交「我今天想去酒店check，」；definite 全文到达
+        stream2._cc_committed_text = committed
+        stream2._cc_committed_len = len(committed)
+        stream2._su_concat = ""  # 本地闸提交不进 su_concat（definite 坐标系独立起算）
+        stream2._on_payload({
+            "result": {
+                "text": committed + "不然不行",
+                "utterances": [{"text": committed + "不然不行", "definite": True}],
+            }
+        })
+        await stream2.aclose()
+        return ev2
+
+    ev2 = asyncio.run(scenario2())
+    assert [t for t in ev2 if t.strip()] == ["不然不行"]  # 只发增量，不重发前缀（空尾巴滤）
 
 
 def test_len_fuse_cut_pure():
