@@ -321,23 +321,31 @@ def test_tail_flush_channel_guard_semantics():
             sent.append(msg)
 
     class _Sess:
-        def __init__(self, ws):
+        def __init__(self, ws, active_epoch=0):
             self._ws = ws
+            self.active_epoch = active_epoch  # 认领纪元(call-4322e14d:催尾须打 owner 戳)
+            self.flush_epoch = 0
 
         def _alive(self):
             return self._ws is not None
 
     class _TTS:
-        def __init__(self, ws):
-            self._s = _Sess(ws)
+        def __init__(self, ws, active_epoch=0):
+            self._s = _Sess(ws, active_epoch)
 
         def _bidi_session(self):
             return self._s
 
-    asyncio.run(tail_flush_channel(_TTS(_WS()))())
-    assert sent == ['{"event": "task_flush"}']
+    stamp = _TTS(_WS(), active_epoch=3)
+    asyncio.run(tail_flush_channel(stamp)())
+    assert sent == ['{"event": "task_flush"}']  # 有认领任务=催
+    assert stamp._s.flush_epoch == 3  # 发送前把 ack 归属钉在当前认领流上
 
-    asyncio.run(tail_flush_channel(_TTS(None))())  # 连接不在场=no-op
+    # 无认领任务(active_epoch==0)=无事可催:催空任务只会污染 flush 握手 → no-op。
+    asyncio.run(tail_flush_channel(_TTS(_WS(), active_epoch=0))())
+    assert len(sent) == 1
+
+    asyncio.run(tail_flush_channel(_TTS(None, active_epoch=3))())  # 连接不在场=no-op
     assert len(sent) == 1
 
     class _Other:  # 非 MiniMax 装配（无 _bidi_session 面）=永久 no-op
@@ -350,7 +358,7 @@ def test_tail_flush_channel_guard_semantics():
         async def send(self, msg):
             raise RuntimeError("dead ws")
 
-    asyncio.run(tail_flush_channel(_TTS(_BoomWS()))())  # 发送异常静默吞
+    asyncio.run(tail_flush_channel(_TTS(_BoomWS(), active_epoch=3))())  # 发送异常静默吞
     assert len(sent) == 1
 
 

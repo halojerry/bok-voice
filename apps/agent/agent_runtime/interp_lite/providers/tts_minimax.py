@@ -79,7 +79,12 @@ def tail_flush_channel(tts_provider):
     （纯增益，绝不成为新故障源）；**只发不收**——ack（task_flushed）由当前在播
     流的 recv 循环消费（触发点=当前 say 刚排干，recv 必仍在 flushed 等待窗内；
     本通道绝不并发读连接，防偷帧）。非 MiniMax 装配（无 ``_bidi_session`` 面）
-    =永久 no-op，调用方无需判型。"""
+    =永久 no-op，调用方无需判型。
+
+    纪元打戳（call-4322e14d 中毒根因修复，2026-10-09）：发送前把
+    ``session.flush_epoch`` 钉在当前 ``active_epoch``——ack 若迟到且下一流已
+    认领新纪元，下一流 recv 按纪元门禁吞掉这枚 ack（不再误当自己的收尾 ack
+    提前早退=吞句）。``active_epoch==0``（无认领任务）= 无可催之尾，no-op。"""
     async def _flush() -> None:
         session = None
         try:
@@ -94,6 +99,10 @@ def tail_flush_channel(tts_provider):
             ws = session._ws
             if ws is None or not session._alive():
                 return
+            owner = getattr(session, "active_epoch", 0)
+            if owner == 0:
+                return  # 无在播任务认领:催空任务只会污染握手,无事可催
+            session.flush_epoch = owner  # 发前打戳:ack 归属=当前认领流
             await ws.send(json.dumps({"event": "task_flush"}))
         except asyncio.CancelledError:
             raise

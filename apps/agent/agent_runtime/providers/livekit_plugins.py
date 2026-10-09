@@ -5254,6 +5254,16 @@ class _MiniMaxBidiSession:
         # （MINIMAX_BIDI_DROP_STALE），唔会漏进下一个流的 emitter。0=尚无认领。
         self.active_epoch = 0
         self._epoch_seq = 0
+        # flush 握手所有权（call-4322e14d 中毒根因，2026-10-09）：task_flush 的 ack
+        # （task_flushed）服务端不带纪元——迟到 ack（上一流的收尾 flush / 原始催尾
+        # 通道发出的）在下一流已认领后才到达，会被下一流 recv 当成自己的收尾 ack，
+        # 提前置 _flushed_evt → 0.5s 空闲早退 → 本流零音频（sentences=0 族=译文
+        # 无声吞句）+ 后续流 DROP_STALE 连锁 + flushed 永不到的 15s+20s 锁滞
+        # （实弹 12 句 perceived 20-39s 卡死）。修法=每个 task_flush 发送点先在此
+        # 打 owner 戳（=发送流纪元 / 原始通道=当前 active_epoch）；recv 只认
+        # owner==my_epoch 的 ack，owner 不符即吞掉并打点。0=无在途握手（旧语义：
+        # 照常接受——warmup 等会话级 flush 的消费方不在流内）。
+        self.flush_epoch = 0
         # 供 PERF 打点:ensure_ready 本次是复用还是新连
         self.last_reused = False
         self.last_connect_ms = 0.0
@@ -5373,6 +5383,7 @@ class _MiniMaxBidiSession:
             raise RuntimeError(f"MINIMAX bidi task_start failed: {str(resp)[:200]}")
         self._ws = ws
         self._params = params
+        self.flush_epoch = 0  # owner 戳是连接域:旧连接的握手唔可带到新连接(2201 重连族)
         self._start_ping(ws)
         self._prewarm_retries = 0  # 连接成功,重试计数归零
 
@@ -5826,7 +5837,20 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             buf.clear()
                             state["audio_ever"] = True  # orch2-C:尾块推清也算已出声
                         if event == "task_flushed":
-                            if state.get("head_flush_pending"):
+                            _owner = session.flush_epoch
+                            session.flush_epoch = 0  # 握手一次性:无论归属,ack 到即消费
+                            if _owner and _owner != my_epoch:
+                                # 纪元门禁(call-4322e14d):这枚 ack 属于别的流的
+                                # task_flush(上一流收尾/原始催尾通道)——绝不可置
+                                # 本流的 _flushed_evt(早退=零音频吞句中毒链源头)。
+                                if not state.get("stale_ack_logged"):
+                                    state["stale_ack_logged"] = True
+                                    print(
+                                        f"MINIMAX_BIDI_FLUSH_ACK_STALE epoch={my_epoch} "
+                                        f"owner={_owner} (ignored)",
+                                        flush=True,
+                                    )
+                            elif state.get("head_flush_pending"):
                                 # 头段催产 flush 的 ack(非收尾):唔收摊,recv 继续
                                 # 30s 等待窗照常吃余句音频。流已收尾(头段=整条
                                 # 回复)时,这次 ack 同时兼任收尾 ack。
@@ -5836,6 +5860,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             else:
                                 self._flushed_evt.set()
                         elif event == "task_canceled":
+                            session.flush_epoch = 0  # cancel 压过在途 flush 握手
                             self._canceled_evt.set()
                         elif event == "task_finished":
                             return
@@ -6096,6 +6121,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                         if _reconnecting.is_set():
                                             await _reconnecting.wait()
                                         state["head_flush_pending"] = True
+                                        session.flush_epoch = my_epoch  # 发前打戳:ack 归属本流
                                         await ws.send(json.dumps({"event": "task_flush"}))
                                         print(
                                             f"MINIMAX_BIDI_HEAD_FLUSH sent "
@@ -6224,6 +6250,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             if _reconnecting.is_set():
                                 await _reconnecting.wait()
                             t_flush = time.monotonic()
+                            # 发前打 owner 戳(2026-10-09):ack 只认本流纪元——迟到 ack
+                            # 由下一流按纪元吞掉(中毒链根因修复,call-4322e14d)。
+                            session.flush_epoch = my_epoch
                             await ws.send(json.dumps({"event": "task_flush"}))
                     except Exception:  # noqa: BLE001
                         pass

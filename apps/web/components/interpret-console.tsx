@@ -1711,7 +1711,13 @@ function ConsoleLive(p: LiveProps) {
   }, [p.interpOn, meSrcCount]);
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    // useLayoutEffect 时机（DOM 已更新但未绘制）+ rAF 双保险——字幕双栏
+    // 任一列新增内容都滚到最新行（Ethan 2026-10-09 反馈「字幕应该实时滚到最新」）
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
   }, [items]);
   // 半双工/出声口径(TTS 暂让徽标与字幕脚注专用):纯 TTS hold,与译文到达无关。
   const holdBusy = p.meHeld || p.othHeld;

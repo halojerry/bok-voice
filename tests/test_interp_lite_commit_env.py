@@ -73,6 +73,7 @@ def test_worker_specs_old_line_untouched(monkeypatch):
     interp = [s for s in specs if s["name"] == "interp-fwd"]
     assert "agent_runtime.interpret" in interp[0]["argv"]
     e = interp[0]["env"]
+    # a63c1d8 切分调档后 B 档缺省（逗号12/长度18/限速1.5）——pin 随调档同步。
     assert (e["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"],
             e["QWEN3_ASR_CLAUSE_LEN_CHARS"],
-            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("6", "8", "1.0")
+            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("12", "18", "1.5")

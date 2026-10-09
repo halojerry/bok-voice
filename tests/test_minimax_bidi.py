@@ -922,3 +922,120 @@ def test_synth_warmup_fail_no_invalidate(monkeypatch, capsys):
     assert "MINIMAX_BIDI_SYNTH_WARMUP_FAIL" in out
     assert "MINIMAX_TTS_BIDI_PREWARM_FAIL" not in out, "暖机失败唔应升级成预热失败"
     assert "MINIMAX_TTS_BIDI_PREWARM connect_ms=" in out, "预热主流程应照常成功收尾"
+
+
+# ---- flush ack 纪元门禁（call-4322e14d 中毒根因回归,2026-10-09）----
+
+
+def test_stray_flush_ack_ignored_by_next_stream(monkeypatch, capsys):
+    """迟到 task_flushed ack(属上一流的催尾)在下一流已认领后才到达——下一流
+    必须按纪元吞掉,绝不可误当自己的收尾 ack 提前置 _flushed_evt 早退
+    (实弹 sentences=0 族=译文无声吞句 + DROP_STALE 连锁的根因)。"""
+    ws = _QueueWS()
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    from agent_runtime.interp_lite.providers.tts_minimax import tail_flush_channel
+
+    ch = tail_flush_channel(tts)
+    fresh_hex = "22" * 2000  # 流 2 自己的合成音频
+    got = {"audio": bytearray()}
+
+    async def run():
+        # 流 1:推文本认领纪元 → 打断(cancel 快速应答,连接保留,锁释放)。
+        s1 = tts.stream()
+        s1.push_text("你好。")
+        assert await _wait_for(lambda: len(_continue_texts(ws)) >= 1), _continue_texts(ws)
+        s1._task.cancel()
+        ws.server_push(_CANCELED)
+        await _wait_for(lambda: s1._task.done(), timeout=10)
+
+        # 原始催尾通道在流 1 收摊后才发(owner=流 1 纪元)——服务端 ack 迟到。
+        await ch()
+        assert "task_flush" in _events(ws), _events(ws)
+
+        # 流 2 复用连接:认领新纪元后,上一轮催尾的迟到 ack 才到达。
+        s2 = tts.stream()
+        s2.push_text("再见")
+        assert await _wait_for(lambda: "再见" in _continue_texts(ws)), _continue_texts(ws)
+        ws.server_push(_FLUSHED)  # ← 毒物:属流 1 的 flush 的 ack
+        ws.server_push('{"data": {"audio": "' + fresh_hex + '"}}')
+        s2.end_input()  # 流 2 自己的收尾 flush(owner=流 2)
+        await asyncio.sleep(0.1)
+        ws.server_push(_FLUSHED)  # 流 2 自己的 ack(owner 匹配,放行收摊)
+
+        async for a in s2:
+            got["audio"] += bytes(a.frame.data)
+        await _wait_for(lambda: s2._task.done(), timeout=10)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=15))
+    audio = bytes(got["audio"])
+    assert b"\x22\x22" in audio, "流 2 自己的音频应照常收到(不被迟到 ack 早退吞掉)"
+    out = capsys.readouterr().out
+    assert "MINIMAX_BIDI_FLUSH_ACK_STALE" in out, "迟到 ack 应被纪元门禁吞掉并打点"
+
+
+def test_tail_flush_channel_noop_without_active_task(monkeypatch):
+    """active_epoch==0(无认领任务)时原始催尾通道 no-op——催空任务只会
+    污染 flush 握手,无事可催。"""
+    from agent_runtime.interp_lite.providers.tts_minimax import tail_flush_channel
+
+    ws = _QueueWS()
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    ch = tail_flush_channel(tts)
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        await _wait_for(lambda: session._prewarm_task.done(), timeout=10)
+        assert session._ws is ws and session.active_epoch == 0
+        await ch()
+        events = [m.get("event") for m in ws.sent]
+        assert "task_flush" not in events, f"无认领任务不应催尾: {events}"
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_own_flush_ack_still_honored_after_stale(monkeypatch, capsys):
+    """同一条连接上先吞一枚迟到 ack,自己 flush 的 ack 必须照常放行
+    (门禁只挡 owner 不符,唔可把合法收尾也挡掉)。"""
+    ws = _QueueWS()
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+
+    fresh_hex = "33" * 2000
+    got = {"audio": bytearray(), "flush_wait_s": 0.0}
+
+    async def run():
+        s1 = tts.stream()
+        s1.push_text("第一句")
+        assert await _wait_for(lambda: "第一句" in _continue_texts(ws)), _continue_texts(ws)
+        s1._task.cancel()
+        ws.server_push(_CANCELED)
+        await _wait_for(lambda: s1._task.done(), timeout=10)
+        # 伪一枚在途握手归属上一流(模拟上一流的催尾已发、ack 未到)。
+        session = tts._bidi_session()
+        session.flush_epoch = 1  # 流 1 的纪元
+
+        s2 = tts.stream()
+        s2.push_text("第二句")
+        assert await _wait_for(lambda: "第二句" in _continue_texts(ws)), _continue_texts(ws)
+        ws.server_push(_FLUSHED)  # owner=1 ≠ 流 2 → 吞
+        ws.server_push('{"data": {"audio": "' + fresh_hex + '"}}')
+        s2.end_input()  # owner=流 2
+        await asyncio.sleep(0.1)
+        ws.server_push(_FLUSHED)  # owner=流 2 → 放行,收摊
+        t0 = time.monotonic()
+        async for a in s2:
+            got["audio"] += bytes(a.frame.data)
+        await _wait_for(lambda: s2._task.done(), timeout=10)
+        got["flush_wait_s"] = time.monotonic() - t0
+
+    asyncio.run(asyncio.wait_for(run(), timeout=15))
+    assert b"\x33\x33" in bytes(got["audio"])
+    out = capsys.readouterr().out
+    assert "MINIMAX_BIDI_FLUSH_ACK_STALE" in out
+    assert got["flush_wait_s"] < 5, "自己的 ack 应即时放行,唔应等 15s 超时"

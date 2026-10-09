@@ -1667,14 +1667,14 @@ def test_commit_interval_env_knob():
 
 
 def test_interp_env_boundary_tightening_defaults():
-    """B 线延迟压刀三收紧落 _interp_env setdefault(2026-10-06):逗号档 8→6/
-    长度档 10→8/限速 1.5→1.0;显式 env 不抢(逃生口)。"""
+    """B 线提交边界缺省(a63c1d8 切分调档后:逗号 12/长度 18/限速 1.5——
+    标点驱动档);显式 env 不抢(逃生口)。"""
     env = bok.env._interp_env({})
-    assert env.get("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS") == "6"
-    assert env.get("QWEN3_ASR_CLAUSE_LEN_CHARS") == "8"
-    assert env.get("QWEN3_ASR_COMMIT_MIN_INTERVAL_S") == "1.0"
-    env2 = bok.env._interp_env({"QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "1.5"})
-    assert env2["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "1.5"  # 显式逃生不抢
+    assert env.get("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS") == "12"
+    assert env.get("QWEN3_ASR_CLAUSE_LEN_CHARS") == "18"
+    assert env.get("QWEN3_ASR_COMMIT_MIN_INTERVAL_S") == "1.5"
+    env2 = bok.env._interp_env({"QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "1.0"})
+    assert env2["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "1.0"  # 显式逃生不抢
 
 
 def test_a_lane_env_untouched_boundary_keys():
