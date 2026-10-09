@@ -856,6 +856,14 @@ _FORWARD_ENV = (
     #    深度门（qsize ≥ depth 才算忙）；缺省 2=深度门（正常说话节奏闸恒开），
     #    1=旧「非空即封」档一键回退；坏值回 2/<1 钳 1；_interp_env 透传白名单同键 ——
     "BOK_INTERP_SPEC_BUSY_DEPTH",
+    # —— S2 spec defer 自适应续窗两键（2026-10-09，call-4322e14d 六发零中主刀；
+    #    读键姿势=模块常量+os.environ.get(_ENV)，静态扫描器不认字面量，此处显式
+    #    登记即立法；_interp_env 透传白名单同键）：
+    #    BOK_INTERP_SPEC_DEFER_MAX_S defer 续窗硬帽秒（缺省 8；0=关回 C2 固定窗
+    #    旧行为）；BOK_INTERP_SPEC_REFIRE_CHARS defer 期增 prefix 再投机门槛
+    #    （新增内容字 ≥N 重发投机替槽；缺省 6；负数钳 0=只续窗不替槽） ——
+    "BOK_INTERP_SPEC_DEFER_MAX_S",
+    "BOK_INTERP_SPEC_REFIRE_CHARS",
     # —— W3b 刀2/刀3（2026-10-08，体检:回声重复 34+26 次/结巴照译）：
     #    BOK_INTERP_ECHO_DEDUP 本向回声/重复判重总闸（默认 1；0=关回旧行为）；
     #    BOK_INTERP_ECHO_DUP_WINDOW_S dup-final 判重窗（默认 8.0；坏值回缺省）；
@@ -1073,6 +1081,12 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         # W3b spec busy 闸放宽 2026-10-08：FIFO 深度门（缺省 2；1=旧非空即封档；
         # B 线 worker 专属，_FORWARD_ENV 已登记）。
         "BOK_INTERP_SPEC_BUSY_DEPTH",
+        # S2 spec defer 自适应续窗两键 2026-10-09（call-4322e14d 六发零中主刀）：
+        # DEFER_MAX_S=续窗硬帽秒（缺省 8；0=关回 C2 固定窗旧行为）；
+        # REFIRE_CHARS=增 prefix 再投机门槛（缺省 6；0=只续窗不替槽）。
+        # _FORWARD_ENV 已显式登记，此处 B 线透传白名单同键。
+        "BOK_INTERP_SPEC_DEFER_MAX_S",
+        "BOK_INTERP_SPEC_REFIRE_CHARS",
         # W3b 刀2/刀3 2026-10-08：本向回声/重复判重（总闸+判重窗）+结巴折叠
         #（B 线 worker 专属，_FORWARD_ENV 已登记）。
         "BOK_INTERP_ECHO_DEDUP",

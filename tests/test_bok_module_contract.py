@@ -127,7 +127,9 @@ _FORWARD_ENV_SNAPSHOT: frozenset[str] = frozenset({
     "BOK_INTERP_REV_AUDIO",
     "BOK_INTERP_SERVER_UTT",
     "BOK_INTERP_SPEC_BUSY_DEPTH",
+    "BOK_INTERP_SPEC_DEFER_MAX_S",
     "BOK_INTERP_SPEC_MT",
+    "BOK_INTERP_SPEC_REFIRE_CHARS",
     "BOK_INTERP_SPEC_RIGHT_CTX",
     "BOK_INTERP_SPEC_WAIT_S",
     "BOK_INTERP_SRC_HEAL",
@@ -352,7 +354,11 @@ _FORWARD_ENV_SNAPSHOT: frozenset[str] = frozenset({
     "VOLC_TTS_ENDPOINT",
     "WEB_SEARCH",
 })
-assert len(_FORWARD_ENV_SNAPSHOT) == 303, "快照含重复键（生成脚本口径坏了）"
+<<<<<<< HEAD
+assert len(_FORWARD_ENV_SNAPSHOT) == 305, "快照含重复键（生成脚本口径坏了）"
+=======
+assert len(_FORWARD_ENV_SNAPSHOT) == 305, "快照含重复键（生成脚本口径坏了）"
+>>>>>>> session-20261009-s2defer
 
 
 def test_forward_env_table_literal_is_unique_in_tools():
@@ -371,7 +377,11 @@ def test_forward_env_key_set_matches_frozen_snapshot():
         f"_FORWARD_ENV 键面漂移：新增 {added}，删除 {removed} ——"
         "更新表必须同步更新 tests/test_bok_module_contract.py 快照（显式立法动作）"
     )
-    assert len(current) == 303
+<<<<<<< HEAD
+    assert len(current) == 305
+=======
+    assert len(current) == 305
+>>>>>>> session-20261009-s2defer
 
 
 def test_control_plane_env_def_is_unique_in_tools():
