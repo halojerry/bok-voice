@@ -74,8 +74,10 @@ function build(outDirName, env) {
   const out = path.join(ROOT, "out");
   const dest = path.join(ROOT, outDirName);
   if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
-  fs.renameSync(out, dest);
-  console.log(`[build-variants] 产物落 ${outDirName}/`);
+  // 复制不挪窝（CI 实弹翻车钉死：rename 会把 out/ 抢走，后续 thin-client
+  // 探针/产物 grep 扑空）——platform-out 是对照档，out/ 原位保留。
+  fs.cpSync(out, dest, { recursive: true });
+  console.log(`[build-variants] 产物复制到 ${outDirName}/（out/ 原位保留）`);
 }
 
 const mode = process.argv[2] || "customer";

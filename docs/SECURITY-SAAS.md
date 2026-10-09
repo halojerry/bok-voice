@@ -9,7 +9,7 @@
 | 入口 | 端口 | 说明 |
 |---|---|---|
 | CP | :8000 | `/api/*` + 静态台托管（`BOK_AUTH_REQUIRED=1` 强制，见下） |
-| web 静态产物 | :443（经 nginx/云 LB） | `apps/web/out/`（客户档，`npm run build` 产物） |
+| web 静态产物 | :443（经 nginx/云 LB） | 客户档产物（apps/web 下 `npm run build` 的 out 目录，非仓库跟踪文件） |
 | LiveKit | :7880 (+TURN) | WebRTC 信令/媒体；API key/secret 只在服务端 env |
 
 **必须内网**（compose `network_mode`/不声明 `ports:`）：agent worker :8081-8083、ASR/TTS sidecar :8787/:8788、csc :8792、laya :8791、LLM :1234-1239、queue_proxy、Redis、Postgres/Supabase pooler、node_agent :3000（云形态不部署）。
