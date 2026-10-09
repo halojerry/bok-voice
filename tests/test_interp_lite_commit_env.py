@@ -1,6 +1,6 @@
-"""薄线句档提交缺省（W6×interp-lite 合流刀1）三态钉死——2026-10-09。
+"""薄线意群档提交缺省（W6×interp-lite 合流刀1）三态钉死——2026-10-09。
 
-优先序=运营显式 env > 薄线句档（999/20/2.0）> B 档碎片缺省（6/8/1.0）。
+优先序=运营显式 env > 薄线意群档（12/15/1.2）> B 档碎片缺省（6/8/1.0）。
 语义依据：docs/superpowers/plans/2026-10-09-bline-fluency.md（病=碎片化串行）。
 """
 
@@ -37,9 +37,9 @@ def test_pure_overrides_fragment_defaults(monkeypatch):
     _clean(monkeypatch)
     base = dict(_FRAGMENT_BASE)
     out = servers.interp_lite_commit_env(base)
-    assert out["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"] == "999"  # 逗号档结构性关闭
-    assert out["QWEN3_ASR_CLAUSE_LEN_CHARS"] == "30"  # 无标点保险丝（实弹定档 2026-10-09）
-    assert out["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "2.0"  # 句档限速
+    assert out["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"] == "12"  # 逗号档=意群门槛(call-b3e4e391 定档)
+    assert out["QWEN3_ASR_CLAUSE_LEN_CHARS"] == "15"  # 无标点保险丝（两轮实弹定档）
+    assert out["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "1.2"  # 意群档限速
     assert base == _FRAGMENT_BASE  # 入参零 mutate
 
 
@@ -48,7 +48,7 @@ def test_pure_operator_explicit_wins(monkeypatch):
     monkeypatch.setenv("QWEN3_ASR_CLAUSE_LEN_CHARS", "12")
     out = servers.interp_lite_commit_env(dict(_FRAGMENT_BASE))
     assert out["QWEN3_ASR_CLAUSE_LEN_CHARS"] == "12"  # 运营显式最高
-    assert out["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "2.0"  # 未显式的仍句档
+    assert out["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"] == "1.2"  # 未显式的仍意群档
 
 
 def test_worker_specs_lite_wiring(monkeypatch):
@@ -63,7 +63,7 @@ def test_worker_specs_lite_wiring(monkeypatch):
     e = interp[0]["env"]
     assert (e["QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS"],
             e["QWEN3_ASR_CLAUSE_LEN_CHARS"],
-            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("999", "30", "2.0")
+            e["QWEN3_ASR_COMMIT_MIN_INTERVAL_S"]) == ("12", "15", "1.2")
 
 
 def test_worker_specs_old_line_untouched(monkeypatch):

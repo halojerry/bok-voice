@@ -1183,28 +1183,29 @@ def _interp_worker_module() -> str:
 
 
 def interp_lite_commit_env(base: dict) -> dict:
-    """薄线句档提交缺省（W6×interp-lite 合流刀1，2026-10-09；纯函数，单测直喂）。
+    """薄线意群档提交缺省（W6×interp-lite 合流刀1，2026-10-09 两轮实弹定档；纯函数，单测直喂）。
 
     W6 立项档（docs/superpowers/plans/2026-10-09-bline-fluency.md）60 条 INTERP_LAG
     分布定案：病=碎片化串行（src_chars p50=10 字、段间天窗复利），不是 MT 腿——
     旧线 B 档「逗号 6 字/限速 1.0s」把语流切成 2 秒碎片。本函数给**薄线 worker**
-    注入句档缺省（翻译单元=句末标点，出声即连续长段）：
+    注入意群档缺省（翻译单元=意群 10-15 字，W6 参照系「意群边界」原话）：
 
-    - ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=999``：逗号（次级标点）档结构性关闭，
-      只认句末标点（。！？；?!，强档另有 ≥6 字门不受此键影响）；
-    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=30``：连续无标点语流 30 内容字保险丝（实弹
-      定档 2026-10-09：30 字档 seg_p50=4.9s/onset 10.1s vs 20 字档 3.4s/9.4s，
-      大窗同源=提交节律非保险丝宽度；拉丁 2× 语义在 provider 内）；
-    - ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S=2.0``：句档限速。
+    - ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=12``：逗号（次级标点）档门槛 12 字
+      ——**真人实测两轮定档**（call-b3e4e391）：999 句档单元 30+ 字=7-8 秒大段
+      音频，尾部排队滞后 7-10 秒（「大块迟到」非跟读）；6 字碎片档=2 秒天窗。
+      12 字=意群级，每段 2.5-4 秒音频，语流中每 2-3 秒一段；
+    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=15``：无标点语流 15 内容字保险丝（同轮定档；
+      拉丁 2× 语义在 provider 内）；
+    - ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S=1.2``：意群档限速。
 
     三键语义=**覆盖 B 档碎片缺省**（``_interp_env`` 已 setdefault 6/8/1.0 进 base，
-    故本函数必须硬覆盖而非 setdefault），优先序=运营显式 env > 薄线句档 > B 档
+    故本函数必须硬覆盖而非 setdefault），优先序=运营显式 env > 薄线意群档 > B 档
     碎片缺省。键集全部既有（_FORWARD_ENV 已登记，零新键）；worker 进程 env 各自
     独立，旧线（开关关）零感知。回退=serve env 显式设旧值或 BOK_INTERP_LITE=0。"""
     profile = {
-        "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS": "999",
-        "QWEN3_ASR_CLAUSE_LEN_CHARS": "30",
-        "QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "2.0",
+        "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS": "12",
+        "QWEN3_ASR_CLAUSE_LEN_CHARS": "15",
+        "QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "1.2",
     }
     out = dict(base)
     out.update(profile)
