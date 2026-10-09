@@ -1163,6 +1163,25 @@ def _realtime_demo_enabled() -> bool:
     return os.environ.get("BOK_QWEN_REALTIME", "") == "1"
 
 
+def _interp_lite_enabled() -> bool:
+    """B 线薄线随栈开关（opt-in，2026-10-09 interp-lite 试点）：BOK_INTERP_LITE="1"
+    时 interp-fwd/rev 两 worker 改拉 ``agent_runtime.interp_lite.worker``。
+
+    serve 侧开关（BOK_LOCAL_TTS 先例，不进 _FORWARD_ENV——worker 不读它，bokctl
+    读）；端口/agent_name/健康面与旧线同槽位（8082/8083、bok-interp-fwd/rev），CP/
+    前端零感知。切换=重启栈（试点期例外，蓝图 docs/superpowers/plans/
+    2026-10-09-interp-lite.md §7）；默认 0=旧线逐字节。"""
+    return os.environ.get("BOK_INTERP_LITE", "") == "1"
+
+
+def _interp_worker_module() -> str:
+    return (
+        "agent_runtime.interp_lite.worker"
+        if _interp_lite_enabled()
+        else "agent_runtime.interpret"
+    )
+
+
 def _worker_specs(py) -> list[dict]:
     """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
     + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
@@ -1193,7 +1212,9 @@ def _worker_specs(py) -> list[dict]:
                 "port": _port,
                 "pidfile": run_dir / f"interp-{_dir}.pid",
                 "logfile": log_dir / f"interp-{_dir}.log",
-                "argv": [str(py), "-m", "agent_runtime.interpret"],
+                # interp-lite 试点开关：BOK_INTERP_LITE=1 换薄线入口（同端口/同
+                # agent_name/同健康面；蓝图 2026-10-09-interp-lite.md）。
+                "argv": [str(py), "-m", _interp_worker_module()],
                 "env": interp_env,
             }
         )
