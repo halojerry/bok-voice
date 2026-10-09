@@ -1421,45 +1421,20 @@ function SubBubble({
   );
 }
 
-/** 双栏字幕单列(W4a):列头承担归属(我方/对方 + 语言短名),栏内按 pairSubtitles
- * 的组序渲染——原文在上、其翻译紧随;空栏画占位,不藏列(列的存在感=归属锚)。
- * playingIdx(2026-10-09)=正在播放的组序(agent 出声信标锚组,-1=无)。 */
+/** 双卡字幕组列表(2026-10-09 双卡改版):列头/空态由外层卡片承担——旧单列时代
+ * 的内嵌列头与「—」占位随双卡退役(Ethan 实弹指出双重显示),这里只渲染成组
+ * 气泡;playingIdx=正在播放的组序(agent 出声信标锚组,-1=无)高亮描边。 */
 function SubColumn({
-  title,
-  langShort,
   groups,
   mine,
   playingIdx = -1,
 }: {
-  title: string;
-  langShort: string;
   groups: SubGroup[];
   mine: boolean;
   playingIdx?: number;
 }) {
-  const playing = playingIdx >= 0;
   return (
     <section className="flex min-w-0 flex-col gap-2">
-      <div className="flex items-center gap-1.5 px-1">
-        <span className={`font-mono text-[11px] font-bold uppercase tracking-wide ${playing ? "text-(--live)" : "text-muted-foreground"}`}>{title}</span>
-        <span className="rounded-full border border-(--card-border) px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-          {langShort}
-        </span>
-        {playing && (
-          <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-(--live-soft) px-2 py-0.5 text-[10px] font-medium text-(--live-ink)">
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-(--live) opacity-60" />
-              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-(--live)" />
-            </span>
-            正在播放
-          </span>
-        )}
-      </div>
-      {groups.length === 0 && (
-        <div className="rounded-2xl border border-dashed border-(--card-border) px-3 py-3 text-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-          —
-        </div>
-      )}
       {groups.map((g, gi) => (
         <div
           key={g.src ? `s${g.src.idx}` : `d${g.dsts[0]?.idx ?? 0}`}
@@ -2139,7 +2114,18 @@ function ConsoleLive(p: LiveProps) {
           <section className="card flex min-h-0 flex-col gap-2 overflow-hidden">
             <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
               <span className="label">我方 · {LANG_SHORT[p.myLang] ?? p.myLang}→{LANG_SHORT[p.otherLang] ?? p.otherLang}</span>
-              <span className="font-mono text-[10px] text-muted-foreground">我说的话 + 给对方的译文</span>
+              <div className="flex items-center gap-2">
+                {playingIdx(myGroups, playMark.fwd) >= 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-(--live-soft) px-2 py-0.5 text-[10px] font-medium text-(--live-ink)">
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-(--live) opacity-60" />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-(--live)" />
+                    </span>
+                    正在播放
+                  </span>
+                )}
+                <span className="font-mono text-[10px] text-muted-foreground">我说的话 + 给对方的译文</span>
+              </div>
             </div>
             <div ref={myListRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
               {myGroups.length === 0 && (
@@ -2147,13 +2133,7 @@ function ConsoleLive(p: LiveProps) {
                   等你开口…
                 </div>
               )}
-              <SubColumn
-                title="我方"
-                langShort={`${LANG_SHORT[p.myLang] ?? p.myLang}→${LANG_SHORT[p.otherLang] ?? p.otherLang}`}
-                groups={myGroups}
-                mine
-                playingIdx={playingIdx(myGroups, playMark.fwd)}
-              />
+              <SubColumn groups={myGroups} mine playingIdx={playingIdx(myGroups, playMark.fwd)} />
             </div>
           </section>
         )}
@@ -2161,7 +2141,18 @@ function ConsoleLive(p: LiveProps) {
           <section className="card flex min-h-0 flex-col gap-2 overflow-hidden">
             <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
               <span className="label">对方 · {LANG_SHORT[p.otherLang] ?? p.otherLang}→{LANG_SHORT[p.myLang] ?? p.myLang}</span>
-              <span className="font-mono text-[10px] text-muted-foreground">对方说的话 + 给我的译文</span>
+              <div className="flex items-center gap-2">
+                {playingIdx(otherGroups, playMark.rev) >= 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-(--live-soft) px-2 py-0.5 text-[10px] font-medium text-(--live-ink)">
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-(--live) opacity-60" />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-(--live)" />
+                    </span>
+                    正在播放
+                  </span>
+                )}
+                <span className="font-mono text-[10px] text-muted-foreground">对方说的话 + 给我的译文</span>
+              </div>
             </div>
             <div ref={othListRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
               {otherGroups.length === 0 && (
@@ -2169,13 +2160,7 @@ function ConsoleLive(p: LiveProps) {
                   等对方开口…
                 </div>
               )}
-              <SubColumn
-                title="对方"
-                langShort={`${LANG_SHORT[p.otherLang] ?? p.otherLang}→${LANG_SHORT[p.myLang] ?? p.myLang}`}
-                groups={otherGroups}
-                mine={false}
-                playingIdx={playingIdx(otherGroups, playMark.rev)}
-              />
+              <SubColumn groups={otherGroups} mine={false} playingIdx={playingIdx(otherGroups, playMark.rev)} />
             </div>
           </section>
         )}
