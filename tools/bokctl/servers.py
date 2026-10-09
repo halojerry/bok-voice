@@ -1182,6 +1182,37 @@ def _interp_worker_module() -> str:
     )
 
 
+def interp_lite_commit_env(base: dict) -> dict:
+    """薄线句档提交缺省（W6×interp-lite 合流刀1，2026-10-09；纯函数，单测直喂）。
+
+    W6 立项档（docs/superpowers/plans/2026-10-09-bline-fluency.md）60 条 INTERP_LAG
+    分布定案：病=碎片化串行（src_chars p50=10 字、段间天窗复利），不是 MT 腿——
+    旧线 B 档「逗号 6 字/限速 1.0s」把语流切成 2 秒碎片。本函数给**薄线 worker**
+    注入句档缺省（翻译单元=句末标点，出声即连续长段）：
+
+    - ``QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=999``：逗号（次级标点）档结构性关闭，
+      只认句末标点（。！？；?!，强档另有 ≥6 字门不受此键影响）；
+    - ``QWEN3_ASR_CLAUSE_LEN_CHARS=20``：连续无标点语流 20 内容字保险丝（防憋死；
+      拉丁 2× 语义在 provider 内）；
+    - ``QWEN3_ASR_COMMIT_MIN_INTERVAL_S=2.0``：句档限速。
+
+    三键语义=**覆盖 B 档碎片缺省**（``_interp_env`` 已 setdefault 6/8/1.0 进 base，
+    故本函数必须硬覆盖而非 setdefault），优先序=运营显式 env > 薄线句档 > B 档
+    碎片缺省。键集全部既有（_FORWARD_ENV 已登记，零新键）；worker 进程 env 各自
+    独立，旧线（开关关）零感知。回退=serve env 显式设旧值或 BOK_INTERP_LITE=0。"""
+    profile = {
+        "QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS": "999",
+        "QWEN3_ASR_CLAUSE_LEN_CHARS": "20",
+        "QWEN3_ASR_COMMIT_MIN_INTERVAL_S": "2.0",
+    }
+    out = dict(base)
+    out.update(profile)
+    for key in profile:
+        if key in os.environ:  # 运营显式值最高优先
+            out[key] = os.environ[key]
+    return out
+
+
 def _worker_specs(py) -> list[dict]:
     """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
     + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
@@ -1206,6 +1237,9 @@ def _worker_specs(py) -> list[dict]:
         interp_env["BOK_SERVICE"] = f"interp-{_dir}"
         interp_env["INTERP_DIRECTION"] = _dir
         env._apply_interp_direction_env(interp_env, _dir)
+        # 薄线句档提交缺省（W6×interp-lite 合流刀1）：翻译单元=句末标点。
+        if _interp_lite_enabled():
+            interp_env = interp_lite_commit_env(interp_env)
         specs.append(
             {
                 "name": f"interp-{_dir}",

@@ -92,6 +92,8 @@ class InterpPipeline:
         self.first_ms = first_ms  # {"ms": int} 逐句覆写（观测口径同旧线）
         self.last_ms = {"ms": 0}  # 逐句 MT 总时长（worker 落库 latency_ms 消费）
         self.q: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+        self._enq: deque = deque()  # 入队时刻（FIFO 与 q 同序；queue_wait_ms 观测）
+        self.queue_wait_ms = {"ms": 0}  # 逐句 FIFO 等待（W6 刀3-lite 四段账）
         self.pairs: deque = deque(maxlen=8)  # (源,译) 滚动对
         self.lane_dead = {"reason": ""}
         self.round = 0
@@ -104,6 +106,7 @@ class InterpPipeline:
         except asyncio.QueueFull:
             print("[interp-lite] source queue overflow, sentence dropped(摘译)", flush=True)
             return
+        self._enq.append(time.perf_counter())
         self.lag.note_src(text)
 
     def _done(self, mt_ms: int) -> None:
@@ -119,6 +122,10 @@ class InterpPipeline:
     async def run(self) -> None:
         while True:
             text = await self.q.get()
+            t_enq = self._enq.popleft() if self._enq else None
+            self.queue_wait_ms["ms"] = (
+                int((time.perf_counter() - t_enq) * 1000) if t_enq is not None else 0
+            )
             self.round += 1
             t0 = time.perf_counter()
             try:

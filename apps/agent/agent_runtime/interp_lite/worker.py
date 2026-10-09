@@ -217,7 +217,7 @@ async def entrypoint(ctx) -> None:
             started_ms, ended_ms, perceived_ms = _lag_turn_timing(rec, time.monotonic(), _t0)
             print(
                 f"[interp-lite] INTERP_LAG src_chars={rec[1]} first_ms={_first_ms.get('ms') or 0} "
-                f"perceived_ms={perceived_ms}",
+                f"queue_ms={pipeline.queue_wait_ms.get('ms') or 0} perceived_ms={perceived_ms}",
                 flush=True,
             )
             _first_ms["ms"] = 0
