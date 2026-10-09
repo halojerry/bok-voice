@@ -257,6 +257,12 @@ async def entrypoint(ctx) -> None:
         if not text or role != "assistant":
             return
         own_translations.append(text)  # echo-dedup self-heard 参考料（本向近期译文）
+        # R7（V3 审计，话轮聚合适配）：每话轮只 1 个 conversation_item，但账本
+        # note_src/done_mt 仍逐句——先排掉超龄 pending（上话轮第 2..N 句残留），
+        # 防错配到本 item（INTERP_LAG 三列错位=验收数字失真）。逐句档恒 0。
+        _stale = _lag.drain_stale(10.0)
+        if _stale:
+            print(f"[interp-lite] INTERP_LAG turn-agg drained={_stale} (coalesced)", flush=True)
         # 播放态信标（2026-10-09 字幕「正在播放」指示）：assistant 项加入≈本句
         # 出声起点——向房间广播一枚不可靠小数据报（web 按 flow 标对应列、按
         # 文本前缀锚组、按字数估时长自灭）。text-only 档（无 TTS）不发——没有

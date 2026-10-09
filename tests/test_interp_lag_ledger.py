@@ -50,6 +50,28 @@ def test_lag_ledger_order_preservation():
     assert led.pop_pending() is None
 
 
+def test_lag_ledger_drain_stale():
+    """R7 话轮聚合适配：超龄 pending 排掉、龄内保留——排掉的不配对、后续不错位。"""
+    clock = {"v": 100.0}
+    led = _LagLedger(clock=lambda: clock["v"])
+    led.note_src("旧句一")  # t=100
+    led.note_src("旧句二")  # t=100
+    clock["v"] = 105.0
+    led.note_src("新句")  # t=105
+    led.done_mt(50)  # 旧句一 pending@100
+    led.done_mt(60)  # 旧句二 pending@100
+    led.done_mt(70)  # 新句 pending@105
+    clock["v"] = 112.0  # 10s 后：龄 12/12/7（帽 10）
+    assert led.drain_stale(10.0) == 2  # 两条超龄排掉
+    assert led.pop_pending()[1] == len("新句")  # 龄内保留、头=新句
+    assert led.pop_pending() is None
+    # 逐句档语义：全龄内=恒 0 零变化
+    led.note_src("a")
+    led.done_mt(1)
+    assert led.drain_stale(10.0) == 0
+    assert led.pop_pending() is not None
+
+
 def test_lag_ledger_empty_pop_returns_none():
     """空 pop=None(兜底句/异常轮不落时间列);空账上的 drop/done 都是 no-op。"""
     led = _LagLedger(clock=lambda: 1.0)

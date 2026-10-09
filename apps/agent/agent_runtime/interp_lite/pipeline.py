@@ -194,11 +194,13 @@ class InterpPipeline:
 
         2026-10-09 两轮修复收敛：HIT 不再走 say(audio=) 通道（与 say(text=)
         在框架 speech queue 内不保跨类型播放序——audio 零合成先出声=第二段
-        先播）。改为预计算译文**文本**入 FIFO，run 循环跳过 MT 直接 say(text)
+        先播）。改为预计算译文**文本**入 FIFO，run 循环跳过 MT 直接进话轮流
         走正常 TTS 合成管线——省 MT 时间（first_ms=0）+ 保播放序（同类型 say）。
+        R8（V3 审计）：队列项携带真源文（三元组）——run 循环回填 pairs 用
+        （源,译），旧 (译文,译文) 对污染 MT few-shot 上下文。
         """
         try:
-            self.q.put_nowait(("__precomputed__", text))
+            self.q.put_nowait(("__precomputed__", src, text))
         except asyncio.QueueFull:
             print("[interp-lite] precomputed queue overflow, dropped(摘译)", flush=True)
             return
@@ -267,11 +269,11 @@ class InterpPipeline:
                     self._say_text(_mt_fail_line(self.target_lang))
                     self._done(0)
                     continue
-                # spec HIT 预计算文本（跳 MT 直走 TTS 合成保播放序——同类型 say 串行）。
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__precomputed__":
-                    _, pre_text = item
+                # spec HIT 预计算文本（跳 MT 直进话轮流保播放序；R8 三元组带真源文）。
+                if isinstance(item, tuple) and len(item) == 3 and item[0] == "__precomputed__":
+                    _, pre_src, pre_text = item
                     self._say_text(pre_text)
-                    self.pairs.append((pre_text, pre_text))
+                    self.pairs.append((pre_src, pre_text))  # R8：真（源,译）对
                     continue
                 text = item
                 self.mt_busy["flag"] = True

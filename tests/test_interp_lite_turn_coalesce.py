@@ -206,8 +206,8 @@ def test_precomputed_and_failline_enter_turn_stream(monkeypatch, _turn_on):
     )
 
     async def scenario():
-        # 预计算文本（spec HIT 路径的 FIFO 形状）
-        p.q.put_nowait(("__precomputed__", "预计算译文够长。"))
+        # 预计算文本（spec HIT 路径的 FIFO 形状；R8 三元组带真源文）
+        p.q.put_nowait(("__precomputed__", "源文原句", "预计算译文够长。"))
         p._enq.append(asyncio.get_running_loop().time())
         task = asyncio.create_task(p.run())
         for _ in range(300):
@@ -215,6 +215,7 @@ def test_precomputed_and_failline_enter_turn_stream(monkeypatch, _turn_on):
                 break
             await asyncio.sleep(0.01)
         assert len(sess.gens) == 1 and not sess.texts, "预计算文本应进话轮流而非 text say"
+        assert p.pairs[-1] == ("源文原句", "预计算译文够长。"), "R8:pairs 回填真（源,译）对"
         out: list[str] = []
         c = asyncio.create_task(_drain_gen(sess.gens[0], out))
         await asyncio.sleep(0.2)

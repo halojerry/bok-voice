@@ -71,9 +71,12 @@ class TurnStream:
             finally:
                 # 退场（收口哨兵/打断/异常）:摘引用让下一单元开新话轮流;
                 # 打断时在途泵就地收线（其产物只会进死队列=丢，别白烧 MT）。
+                # R5（V3 审计）：泵收线带 q 身份门——若 finally 晚于新话轮流开
+                # （收线/teardown 竞态），self.q 已是新流的队列，绝不可误杀
+                # 新话轮的在途 MT 泵（误杀=该句 error_pre 白烧一次整句重译）。
                 if self.q is q:
                     self.q = None
-                p._cancel_active_pump()
+                    p._cancel_active_pump()
 
         p._last_say = p.session.say(_gen())
         arm_tail_flush(p, p._last_say)

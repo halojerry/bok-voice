@@ -6302,7 +6302,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     except Exception:  # noqa: BLE001
                         pass
                     try:
-                        await asyncio.wait_for(self._flushed_evt.wait(), timeout=15)
+                        # R1（V3 审计，2026-10-09）：15s→4s 帽——ack 只为排干计时服务，
+                        # 真正收摊由 recv 侧 flushed+0.5s 空闲兜底；15s 档在话轮聚合下
+                        # =收口期锁滞上限 15+20=35s（毒链段实弹形状），收窄到 4s 把
+                        # 最坏收口税压到 ~4.5s；迟到 ack 由纪元门禁吞。
+                        await asyncio.wait_for(self._flushed_evt.wait(), timeout=4)
                     except asyncio.TimeoutError:
                         print("MINIMAX_TTS_BIDI_FLUSH_TIMEOUT", flush=True)
                     # 等 recv_loop 把尾巴音频排完(0.5s 空闲自动收,给 20s 上限兜底)
@@ -6403,6 +6407,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 if stretch is not None:
                     # 变换流收尾（W8-B）：排干残余输入+吐出窗口余量+输入时长观测
                     # （句均时长 EMA 回灌 interp_lite TempoController）。尽力而为。
+                    # R4（V3 审计）：注入本流服务端切句数——done_cb 回报归一回
+                    # 句均，防话轮聚合档 EMA 漂成话均→backlog 虚高常态顶格速。
+                    _div = getattr(stretch, "sentence_divisor", None)
+                    if _div is not None:
+                        stretch.sentence_divisor = float(max(1, int(state.get("sentences") or 0)))
                     fin = getattr(stretch, "finalize", None)
                     if callable(fin):
                         try:

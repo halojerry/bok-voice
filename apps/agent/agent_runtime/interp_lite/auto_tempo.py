@@ -122,6 +122,11 @@ class ChunkStretcher:
         self._sr = max(8000, int(sample_rate))
         self._speed = float(speed)
         self._done_cb = done_cb
+        # 句均归一除数（R4，V3 审计）：话轮聚合档一条流吃 N 句——done_cb 若回
+        # 报整流输入时长，EMA 从「句均」漂成「话均」→ backlog=depth×话均系统性
+        # 虚高 → 一有积压常态顶格 1.35。bidi finalize 处把该流服务端切句数
+        # （state["sentences"]）注入本除数；缺省 1=逐句档逐字节旧语义。
+        self.sentence_divisor = 1.0
         self._w = max(64, int(round(self._sr * 0.06)))  # 60ms 窗（16k=960 与探针一致）
         self._hop_out = self._w // 4
         self._hop_in = max(1, int(round(self._hop_out * self._speed)))
@@ -180,7 +185,10 @@ class ChunkStretcher:
         self._wsum[:] = 0.0
         if self._done_cb is not None:
             try:
-                self._done_cb(self._in_samples / float(self._sr) * 1000.0)
+                # R4 句均归一：整流输入 ms ÷ 该流句数（除数由 bidi finalize 注入）
+                self._done_cb(
+                    self._in_samples / float(self._sr) * 1000.0 / max(1.0, float(self.sentence_divisor))
+                )
             except Exception:  # noqa: BLE001 - 观测纯增益
                 pass
         return bytes(out)

@@ -231,6 +231,23 @@ def test_chunk_stretcher_reports_input_ms_once():
     assert st.finalize() == b""  # 重复收尾=空（不重复观测）
 
 
+def test_chunk_stretcher_sentence_divisor_normalizes_to_per_sentence():
+    """R4（V3 审计）：话轮聚合档一条流吃 N 句——done_cb 回报须除以句数归一回
+    句均，防 EMA 漂成话均→backlog 虚高常态顶格 1.35。除数缺省 1=旧语义。"""
+    seen: list[float] = []
+    st = ChunkStretcher(SR, 1.0, done_cb=seen.append)
+    st.sentence_divisor = 4.0  # bidi finalize 注入该流服务端切句数
+    st.push(_sine_pcm(secs=1.0)[: SR * 2])  # 1s 输入
+    st.finalize()
+    assert abs(seen[0] - 250.0) < 2.0  # 1000ms ÷ 4 = 250ms 句均
+    # 缺省除数=1：逐句档逐字节旧口径
+    seen2: list[float] = []
+    st2 = ChunkStretcher(SR, 1.0, done_cb=seen2.append)
+    st2.push(_sine_pcm(secs=1.0)[: SR * 2])
+    st2.finalize()
+    assert abs(seen2[0] - 1000.0) < 2.0
+
+
 def test_chunk_stretcher_short_input_and_finalize_only():
     st = ChunkStretcher(SR, 1.35)
     out = st.push(b"\x01\x02")  # 不足一窗：中段不吐

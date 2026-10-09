@@ -1553,6 +1553,21 @@ class _LagLedger:
             return None
         return self._pending.popleft()
 
+    def drain_stale(self, max_age_s: float) -> int:
+        """排掉超过 max_age 的陈旧 pending（R7，2026-10-09 话轮聚合适配）。
+
+        聚合档一条 say 吃整个话轮=每话轮只 1 个 conversation_item，但 note_src/
+        done_mt 仍逐句——话轮内第 2..N 句的 pending 没有本话轮 item 可配，不排
+        就会错配到下一话轮的 item（INTERP_LAG 三列全错位）。item 到达时先排
+        掉 >max_age 的（话轮内句在话轮内消化，超龄=上话轮残留）。
+        返回排出数（观测用）；逐句档配对天然干净=恒 0 零变化。"""
+        now = float(self._clock())
+        n = 0
+        while self._pending and now - self._pending[0][0] > float(max_age_s):
+            self._pending.popleft()
+            n += 1
+        return n
+
 
 def _lag_turn_timing(rec: tuple[float, int, int], now: float, t0: float) -> tuple[int, int, int]:
     """账本配对 → add_turn 三列(纯函数,单测直喂):镜像 A 线口径。
