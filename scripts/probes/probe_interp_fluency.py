@@ -31,6 +31,7 @@ for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
 
 
 import asyncio
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -144,10 +145,8 @@ async def main() -> int:
     finally:
         await me.close()
         await other.close()
-        try:
+        with contextlib.suppress(Exception):
             e2e.httpx.post(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
-        except Exception:
-            pass
 
     tl = _speech_timeline(other.timelog, other.captured)
     gap_budget = float(os.environ.get("BOK_PROBE_GAP_MS", "800")) / 1000.0

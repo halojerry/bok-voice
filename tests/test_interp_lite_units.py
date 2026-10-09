@@ -367,7 +367,7 @@ def test_server_hybrid_starve_and_merge(monkeypatch):
             def close():
                 pass
 
-            def send_nowait(_, ev):
+            def send_nowait(self, ev):
                 ev2.append(ev.alternatives[0].text if ev.alternatives else "")
 
         stream2._event_ch = _Ch2()

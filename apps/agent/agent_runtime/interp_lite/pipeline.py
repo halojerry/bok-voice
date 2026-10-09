@@ -82,9 +82,9 @@ class _Utterance:
     """单话段（VAD 段内一组子句）的连续流状态。"""
 
     __slots__ = (
-        "t0", "committed", "display", "src_sent", "chunks_started", "chunks",
-        "tts_q", "mt_parts", "chunk_task", "quiet_task", "quiet_seq", "closed",
-        "yielded", "any_delta", "gate_failed", "src_final",
+        "any_delta", "chunk_task", "chunks", "chunks_started", "closed",
+        "committed", "display", "gate_failed", "mt_parts", "quiet_seq",
+        "quiet_task", "src_final", "src_sent", "t0", "tts_q", "yielded",
     )
 
     def __init__(self, t0: float):
@@ -439,10 +439,8 @@ class InterpPipeline:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            try:
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(self._shutdown_flush(), timeout=2.0)
-            except (TimeoutError, asyncio.CancelledError):
-                pass
             raise
 
     async def _shutdown_flush(self) -> None:

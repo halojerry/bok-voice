@@ -28,7 +28,7 @@ def content_len(s: str) -> int:
 
 def common_prefix_len(a: str, b: str) -> int:
     n = 0
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=False):
         if x != y:
             break
         n += 1
