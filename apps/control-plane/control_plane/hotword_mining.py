@@ -13,8 +13,9 @@ flow.py `_BRANCH_LINE_RE` 的镜像先例）。
 - ``polish_fix``：客户轮过一遍运行时同款确定性音近纠错（``asr_polish.polish_transcript``，
   与 scripts/seed/prepare_csc_data.py 的「edits 非空即采」逐字同姿势），raw≠polished
   时取**纠错后 span 的词**为候选（这就是 ASR 听错、应进词表让 ASR 偏置正确的词）。
-- ``near_miss``：客户轮**近似**命中「要求重复/没听清」规范用语族（编辑距离 ≤2 的
-  同长窗口）——候选=该规范用语（让 ASR 把客户喊的「冇听清/再讲一次」识别稳）。
+- ``near_miss``：客户轮**近似**命中「要求重复/没听清」规范用语族（编辑距离预算内
+  的同长窗口：≤4 字短语容 1 字差、≥5 字容 2，见 ``near_miss_edit_budget``）——
+  候选=该规范用语（让 ASR 把客户喊的「冇听清/再讲一次」识别稳）。
 - ``gap_ngram``：反复出现（≥3 次）却没有任何 qa 词条问法覆盖的客户 n-gram
   （2-4 个 CJK 字或单个拉丁词，casefold）+ 尚不在热词表。
 
@@ -25,7 +26,11 @@ flow.py `_BRANCH_LINE_RE` 的镜像先例）。
 (ii) **回声轮排除**：`turn_quality.looks_garbled(text, hotword_terms)` 为真
 （剥数字/标点/词表命中后无实质内容的碎片/抄词轮）整轮跳过；
 (iii) **语言**：候选 lang=该通通话语言（turns 带 language，缺省 zh），三态
-zh/cantonese/en（cantonese 为规范拼写）。
+zh/cantonese/en（cantonese 为规范拼写）；
+(iv) **子串吞噬**：同批（同语言）候选归一后互为真子串 → 丢短留长
+（``filter_substring_swallowed``，聚合出口、每语言截断前）——下游热词表预算
+（豆包 100 token 上限取前 40 词、总长 ≤200 字符）每一槽都该花在长词上，
+短碎片只稀释。
 
 `existing_words`=已入库热词（两级合并，含停用行——避免重复提议）；`existing_q_norms`
 =同账号 qa 词条归一后问法集（gap_ngram 的 qa 覆盖排除用，复用 qa_text.normalize_question
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from functools import lru_cache
 
 from bok_voice_core.asr_polish import detect_lane, load_variant_table, polish_transcript
@@ -61,6 +67,8 @@ NGRAM_MIN_FREQ = 3
 # near_miss：只对短轮做窗口扫描（重复用语是短句；长轮既非近似用语又太贵）。
 NEAR_MISS_MAX_CHARS = 60
 NEAR_MISS_MAX_EDITS = 2
+# ≤4 字（CJK 规范语族全长 2-4 字）只容 1 字之差——见 near_miss_edit_budget。
+NEAR_MISS_SHORT_MAX_CHARS = 4
 
 CANONICAL_LANGS = ("zh", "cantonese", "en")
 
@@ -159,8 +167,21 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+def near_miss_edit_budget(phrase_len: int) -> int:
+    """near_miss 窗口编辑预算（按短语长度分档；EX-H1 遗留② 证据样失配修复）。
+
+    ≤4 字（REPEAT_PHRASES 的 CJK 族全长 2-4 字）只容 **1** 字之差：d=2 的同长
+    窗口与短语仅共享单字（「听清啊」≈「乜嘢啊」、「你说什」≈「你讲乜」），会把
+    整个规范语族从一句话里炸成一堆候选，而证据样（客户原话）与多数候选词根本
+    对不上——运营者看到「证据：你说什幺 → 你讲乜」这类失配样本。≥5 字（拉丁族
+    repeat/pardon/say again…）保持 2（拼错两个字母仍算近似）。调用方须再与
+    ``phrase_len - 1`` 取 min（2 字短语不容整词替换，「至少一字相同」护栏）。
+    """
+    return 1 if phrase_len <= NEAR_MISS_SHORT_MAX_CHARS else NEAR_MISS_MAX_EDITS
+
+
 def _near_miss_phrases(text: str) -> list[str]:
-    """文本近似命中（距离 1..2）的规范用语展示形列表（确定性、去重、保序）。"""
+    """文本近似命中（编辑预算内）的规范用语展示形列表（确定性、去重、保序）。"""
     s = str(text or "").strip()
     if not s or len(s) > NEAR_MISS_MAX_CHARS:
         return []
@@ -170,9 +191,9 @@ def _near_miss_phrases(text: str) -> list[str]:
         L = len(match_form)
         if L < 2:
             continue
-        # 至少一字相同才算「近似」：d 上限 min(2, L-1)——否则 2 字短语会把任意
-        # 全异 2 字窗口（距离=2=整词替换）误判成近似（「单号」≈「咩话」噪声）。
-        max_ed = min(NEAR_MISS_MAX_EDITS, L - 1)
+        # 至少一字相同才算「近似」：预算 min(分档预算, L-1)——2 字短语不容整词
+        # 替换；≤4 字短语只容 1 字差（否则单字共享窗把全族炸成候选，证据样失配）。
+        max_ed = min(near_miss_edit_budget(L), L - 1)
         hit = False
         if len(cf) >= L:
             for i in range(len(cf) - L + 1):
@@ -209,6 +230,56 @@ def _customer_ngrams(text: str) -> list[str]:
         if len(w) >= LATIN_WORD_MIN:
             out.append(w)
     return out
+
+
+# ---- 子串吞噬过滤（EX-H1 遗留①，聚合出口、每语言截断前）----
+
+
+def _norm_compare(word: str) -> str:
+    """子串比对归一形：NFKC（全半角归一）+ casefold（大小写归一）。仅用于比对，
+    候选展示形（word 字段原值）不动。"""
+    return unicodedata.normalize("NFKC", str(word or "")).strip().casefold()
+
+
+def filter_substring_swallowed(candidates: list[dict]) -> tuple[list[dict], list[str]]:
+    """同批候选子串吞噬过滤（纯函数）：真子串丢短留长，返回 (保留行, 被吞词)。
+
+    **策略（简单确定，无加权）**：同语言批内，归一形 A 为另一候选 B 的真子串
+    （A ⊂ B 且 A ≠ B）→ **无条件丢弃 A、保留 B**。链式包含（A⊂B⊂C）单趟即收敛
+    （包含传递 ⇒ A⊂C 直接判掉，与途经 B 无关），保留的恒为极大形。
+
+    **为什么不设「A 频次 ≥2×B 则豁免」**：gap_ngram 同源计数下
+    ``freq(子串) ≥ freq(超串)`` 是结构性恒等（超串每出现一次必内嵌子串一次），
+    2× 门只在跨源处可能开——而 polish_fix（按纠错 span 计 1）与 gap_ngram（按
+    gram 出现计次）的 freq 基准不可比，拿它当豁免=模糊加权。故一刀切留长词。
+
+    **为什么放在聚合出口**：三源汇合后、每语言 PER_LANG_CAP 截断前——被吞短词
+    让出的槽位可被下一个非冗余候选顶上（下游预算：豆包热词表 100 token 上限取
+    前 40 词、总长 ≤200 字符）。跨语言不比较（热词表按 lang 分表下发，zh 的
+    「拼多多」与 cantonese 的「拼多多」互不稀释）。
+
+    空输入=([], []) 零漂移；非 dict 行过滤掉（防御，不炸）。保序返回。
+    """
+    rows = [c for c in (candidates or []) if isinstance(c, dict)]
+    norms = [(_norm_compare(r.get("word")), str(r.get("lang") or "")) for r in rows]
+    kept: list[dict] = []
+    dropped: list[str] = []
+    for i, row in enumerate(rows):
+        wi, li = norms[i]
+        swallowed = bool(wi) and any(
+            j != i
+            and lj == li
+            and wj
+            and wi in wj
+            and wi != wj
+            for j, (wj, lj) in enumerate(norms)
+        )
+        if swallowed:
+            if row.get("word") not in dropped:
+                dropped.append(str(row.get("word") or ""))
+        else:
+            kept.append(row)
+    return kept, dropped
 
 
 # ---- LLM 判据（单次批量；adopt|reject + 一句理由）----
@@ -317,7 +388,8 @@ def extract_hotword_candidates(
 
     conversations 形如 repository.iter_call_conversations 返回：每通一个轮次
     列表，轮 dict 带 role/text/lang/gen/provider/call_id（缺键宽容）。返回每语言
-    按 freq 降序取前 PER_LANG_CAP 的候选行：
+    按 freq 降序取前 PER_LANG_CAP 的候选行（聚合出口先过 IRON FILTER iv 子串
+    吞噬，见 filter_substring_swallowed）：
     {word, lang, freq, kind, evidence:[{call_id, raw, fixed}]}。
 
     后两个参数是**过滤上下文**：existing_words=已入库热词（避免重复提议）、
@@ -396,9 +468,18 @@ def extract_hotword_candidates(
         call_id, raw = ngram_evi.get((gram, lang), ("", ""))
         _note(gram, lang, KIND_GAP_NGRAM, count, call_id, raw, "")
 
+    # 子串吞噬（IRON FILTER iv）：三源汇合后、每语言截断前丢短留长；观测对标
+    # CP 侧 print 风格（main.py `[cp] …` flush 行），仅在真的吞了东西时出一行。
+    kept_rows, swallowed = filter_substring_swallowed(list(agg.values()))
+    if swallowed:
+        print(
+            f"[cp] hotword substring swallow: dropped={len(swallowed)} words={','.join(swallowed)}",
+            flush=True,
+        )
+
     # 每语言 top PER_LANG_CAP by freq（并列取字典序，确定性）。
     by_lang: dict[str, list[dict]] = {}
-    for entry in agg.values():
+    for entry in kept_rows:
         by_lang.setdefault(entry["lang"], []).append(entry)
     out: list[dict] = []
     for _lang, rows in by_lang.items():

@@ -15,6 +15,7 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { api, type UserRow } from "@/lib/api";
+import { setDirty } from "@/lib/dirty-signal";
 import { useTemplatesList } from "@/lib/swr";
 import { downloadCsv, parseBoolCell } from "@/lib/csv";
 import { serializeStepRef } from "@/lib/flow-canvas";
@@ -299,6 +300,13 @@ export default function StudioPage() {
   // popstate 防线的引用快照(声明在 effect 附近,赋值在此=anyDirty 已就绪)
   dirtyRef.current = anyDirty;
   selIdRef.current = selId;
+  // 全局 dirty 信号上报（2026-10-08 侧栏拦截刀）：meta 编辑器的 dirty 由
+  // TemplateEditor 自报，这里补页面自持的步骤草稿——dirty 时上报、清脏/卸载即清。
+  useEffect(() => {
+    if (!stepsDirty) return;
+    setDirty("studio-steps-draft", true);
+    return () => setDirty("studio-steps-draft", false);
+  }, [stepsDirty]);
   const [applying, setApplying] = useState(false);
   const [applyErr, setApplyErr] = useState("");
   const [applyNote, setApplyNote] = useState("");

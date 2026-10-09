@@ -7,12 +7,12 @@
     "seedFindingCount": 88,
     "dependencyAdvisories": {
       "mimosaOfflineAdvisory": "1 包 2 条（产物未具名）",
-      "disposition": "accepted-risk：2026-09-23 对 apps/web 与 services/realtime-translation 两份 package-lock 跑 npm audit --package-lock-only 均报 0 vulnerabilities——钉死版本在权威活源查无已知漏洞，Mimosa 离线库命中无法复现；后续锁定版本升级时随 CI 复核"
+      "disposition": "2026-10-09 live audit 复核推翻 2026-09-23「0 vulnerabilities」旧读数：apps/web/package-lock.json（唯一存续 lock）实测 9 vulnerabilities（1 critical+8 high）——next 16.3.3 critical（7 份 GHSA：ImageResponse RCE+Image Optimization SSRF 等）+sharp/source-map-js high 已随本轮 npm audit fix 非破坏修复（next→16.4.0/sharp→0.35.5/source-map-js→1.2.2，tsc+199 tests+build 全绿）；余 6 high=braces(GHSA-vfj7-8cjw-p6xm 栈耗尽 DoS)→micromatch→fast-glob→ts-morph 链，唯一修复路径=shadcn 4.21.0 破坏性降级——accepted-risk：暴露面=构建期 codegen 工具链（shadcn CLI/ts-morph），非运行时服务面，且 shadcn 为仓规钉死版本（AGENTS.md）。后续锁定版本升级时随 CI 复核"
     },
     "advisories": [
       "tts_cache sha1 缓存键（hook 侧弱算法告警）：内容寻址缓存键非安全边界，换 sha256 将作废全部已钉罐头（greetings/fillers/qa）——accepted-risk，勿顺手改",
       "logger.ts trace id 的 Math.random 回退：非凭据（主路径 crypto.randomUUID）——accepted-risk",
-      "probe_cloud_asr_ab CLOUD_URL：云端 ASR API 客户端（官方端点默认+key），未上环回闸——候选后续用 assert_public_http_url 档加固",
+      "probe_cloud_asr_ab CLOUD_URL：已上公网出站闸（2026-10-08 收口）——urlguard_gate.gate_public 地址类档（http(s)+无 userinfo+IP 字面量/域名 DNS 解析后拒环回/私网/链路本地/保留段；core assert_public_http_url 门面），私网/自建端点 BOK_PROBE_ALLOW_PRIVATE=1 显式 opt-in（云元数据段无口子）；默认官方端点 dashscope.aliyuncs.com 放行",
       "node_handshake_smoke：CI 基建脚本（workflow 注入云 CP 地址，受信 CI 面），不上环回闸"
     ]
   },
@@ -100,9 +100,9 @@
       "id": "accepted-knowledge-source-fetch",
       "publicClass": "other-security",
       "path_glob": "apps/control-plane/*",
-      "verdict": "accepted-risk",
-      "reason": "main.py→markdown_source 的污点=知识库源抓取特性（URL 来自 admin 配置的知识源）；管理面配置+权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
-      "evidence": "packages/knowledge markdown_source 适配器; §50 知识抓取=配置型适配器核验"
+      "verdict": "fixed",
+      "reason": "main.py→markdown_source 的污点=知识库源抓取特性（URL 来自 admin 配置的知识源）；管理面配置+权限闸在位。2026-10-08 后续候选已落地：适配器出站统一过 _guard_outbound_url 公网守卫（默认拒私网/环回/云 metadata，BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行内网知识源；userinfo 恒拒；read path urlencode 防注入）",
+      "evidence": "packages/knowledge markdown_source 适配器 _guard_outbound_url 单闸; tests/test_markdown_source_netguard.py; §50 知识抓取=配置型适配器核验"
     },
     {
       "id": "fp-sidecar-taint",
@@ -165,24 +165,24 @@
       "publicClass": "other-security",
       "path_glob": "scripts/probes/probe_flow_graph.py",
       "verdict": "false-positive",
-      "reason": "『疑似跨文件污点』=env→本机 CP 出站链(:772 _cp→httpx.request→CONTROL_PLANE_URL 缺省环回;:948 经 erc 同款),探针常量 payload——同族(fixed-scripts-urlguard-gate/fixed-scripts-cp-api-entries 先例)",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链(:772 _cp→httpx.request→CONTROL_PLANE_URL 缺省环回;:948 经 erc 同款),探针常量 payload——同族(fixed-scripts-urlguard-gate/fixed-scripts-cp-api-entries 先例)。2026-10-09 审计勘误：报点 :948/:88 为函数定义行（sink 归因漂移）,真出站=probe_flow_graph:772-776 与 probe_ambient_keyboard:90-108;发送期 host 闸条件含 or bool(host)(环回白名被架空),主机约束单点依赖 import 期 urlguard gate——涉事脚本全部已接 gate,本 PR 合并后该层由 cp_outbound 严格环回校验接管",
       "evidence": "scripts/probes/probe_flow_graph.py:772 _cp;调用点 :948;同族 fp-probe-branch-action-cp-taint"
     },
     {
       "id": "accepted-cp-knowledge-source-chain",
       "publicClass": "other-security",
       "path_glob": "apps/control-plane/control_plane/main.py",
-      "verdict": "accepted-risk",
-      "reason": "『环境变量→markdown_source.py:79 SSRF』链=CP 把 BOK_URL/BOK_KNOWLEDGE_* env 传给知识源抓取适配器;markdown_source 构造期非 http(s) 显式拒(ValueError 启动面炸)+write/read sink 级 scheme/host/userinfo 闸(2026-10-05 逐行核验)——与 accepted-knowledge-source-ssrf 同裁定面,风险=运维配错而非注入",
-      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py 构造器 scheme 校验+write() sink 闸注释;security-policy.json threatModel 攻击面第 2 条已列"
+      "verdict": "fixed",
+      "reason": "『环境变量→markdown_source SSRF』链=CP 把 BOK_URL/BOK_KNOWLEDGE_* env 传给知识源抓取适配器;2026-10-08 适配器出站统一过 _guard_outbound_url 单闸（构造器 resolve=True 保存期 DNS 全验+read/write 发送期复验,对标 CP webhook 双重校验;地址策略单源委托 bok_voice_core.urlguard,环回/私网/保留段默认拒、解析失败 fail-closed、多 A 记录任一命中即拒、云 metadata/link-local 恒拒无口子;BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行内网知识源;read path urlencode 消除 query/CRLF 注入）——与 accepted-knowledge-source-ssrf 同裁定面,一并翻 fixed。2026-10-09 审计补充事实（@587f58e 分诊）：BokMarkdownSource 全仓零构造点=死适配器,CP 装配面仅 LocalMarkdownSource(main.py:569);合并前 main 版 read() 无 sink 闸且 urlopen(headers=) kwarg 错位(运行时 TypeError fail-closed)——均随本 PR 修复",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py _guard_outbound_url; tests/test_markdown_source_netguard.py 26 用例零网络; security-policy.json threatModel 攻击面第 2 条已列"
     },
     {
       "id": "accepted-knowledge-source-ssrf",
       "publicClass": "ssrf",
       "path_glob": "packages/knowledge/*",
-      "verdict": "accepted-risk",
-      "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
-      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py; §50 配置型适配器核验"
+      "verdict": "fixed",
+      "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。2026-10-08 护栏升级：read()/write() 出站与构造器统一过 _guard_outbound_url 单闸——scheme 白名单 http/https+host 非空+userinfo 恒拒+地址策略单源委托 bok_voice_core.urlguard（环回/私网/保留段 DNS 解析后默认拒，解析失败 fail-closed，多 A 记录任一命中即拒；云 metadata/link-local 恒拒无口子）；运维合法内网走 BOK_KNOWLEDGE_ALLOW_PRIVATE=1 显式放行；read path 经 urlencode 消除 query/CRLF 注入",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py _guard_outbound_url（构造器 resolve=True 保存期全验+发送期复验，对标 CP webhook 双重校验）；tests/test_markdown_source_netguard.py 26 用例零网络"
     },
     {
       "id": "fp-queue-proxy-room-claim-taint",
@@ -198,7 +198,7 @@
       "path_glob": "scripts/runtime/mine_qa.py",
       "verdict": "false-positive",
       "reason": "『疑似跨文件污点』=env→本机 CP 出站链（BOK_CP_URL/--cp 缺省 http://127.0.0.1:8000、BOK_CP_TOKEN→Bearer）：operator 诊断 CLI 配置面（bok.py tts-mine 执行体，同 fp-agent-sidecar-taint/fp-bok-cli-loopback 先例），非远端用户输入；payload 全 JSON 序列化打 qa-entries/qa-pairs API，无命令/SQL/路径 sink；扫描器跨文件 sink 归因（load_intent_catalog.py:118）=同族 env→request 共享形状（2026-10-04 Ethan 指派 triage）",
-      "evidence": "scripts/runtime/mine_qa.py:47-60 _safe_urlopen 出站闸 + :84-91 _cp_request 单点 + :274/:284 env 缺省；调用点 :191/:260/:294/:324/:335/:364"
+      "evidence": "scripts/runtime/mine_qa.py:47-60 _safe_urlopen 出站闸 + :84-91 _cp_request 单点 + :274/:284 env 缺省；调用点 :191/:260/:294/:324/:335/:364；执行体=tools/bokctl/commands/misc.py:39-48（bokctl 拆包后措辞，2026-10-09 审计修正）"
     },
     {
       "id": "fp-probe-branch-action-cp-taint",

@@ -92,10 +92,9 @@ import probe_latency_soak as pls  # noqa: E402  复用:百分位/汇总/首声�
 
 REPORT_DIR = Path(__file__).resolve().parents[2] / "reports" / "flow-graph"
 
-# auth-on 栈（2026-09-15 标准姿势）：CP 请求带机器通道 Bearer，未设 env 零变化。
-_CP_HEADERS: dict[str, str] = {}
-if os.environ.get("BOK_CP_TOKEN", "").strip():
-    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+# auth-on 栈（2026-09-15 标准姿势）：CP 请求带机器通道 Bearer，未设 env 零变化
+# ——头账本单点在 erc.CP_HEADERS（本探针 CP 出站全部经 erc.cp_request →
+# 共享单点 scripts/lib/cp_outbound，2026-10-09 L3 收敛；不再自持第二份头账本）。
 
 ACCOUNT_ID = os.environ.get("BOK_PROBE_ACCOUNT", "acc-001")
 TARGET_STEP = 4  # 1-based：投诉 jump 的目标步
@@ -339,10 +338,7 @@ async def fetch_turns_authed(call_id: str, settle_s: float = 12.0) -> list[dict]
     stable = 0
     deadline = time.perf_counter() + settle_s
     while time.perf_counter() < deadline:
-        rows = httpx.get(
-            f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/turns",
-            headers=_CP_HEADERS, timeout=10,
-        ).json()
+        rows = _cp(f"/api/calls/{call_id}/turns", timeout=10).json()
         if not isinstance(rows, list):
             rows = []
         if rows and len(rows) == len(last):
@@ -770,10 +766,10 @@ def evaluate_leg(
 # CP 侧：模板 / QA 条目 / 通话
 # ---------------------------------------------------------------------------
 def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
-    kw.setdefault("timeout", 15)
-    return httpx.request(
-        method, f"{erc.CONTROL_PLANE_URL}{path}", headers=_CP_HEADERS, **kw
-    )
+    """CP 请求单点：委托 erc.cp_request（出站闸与 httpx sink 在共享单点
+    scripts/lib/cp_outbound，2026-10-09 L3 收敛），返回 httpx.Response 原生面
+    （.json()/.raise_for_status()/.status_code）。timeout 缺省 15（erc 同款）。"""
+    return erc.cp_request(method, path, **kw)
 
 
 def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool | str = False,

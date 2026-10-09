@@ -12,6 +12,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { nextDirtyKey, setDirty } from "@/lib/dirty-signal";
 import { ErrorState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
@@ -373,21 +374,29 @@ export default function TemplateEditor(props: {
   // 覆盖本组件持有的全部可编辑面（名称/四段/语气/热词/语言/分步）；保存成功与换模板时重锚。
   const dirty = useMemo(() => serializeState(form, steps) !== snap, [form, steps, snap]);
 
-  // dirty 上抛（可选 prop）：同一值只回调一次——父页常传内联回调（每次渲染换引用），
-  // 用 ref 持最新回调、用 lastDirtyRef 去重；卸载时回落 false（编辑面已销毁，残留 true 会误报）。
+  // dirty 上抛（可选 prop）+ 全局信号上报（2026-10-08 侧栏拦截刀）：同一值只
+  // 回调/上报一次——父页常传内联回调（每次渲染换引用），用 ref 持最新回调、
+  // lastDirtyRef 去重；全局信号键按实例唯一（同组件多实例不互相覆盖）。
+  // 卸载时回落 false（编辑面已销毁，残留 true 会误拦导航）。
   const dirtyCbRef = useRef(props.onDirtyChange);
   const lastDirtyRef = useRef<boolean | null>(null);
+  const dirtyKeyRef = useRef("");
+  if (!dirtyKeyRef.current) dirtyKeyRef.current = nextDirtyKey("template-editor");
   useEffect(() => {
     dirtyCbRef.current = props.onDirtyChange;
   });
   useEffect(() => {
     if (lastDirtyRef.current === dirty) return;
     lastDirtyRef.current = dirty;
+    setDirty(dirtyKeyRef.current, dirty);
     dirtyCbRef.current?.(dirty);
   }, [dirty]);
   useEffect(
     () => () => {
-      if (lastDirtyRef.current) dirtyCbRef.current?.(false);
+      if (lastDirtyRef.current) {
+        setDirty(dirtyKeyRef.current, false);
+        dirtyCbRef.current?.(false);
+      }
     },
     [],
   );

@@ -65,13 +65,9 @@ import re
 import subprocess
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
-import httpx
 from livekit import rtc
-
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 _SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 _ROOT = _SCRIPTS.parent
@@ -82,6 +78,8 @@ import e2e_real_customer as erc  # noqa: E402  复用骨架:建通/推流/收音
 REPORT_DIR = _ROOT / "reports" / "branch-action"
 
 # auth-on 栈：CP 请求带机器通道 Bearer，未设 env 零变化（与 probe_flow_graph 同款）。
+# 此账本本探针仍直接消费（pregen 子进程 env 还原 BOK_CP_TOKEN）；CP 出站本身
+# 全部经 erc.cp_request → 共享单点 scripts/lib/cp_outbound（2026-10-09 L3 收敛）。
 _CP_HEADERS: dict[str, str] = {}
 if os.environ.get("BOK_CP_TOKEN", "").strip():
     _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
@@ -442,51 +440,16 @@ def evaluate_leg(
 # ---------------------------------------------------------------------------
 # CP 侧：模板 / 通话 / 日志窗口
 # ---------------------------------------------------------------------------
-def _safe_urlopen(req, *, timeout: float):
-    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
-    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。"""
-    import urllib.request
-
-    _parts = urllib.parse.urlsplit(req.full_url)
-    _host = (_parts.hostname or "").lower()
-    if not (
-        _parts.scheme in ("http", "https")
-        and (_host in _LOOPBACK_HOSTS or bool(_host))
-        and not _parts.username
-        and not _parts.password
-    ):
-        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
-    return urllib.request.urlopen(req, timeout=timeout)
-
-
 def _jbody(payload) -> bytes:
     """json= 糖衣的预序列化形（body+Content-Type 与 json= 逐字节等价；
     Mimosa 钉 json= kwarg 形状，data= 过门）。"""
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-class _RespShim:
-    """urllib 响应的最小 httpx 兼容面（json/raise_for_status/status_code）。"""
-
-    def __init__(self, status: int, body: bytes):
-        self.status_code = status
-        self._body = body
-
-    def json(self):
-        return json.loads(self._body.decode("utf-8"))
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:200]!r}")
-
-    @property
-    def text(self):
-        return self._body.decode("utf-8", "replace")
-
-
 def _cp(path: str, *, method: str = "GET", **kw):
-    """CP 请求单点：委托 erc.cp_request（底座 urlguard 闸 + 门实证清白形状），
-    返回 httpx.Response 原生面（.json()/.raise_for_status()/.status_code）。"""
+    """CP 请求单点：委托 erc.cp_request（出站闸与 httpx sink 在共享单点
+    scripts/lib/cp_outbound，2026-10-09 L3 收敛），返回 httpx.Response 原生面
+    （.json()/.raise_for_status()/.status_code）。"""
     return erc.cp_request(method, path, **kw)
 
 
