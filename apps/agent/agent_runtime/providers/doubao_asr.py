@@ -235,6 +235,37 @@ def _find_clause_cut(
     return None
 
 
+def _len_fuse_cut(text: str, start: int, min_chars: int) -> int | None:
+    """长度保险丝切点（纯函数，2026-10-09 W6×interp-lite 合流；单测直喂）。
+
+    标点档（``_find_clause_cut``）只在标点边界提交——无标点连续语流（长句/
+    地址/一气呵成形）结构性等句号/EOS，句档下两句并成一单=译文轨饿出巨型
+    天窗（实弹 call-d6704474：26.3s 窗，根因 119 字单 commit）。本函数在
+    ``[start:]`` 攒够 ``min_chars`` **内容字**（非空白/标点）后找安全切点：
+    切位后一个字符不得是 ASCII 字母数字（防劈单号/号码 run——``_find_clause_cut``
+    的数字 run 纪律同源）；攒不够/只在 run 内= None（等下轮 interim）。
+    稳定性与限速由调用方门控（与标点档同判据）。
+    """
+    n = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P"):
+            n += 1
+            if n >= min_chars:
+                j = i + 1
+                if (
+                    j < len(text)
+                    and ch.isascii() and ch.isalnum()
+                    and text[j].isascii() and text[j].isalnum()
+                ):
+                    pass  # 切点两侧都在 ASCII 字母数字 run 内：后移到 run 尾（防劈单号）
+                else:
+                    return j
+        i += 1
+    return None
+
+
 class DoubaoSTT(stt.STT):
     """豆包 SAUC 流式 ASR（LiveKit STT；A/B 线共用）。
 
@@ -277,6 +308,7 @@ class DoubaoSTT(stt.STT):
         utt_merge: bool = False,
         utt_wait_s: float = 0.45,
         clause_commit: bool = False,
+        len_fuse: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -315,6 +347,12 @@ class DoubaoSTT(stt.STT):
         # 说话中成句（B 线 W1 clause-commit，2026-10-08）：interim 子句级闸命中
         # 即发 FINAL（说话中 MT 起跑）；False（A 线缺省不传）=逐字节旧路。
         self._clause_commit = bool(clause_commit)
+        # 长度保险丝（2026-10-09 W6×interp-lite 合流）：无标点连续语流攒够
+        # ``QWEN3_ASR_CLAUSE_LEN_CHARS`` 内容字就地切（``_len_fuse_cut``）——句档
+        # （逗号档关）下没有它=长句结构性等句号/EOS，两句并一单饿出巨型天窗
+        # （call-d6704474 实弹 26.3s 窗根因）。**默认 False=旧线逐字节**；仅
+        # interp_lite 装配开（LiteDoubaoSTT）。限速/跨窗稳定与标点档同判据。
+        self._len_fuse = bool(len_fuse)
         # 与 Qwen3ASRLiveSTT 同款公开面（agent 侧 duck 访问）：partial 档旋钮、
         # 回复在途旗、收线窗旗、本轮 partial 末稿。云档语义见各方法 docstring。
         self._partial_ms_override: int | None = None
@@ -707,6 +745,21 @@ class _DoubaoLiveStream(stt.RecognizeStream):
             last_commit_at=self._cc_last_commit_at,
             now=now,
         )
+        if cut is None and self._stt_._len_fuse:
+            # 长度保险丝（标点档未命中才问；限速/跨窗稳定与标点档同判据）。
+            from .livekit_plugins import _sentence_commit_min_interval_s  # noqa: PLC0415
+
+            try:
+                min_chars = int(os.environ.get("QWEN3_ASR_CLAUSE_LEN_CHARS", "20") or 20)
+            except ValueError:
+                min_chars = 20
+            fuse = _len_fuse_cut(text, self._cc_committed_len, max(1, min_chars))
+            if (
+                fuse is not None
+                and now - self._cc_last_commit_at >= _sentence_commit_min_interval_s()
+                and prev_full[self._cc_committed_len:fuse] == text[self._cc_committed_len:fuse]
+            ):
+                cut = fuse
         if cut is None:
             return
         clause = text[self._cc_committed_len:cut]

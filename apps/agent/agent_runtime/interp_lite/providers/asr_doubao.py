@@ -42,6 +42,10 @@ class LiteDoubaoSTT(DoubaoSTT):
         # 替代自家闸（蓝图 §8 该行已更新为「已开」）。
         kwargs.setdefault("clause_commit", True)
         kwargs.setdefault("utt_merge", True)
+        # 长度保险丝（同日合流补件）：句档（逗号档关）下无标点长句的防饿死闸
+        # ——QWEN3_ASR_CLAUSE_LEN_CHARS 在豆包路径此前无实现（键空转，W6 立项档
+        # 未察），call-d6704474 实弹 26.3s 巨窗根因。见 _len_fuse_cut docstring。
+        kwargs.setdefault("len_fuse", True)
         super().__init__(**kwargs)
 
     def _config(self) -> dict:

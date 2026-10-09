@@ -165,6 +165,30 @@ def test_lite_doubao_config_official_arms():
     assert "enable_ddc" not in req  # 与语气标记冲突，不开
     # 说话中出译已开（2026-10-09 用户拍板「必须边讲边出声」）：与旧线 B 档同旗。
     assert stt._clause_commit is True and stt._utt_merge is True
+    # 长度保险丝（同日合流补件）：无标点长句防饿死；旧线 DoubaoSTT 默认关。
+    assert stt._len_fuse is True
+    from agent_runtime.providers.doubao_asr import DoubaoSTT as _Old
+
+    assert _Old(api_key="k")._len_fuse is False  # 旧线逐字节（旗不传=零行为）
+
+
+def test_len_fuse_cut_pure():
+    """长度保险丝切点纯函数：内容字计数/ASCII run 防劈/门槛不足 None。"""
+    from agent_runtime.providers.doubao_asr import _len_fuse_cut
+
+    # 攒够 6 个内容字（标点/空白不计）→ 切点在其后。
+    assert _len_fuse_cut("你好世界今天天气很好", 0, 6) == 6
+    assert _len_fuse_cut("你好，世界。今天天气", 0, 6) == 8  # 标点占位不计内容字（第6内容字=今@7→切8）
+    # ASCII run 防劈：门槛落在 run 内 → 后移到 run 尾（单号 7890123 不劈）。
+    s = "订单号是七八九零一二三四五六"  # 12 内容字无 ASCII run
+    assert _len_fuse_cut(s, 0, 6) == 6  # 无 run：门槛即切
+    s2 = "单号 ABC12345 后面还有内容"
+    cut = _len_fuse_cut(s2, 0, 4)  # 门槛落在 ABC12 内 → 推到 run 尾
+    assert s2[:cut].endswith("ABC12345")
+    # 门槛不足 → None。
+    assert _len_fuse_cut("太短", 0, 6) is None
+    # start 偏移（已提交前缀之后）。
+    assert _len_fuse_cut("前缀你好世界今天天气", 2, 6) == 8
 
 
 def test_lite_doubao_accelerate_arm_uses_existing_key(monkeypatch):

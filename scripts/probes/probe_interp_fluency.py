@@ -8,11 +8,12 @@
     §5 口径修正版——perceived 含整段播完与「单段 ≥4s」内部矛盾，故不设门只报告）：
       1. 段间天窗：译文轨静音 >800ms 计数 ≤1/句（主判据——「断断续续」的量化）；
       2. 单段出声时长 p50 ≥4s（碎片→长段：碎片档每段只 ~2s 声）；
-      3. 首声 onset ≤3.5s（边说边译沿用）；
+      3. 首声 onset 早于**第一句讲完**（边说边译；句档语料首个提交单元=保险丝/
+         句号,结构性在语流深处——绝对 onset 值仅报告,短句预算不适用）；
       4. 原文提交单元 p50 ≥15 字（句档生效的账本侧证据；碎片档 p50=10）。
 
 语料=≥40 字长句 ×3（句内带逗号——逗号档若在必被切碎；句号收尾），butt-join
-0.12s 连续推流。判据全部可 env 调（BOK_PROBE_GAP_MS/SEG_MIN_S/ONSET_BUDGET_MS）。
+0.12s 连续推流。判据可 env 调（BOK_PROBE_GAP_MS/SEG_MIN_S）。
 
 用法：
   .venv312/bin/python scripts/probes/probe_interp_fluency.py
@@ -74,11 +75,10 @@ def _speech_timeline(timelog, captured: bytearray) -> list[tuple[float, bool]]:
     return out
 
 
-def _segments(tl: list[tuple[float, bool]]) -> tuple[list[float], list[float]]:
-    """语音时间线 → (段时长秒列表, 段间静音 >gap 的天窗列表)。首前/尾后静音不计。"""
-    gap_budget = float(os.environ.get("BOK_PROBE_GAP_MS", "800")) / 1000.0
+def _segments(tl: list[tuple[float, bool]], gap_budget: float) -> tuple[list[float], list[tuple[float, float]]]:
+    """语音时间线 → (段时长秒列表, [(天窗起点墙钟, 时长秒)] )。首前/尾后静音不计。"""
     segs: list[float] = []
-    gaps: list[float] = []
+    gaps: list[tuple[float, float]] = []
     run_start = None
     last_speech_end = None
     for t, is_speech in tl:
@@ -86,7 +86,7 @@ def _segments(tl: list[tuple[float, bool]]) -> tuple[list[float], list[float]]:
             if run_start is None:
                 run_start = t
                 if last_speech_end is not None and t - last_speech_end > gap_budget:
-                    gaps.append(t - last_speech_end)
+                    gaps.append((last_speech_end, t - last_speech_end))
             last_speech_end = t
         else:
             if run_start is not None and t - last_speech_end > gap_budget:
@@ -107,7 +107,6 @@ def _p50(xs: list[float]) -> float:
 async def main() -> int:
     src_lang, tgt_lang = os.environ.get("BOK_PROBE_LANG_PAIR", "zh,en").split(",")
     seg_min_s = float(os.environ.get("BOK_PROBE_SEG_MIN_S", "4.0"))
-    onset_budget_ms = float(os.environ.get("BOK_PROBE_ONSET_BUDGET_MS", "3500"))
 
     parts = [cont.strip_silence(cont.tts_pcm(s, src_lang)) for s in SENTENCES]
     gap = b"\x00\x00" * int(16000 * cont.JOIN_GAP_S)
@@ -151,8 +150,18 @@ async def main() -> int:
             pass
 
     tl = _speech_timeline(other.timelog, other.captured)
-    segs, gaps = _segments(tl)
+    gap_budget = float(os.environ.get("BOK_PROBE_GAP_MS", "800")) / 1000.0
+    segs, gaps_all = _segments(tl, gap_budget)
     onset_ms = None if onset is None else round((onset - t0) * 1000)
+    # 天窗只数「讲完之前」起点的窗（尾部收敛期噪声块/挂断杂音不算段间天窗）；
+    # onset 判据=首声早于第一句讲完（句档语料首个提交单元=保险丝/句号,结构性
+    # 在语流深处——短句语料校准的绝对 onset 预算在此不适用,绝对值仍报告）。
+    src_end = t0 + audio_s / 0.8
+    first_sent_end = t0 + (audio_s / len(SENTENCES)) / 0.8
+    gaps = [(t, d) for (t, d) in gaps_all if t < src_end]
+    # 单窗上限（防「≤N/句 计数」放过巨型天窗——首版实弹 26.3s 窗混过 PASS 的教训：
+    # 句 2+3 并成一单 commit + 播报衔接饿窗；根因修在 provider 长度保险丝）。
+    max_gap_s = float(os.environ.get("BOK_PROBE_MAX_GAP_S", "8"))
 
     src_lens: list[int] = []
     try:
@@ -170,17 +179,20 @@ async def main() -> int:
     seg_p50 = _p50(segs)
 
     ok = (
-        onset_ms is not None
-        and onset_ms <= onset_budget_ms
+        onset is not None
+        and onset < first_sent_end  # 边说边译（首声早于第一句讲完）
         and len(gaps) <= len(SENTENCES)  # ≤1 天窗/句
+        and all(d <= max_gap_s for _, d in gaps)  # 单窗上限
         and seg_p50 >= seg_min_s
         and src_p50 >= 15
     )
     print(
         f"INTERPRET_FLUENCY_PROBE audio_s={audio_s:.1f} "
         f"onset_ms={'-' if onset_ms is None else onset_ms} "
+        f"first_sent_end_s={round((first_sent_end - t0), 1)} "
         f"segments={len(segs)} seg_p50_s={seg_p50:.1f} "
-        f"gaps_gt800ms={len(gaps)} gap_list={[round(g, 2) for g in gaps]} "
+        f"gaps_gt800ms={len(gaps)} gap_list={[round(d, 2) for _, d in gaps]} "
+        f"max_gap_budget_s={max_gap_s:g} "
         f"src_turns={len(src_lens)} src_p50_chars={src_p50:.0f} "
         f"{'PASS' if ok else 'FAIL'}",
         flush=True,
