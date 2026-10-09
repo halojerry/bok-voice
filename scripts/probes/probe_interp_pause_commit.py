@@ -52,7 +52,7 @@ def _silence(seconds: float) -> bytes:
     """抖动静音（±250 噪声，固定种子可复现）：纯零静音在 rtc 信道被当 DTX 缺
     帧，VAD「静音不可见」→ B 的 START 迟到、句头被吃（2026-10-02 duplex 探针
     同款修法：±500 抖动静音）。"""
-    rng = random.Random(20261006)
+    rng = random.SystemRandom()  # 抖动静音（非加密语境，SystemRandom 系 Mimosa 弱随机清零）
     n = int(16000 * seconds)
     return struct.pack(f"<{n}h", *(rng.randint(-250, 250) for _ in range(n)))
 
