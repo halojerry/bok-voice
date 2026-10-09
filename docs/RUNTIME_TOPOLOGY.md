@@ -327,6 +327,37 @@ RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)。
 WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 ("Agent did not join the room" 根因,2026-09-06)。
 v1 Node 同传 POC（/translate + WS :8790）已于 2026-10-02 退役，代码见 git 历史。
+
+**B 线薄线 interp_lite（2026-10-09 试点，opt-in）**：serve 侧 `BOK_INTERP_LITE=1`
+时 interp-fwd/rev 两 worker 换拉 `agent_runtime.interp_lite.worker`
+（同端口 8082/8083、同 agent_name `bok-interp-fwd/rev`、同 `GET :port/worker`
+健康面——CP/前端零感知；=0 或缺省回旧线逐字节）。现行事实：
+
+- **管线内核**（`interp_lite.pipeline.InterpPipeline`）：豆包 ASR 服务端分句主档
+  （`LiteDoubaoSTT`，`BOK_INTERP_SERVER_UTT` 总闸 + `BOK_DOUBAO_END_WINDOW_MS`
+  灵敏度；W8 合并档=definite 与本地意群档互补）→ 单消费 FIFO → DeepSeek 流式
+  MT（`interp_lite.providers.mt_deepseek.DeepSeekMT`，thinking 显式关、官方
+  prompt_cache 回读）→ delta 逐字喂 `session.say` → MiniMax bidi 复用在役插件。
+  cloud-only 姿势：ASR 非 doubao 档/mt 车道非 openai 档 → job 放弃（绝不静默回退本地）。
+- **提交缺省**：`bokctl.servers.interp_lite_commit_env` 给薄线 worker 注入意群档
+  三键（`QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS=12`/`QWEN3_ASR_CLAUSE_LEN_CHARS=15`/
+  `QWEN3_ASR_COMMIT_MIN_INTERVAL_S=1.2`；运营显式 env 最高优先，键全既有零新键）。
+- **spec-mt 投机翻译**（`interp_lite.spec_mt`，总闸沿用 `BOK_INTERP_SPEC_MT`）：
+  机器件单源 import 旧线 `_SpecMtController` 家族；lite 专属右上下文门
+  `BOK_INTERP_SPEC_RIGHT_CTX`（缺省 2，0=关）+ busy 闸深度 `BOK_INTERP_SPEC_BUSY_DEPTH`；
+  HIT 走预计算译文文本入 FIFO（同类型 say 保播放序，call-d1cf9dc3 乱序终修）。
+- **轮尾催尾**（`BOK_INTERP_TAIL_FLUSH` 缺省 1）：FIFO 空+播完向 bidi 连接催一枚
+  官方 `task_flush`（`interp_lite.providers.tts_minimax.tail_flush_channel`），
+  免等无标点兜底窗；触发点=playout 观察者（泵排干≠文本推送完成）。
+- **bidi flush ack 纪元门禁**（8bd401a，call-4322e14d 吞句根修）：催尾发送前把
+  `session.flush_epoch` 钉在当前 `active_epoch`，迟到 ack 若跨流由下一流 recv 按
+  纪元吞掉（`MINIMAX_BIDI_FLUSH_ACK_STALE`/`MINIMAX_BIDI_DROP_STALE` 观测行）——
+  不再误当自己的收尾 ack 提前早退（sentences=0 族=译文无声吞句+20-39s 卡死）。
+  结构性修复，无回退键。
+- **字幕双卡+「正在播放」信标**（4bd3af8）：web 双栏列=说话方（译文归被译句说话方），
+  assistant 项入队即向房间广播一枚不可靠数据报 `interp_play`（payload 只带
+  flow+文本前缀+字数，web 按字数估时长自灭；text-only 档不发）。
+  auto_tempo：无 env 键（未落 env 面，不列）。
 ```
 
 ## 3. 生命周期
